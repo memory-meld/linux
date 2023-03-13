@@ -18,6 +18,7 @@
 #include <linux/wait.h>
 #include <linux/mm.h>
 #include <linux/page_reporting.h>
+#include <asm/timer.h>
 
 /*
  * Balloon device works in 4K page units.  So each page is pointed to by
@@ -45,11 +46,18 @@ enum virtio_balloon_vq {
 	VIRTIO_BALLOON_VQ_STATS,
 	VIRTIO_BALLOON_VQ_FREE_PAGE,
 	VIRTIO_BALLOON_VQ_REPORTING,
+	VIRTIO_BALLOON_VQ_HETERO_INFLATE,
+	VIRTIO_BALLOON_VQ_HETERO_DEFLATE,
 	VIRTIO_BALLOON_VQ_MAX
 };
 
 enum virtio_balloon_config_read {
 	VIRTIO_BALLOON_CONFIG_READ_CMD_ID = 0,
+};
+
+struct balloon_tracepoints {
+	u64 size_change_begin, size_change_elapsed;
+	u64 hetero_size_change_begin, hetero_size_change_elapsed;
 };
 
 struct virtio_balloon {
@@ -124,6 +132,17 @@ struct virtio_balloon {
 	spinlock_t adjustment_lock;
 	bool adjustment_signal_pending;
 	bool adjustment_in_progress;
+
+	/* Heterogeneous memory support */
+	struct work_struct update_balloon_hetero_size_work;
+	struct virtqueue *hetero_inflate_vq, *hetero_deflate_vq;
+	/* Number of heterogeneous balloon pages we've told the Host we're not using. */
+	unsigned int num_hetero_pages;
+	/* Heterogeneous pages we've told the Host about.*/
+	struct balloon_dev_info hetero_vb_dev_info;
+	unsigned int num_hetero_pfns;
+	__virtio32 hetero_pfns[VIRTIO_BALLOON_ARRAY_PFNS_MAX];
+	struct balloon_tracepoints tracepoints;
 };
 
 static const struct virtio_device_id id_table[] = {
@@ -147,12 +166,13 @@ static void balloon_ack(struct virtqueue *vq)
 	wake_up(&vb->acked);
 }
 
-static void tell_host(struct virtio_balloon *vb, struct virtqueue *vq)
+static void tell_host(struct virtio_balloon *vb, struct virtqueue *vq,
+		      const void *buf, size_t buflen)
 {
 	struct scatterlist sg;
 	unsigned int len;
 
-	sg_init_one(&sg, vb->pfns, sizeof(vb->pfns[0]) * vb->num_pfns);
+	sg_init_one(&sg, buf, buflen);
 
 	/* We should always be able to add one buffer to an empty queue. */
 	virtqueue_add_outbuf(vq, &sg, 1, vb, GFP_KERNEL);
@@ -250,7 +270,70 @@ static unsigned int fill_balloon(struct virtio_balloon *vb, size_t num)
 	num_allocated_pages = vb->num_pfns;
 	/* Did we get any? */
 	if (vb->num_pfns != 0)
-		tell_host(vb, vb->inflate_vq);
+		tell_host(vb, vb->inflate_vq, vb->pfns,
+			  sizeof(vb->pfns[0]) * vb->num_pfns);
+	mutex_unlock(&vb->balloon_lock);
+
+	return num_allocated_pages;
+}
+
+struct page *balloon_hetero_page_alloc(void)
+{
+	struct page *page =
+		alloc_pages_node(num_online_nodes() - 1,
+				 balloon_mapping_gfp_mask() | __GFP_NOMEMALLOC |
+					 __GFP_NORETRY | __GFP_NOWARN,
+				 0);
+	return page;
+}
+
+static unsigned int fill_hetero_balloon(struct virtio_balloon *vb, size_t num)
+{
+	unsigned int num_allocated_pages;
+	unsigned int num_pfns;
+	struct page *page;
+	LIST_HEAD(pages);
+
+	/* We can only do one array worth at a time. */
+	num = min(num, ARRAY_SIZE(vb->hetero_pfns));
+
+	for (num_pfns = 0; num_pfns < num;
+	     num_pfns += VIRTIO_BALLOON_PAGES_PER_PAGE) {
+		struct page *page = balloon_hetero_page_alloc();
+
+		if (!page) {
+			dev_info_ratelimited(
+				&vb->vdev->dev,
+				"Out of puff! Can't get %u pages\n",
+				VIRTIO_BALLOON_PAGES_PER_PAGE);
+			/* Sleep for at least 1/5 of a second before retry. */
+			msleep(200);
+			break;
+		}
+
+		balloon_page_push(&pages, page);
+	}
+
+	mutex_lock(&vb->balloon_lock);
+
+	vb->num_hetero_pfns = 0;
+
+	while ((page = balloon_page_pop(&pages))) {
+		balloon_page_enqueue(&vb->hetero_vb_dev_info, page);
+
+		set_page_pfns(vb, vb->hetero_pfns + vb->num_hetero_pfns, page);
+		vb->num_hetero_pages += VIRTIO_BALLOON_PAGES_PER_PAGE;
+		if (!virtio_has_feature(vb->vdev,
+					VIRTIO_BALLOON_F_DEFLATE_ON_OOM))
+			adjust_managed_page_count(page, -1);
+		vb->num_hetero_pfns += VIRTIO_BALLOON_PAGES_PER_PAGE;
+	}
+
+	num_allocated_pages = vb->num_hetero_pfns;
+	/* Did we get any? */
+	if (vb->num_hetero_pfns != 0)
+		tell_host(vb, vb->hetero_inflate_vq, vb->hetero_pfns,
+			  sizeof(vb->hetero_pfns[0]) * vb->num_hetero_pfns);
 	mutex_unlock(&vb->balloon_lock);
 
 	return num_allocated_pages;
@@ -300,7 +383,45 @@ static unsigned int leak_balloon(struct virtio_balloon *vb, size_t num)
 	 * is true, we *have* to do it in this order
 	 */
 	if (vb->num_pfns != 0)
-		tell_host(vb, vb->deflate_vq);
+		tell_host(vb, vb->deflate_vq, vb->pfns,
+			  sizeof(vb->pfns[0]) * vb->num_pfns);
+	release_pages_balloon(vb, &pages);
+	mutex_unlock(&vb->balloon_lock);
+	return num_freed_pages;
+}
+
+static unsigned int leak_hetero_balloon(struct virtio_balloon *vb, size_t num)
+{
+	unsigned int num_freed_pages;
+	struct page *page;
+	struct balloon_dev_info *vb_dev_info = &vb->hetero_vb_dev_info;
+	LIST_HEAD(pages);
+
+	/* We can only do one array worth at a time. */
+	num = min(num, ARRAY_SIZE(vb->hetero_pfns));
+
+	mutex_lock(&vb->balloon_lock);
+	/* We can't release more pages than taken */
+	num = min(num, (size_t)vb->num_hetero_pages);
+	for (vb->num_hetero_pfns = 0; vb->num_hetero_pfns < num;
+	     vb->num_hetero_pfns += VIRTIO_BALLOON_PAGES_PER_PAGE) {
+		page = balloon_page_dequeue(vb_dev_info);
+		if (!page)
+			break;
+		set_page_pfns(vb, vb->hetero_pfns + vb->num_hetero_pfns, page);
+		list_add(&page->lru, &pages);
+		vb->num_hetero_pages -= VIRTIO_BALLOON_PAGES_PER_PAGE;
+	}
+
+	num_freed_pages = vb->num_hetero_pfns;
+	/*
+	 * Note that if
+	 * virtio_has_feature(vdev, VIRTIO_BALLOON_F_MUST_TELL_HOST);
+	 * is true, we *have* to do it in this order
+	 */
+	if (vb->num_hetero_pfns != 0)
+		tell_host(vb, vb->hetero_deflate_vq, vb->hetero_pfns,
+			  sizeof(vb->hetero_pfns[0]) * vb->num_hetero_pfns);
 	release_pages_balloon(vb, &pages);
 	mutex_unlock(&vb->balloon_lock);
 	return num_freed_pages;
@@ -408,6 +529,21 @@ static inline s64 towards_target(struct virtio_balloon *vb)
 	return target - vb->num_pages;
 }
 
+static inline s64 towards_hetero_target(struct virtio_balloon *vb)
+{
+	s64 target;
+	u32 num_hetero_pages;
+	if (!virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_HETERO_MEM))
+		return 0;
+
+	/* Legacy balloon config space is LE, unlike all other devices. */
+	virtio_cread_le(vb->vdev, struct virtio_balloon_config,
+			num_hetero_pages, &num_hetero_pages);
+
+	target = num_hetero_pages;
+	return target - vb->num_hetero_pages;
+}
+
 /* Gives back @num_to_return blocks of free pages to mm. */
 static unsigned long return_free_pages_to_mm(struct virtio_balloon *vb,
 					     unsigned long num_to_return)
@@ -446,6 +582,9 @@ static void start_update_balloon_size(struct virtio_balloon *vb)
 {
 	unsigned long flags;
 
+	if (!vb->tracepoints.size_change_begin)
+		vb->tracepoints.size_change_begin = native_sched_clock();
+
 	spin_lock_irqsave(&vb->adjustment_lock, flags);
 	vb->adjustment_signal_pending = true;
 	if (!vb->adjustment_in_progress) {
@@ -465,6 +604,13 @@ static void end_update_balloon_size(struct virtio_balloon *vb)
 		pm_relax(vb->vdev->dev.parent);
 	}
 	spin_unlock_irq(&vb->adjustment_lock);
+
+	vb->tracepoints.size_change_elapsed =
+		native_sched_clock() -
+		vb->tracepoints.size_change_begin;
+	vb->tracepoints.size_change_begin = 0;
+	pr_info("balloon: size change has taken %llu\n",
+		vb->tracepoints.size_change_elapsed);
 }
 
 static void virtballoon_changed(struct virtio_device *vdev)
@@ -475,6 +621,10 @@ static void virtballoon_changed(struct virtio_device *vdev)
 	spin_lock_irqsave(&vb->stop_update_lock, flags);
 	if (!vb->stop_update) {
 		start_update_balloon_size(vb);
+		queue_work(system_freezable_wq,
+			   &vb->update_balloon_size_work);
+		queue_work(system_freezable_wq,
+			   &vb->update_balloon_hetero_size_work);
 		virtio_balloon_queue_free_page_work(vb);
 	}
 	spin_unlock_irqrestore(&vb->stop_update_lock, flags);
@@ -483,10 +633,14 @@ static void virtballoon_changed(struct virtio_device *vdev)
 static void update_balloon_size(struct virtio_balloon *vb)
 {
 	u32 actual = vb->num_pages;
+	u32 actual_hetero = vb->num_hetero_pages;
 
 	/* Legacy balloon config space is LE, unlike all other devices. */
 	virtio_cwrite_le(vb->vdev, struct virtio_balloon_config, actual,
 			 &actual);
+	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_HETERO_MEM))
+		virtio_cwrite_le(vb->vdev, struct virtio_balloon_config,
+				 actual_hetero, &actual_hetero);
 }
 
 static void update_balloon_stats_func(struct work_struct *work)
@@ -526,6 +680,39 @@ static void update_balloon_size_func(struct work_struct *work)
 		end_update_balloon_size(vb);
 }
 
+static void update_balloon_hetero_size_func(struct work_struct *work)
+{
+	struct virtio_balloon *vb;
+	s64 diff;
+
+	vb = container_of(work, struct virtio_balloon,
+			  update_balloon_hetero_size_work);
+	diff = towards_hetero_target(vb);
+
+	if (!diff)
+		return;
+
+	if (!vb->tracepoints.hetero_size_change_begin)
+		vb->tracepoints.hetero_size_change_begin = native_sched_clock();
+
+	if (diff > 0)
+		diff -= fill_hetero_balloon(vb, diff);
+	else
+		diff += leak_hetero_balloon(vb, -diff);
+	update_balloon_size(vb);
+
+	if (diff)
+		queue_work(system_freezable_wq, work);
+	else {
+		vb->tracepoints.hetero_size_change_elapsed =
+			native_sched_clock() -
+			vb->tracepoints.hetero_size_change_begin;
+		vb->tracepoints.hetero_size_change_begin = 0;
+		pr_info("balloon: hetero size change has taken %llu\n",
+			vb->tracepoints.hetero_size_change_elapsed);
+	}
+}
+
 static int init_vqs(struct virtio_balloon *vb)
 {
 	struct virtqueue *vqs[VIRTIO_BALLOON_VQ_MAX];
@@ -547,6 +734,8 @@ static int init_vqs(struct virtio_balloon *vb)
 	callbacks[VIRTIO_BALLOON_VQ_FREE_PAGE] = NULL;
 	names[VIRTIO_BALLOON_VQ_FREE_PAGE] = NULL;
 	names[VIRTIO_BALLOON_VQ_REPORTING] = NULL;
+	names[VIRTIO_BALLOON_VQ_HETERO_INFLATE] = NULL;
+	names[VIRTIO_BALLOON_VQ_HETERO_DEFLATE] = NULL;
 
 	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_STATS_VQ)) {
 		names[VIRTIO_BALLOON_VQ_STATS] = "stats";
@@ -561,6 +750,13 @@ static int init_vqs(struct virtio_balloon *vb)
 	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_REPORTING)) {
 		names[VIRTIO_BALLOON_VQ_REPORTING] = "reporting_vq";
 		callbacks[VIRTIO_BALLOON_VQ_REPORTING] = balloon_ack;
+	}
+
+	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_HETERO_MEM)) {
+		names[VIRTIO_BALLOON_VQ_HETERO_INFLATE] = "hetero_inflate_vq";
+		callbacks[VIRTIO_BALLOON_VQ_HETERO_INFLATE] = balloon_ack;
+		names[VIRTIO_BALLOON_VQ_HETERO_DEFLATE] = "hetero_deflate_vq";
+		callbacks[VIRTIO_BALLOON_VQ_HETERO_DEFLATE] = balloon_ack;
 	}
 
 	err = virtio_find_vqs(vb->vdev, VIRTIO_BALLOON_VQ_MAX, vqs,
@@ -597,6 +793,11 @@ static int init_vqs(struct virtio_balloon *vb)
 
 	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_REPORTING))
 		vb->reporting_vq = vqs[VIRTIO_BALLOON_VQ_REPORTING];
+
+	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_HETERO_MEM)) {
+		vb->hetero_inflate_vq = vqs[VIRTIO_BALLOON_VQ_HETERO_INFLATE];
+		vb->hetero_deflate_vq = vqs[VIRTIO_BALLOON_VQ_HETERO_DEFLATE];
+	}
 
 	return 0;
 }
@@ -821,7 +1022,8 @@ static int virtballoon_migratepage(struct balloon_dev_info *vb_dev_info,
 	spin_unlock_irqrestore(&vb_dev_info->pages_lock, flags);
 	vb->num_pfns = VIRTIO_BALLOON_PAGES_PER_PAGE;
 	set_page_pfns(vb, vb->pfns, newpage);
-	tell_host(vb, vb->inflate_vq);
+	tell_host(vb, vb->inflate_vq, vb->pfns,
+		  sizeof(vb->pfns[0]) * vb->num_pfns);
 
 	/* balloon's page migration 2nd step -- deflate "page" */
 	spin_lock_irqsave(&vb_dev_info->pages_lock, flags);
@@ -829,7 +1031,8 @@ static int virtballoon_migratepage(struct balloon_dev_info *vb_dev_info,
 	spin_unlock_irqrestore(&vb_dev_info->pages_lock, flags);
 	vb->num_pfns = VIRTIO_BALLOON_PAGES_PER_PAGE;
 	set_page_pfns(vb, vb->pfns, page);
-	tell_host(vb, vb->deflate_vq);
+	tell_host(vb, vb->deflate_vq, vb->pfns,
+		  sizeof(vb->pfns[0]) * vb->num_pfns);
 
 	mutex_unlock(&vb->balloon_lock);
 
@@ -876,6 +1079,10 @@ static int virtio_balloon_oom_notify(struct notifier_block *nb,
 	unsigned long *freed = parm;
 
 	*freed += leak_balloon(vb, VIRTIO_BALLOON_OOM_NR_PAGES) /
+		  VIRTIO_BALLOON_PAGES_PER_PAGE;
+	*freed += leak_hetero_balloon(
+			  vb, VIRTIO_BALLOON_OOM_NR_PAGES -
+				      *freed * VIRTIO_BALLOON_PAGES_PER_PAGE) /
 		  VIRTIO_BALLOON_PAGES_PER_PAGE;
 	update_balloon_size(vb);
 
@@ -1029,11 +1236,24 @@ static int virtballoon_probe(struct virtio_device *vdev)
 
 	spin_lock_init(&vb->adjustment_lock);
 
+	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_HETERO_MEM)) {
+		INIT_WORK(&vb->update_balloon_hetero_size_work,
+			  update_balloon_hetero_size_func);
+		balloon_devinfo_init(&vb->hetero_vb_dev_info);
+#ifdef CONFIG_BALLOON_COMPACTION
+		// TODO: heterogeneous balloon migration
+		// vb->hetero_vb_dev_info.migratepage = virtballoon_migratepage;
+#endif
+	}
+	memset(&vb->tracepoints, 0, sizeof(struct balloon_tracepoints));
+
 	virtio_device_ready(vdev);
 
-	if (towards_target(vb))
+	if (towards_target(vb) || towards_hetero_target(vb))
 		virtballoon_changed(vdev);
 	return 0;
+
+out_unregister_hetero:
 
 out_unregister_oom:
 	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_DEFLATE_ON_OOM))
@@ -1057,6 +1277,8 @@ static void remove_common(struct virtio_balloon *vb)
 	/* There might be pages left in the balloon: free them. */
 	while (vb->num_pages)
 		leak_balloon(vb, vb->num_pages);
+	while (vb->num_hetero_pages)
+		leak_hetero_balloon(vb, vb->num_pages);
 	update_balloon_size(vb);
 
 	/* There might be free pages that are being reported: release them. */
@@ -1083,6 +1305,8 @@ static void virtballoon_remove(struct virtio_device *vdev)
 	vb->stop_update = true;
 	spin_unlock_irq(&vb->stop_update_lock);
 	cancel_work_sync(&vb->update_balloon_size_work);
+	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_HETERO_MEM))
+		cancel_work_sync(&vb->update_balloon_hetero_size_work);
 	cancel_work_sync(&vb->update_balloon_stats_work);
 
 	if (virtio_has_feature(vdev, VIRTIO_BALLOON_F_FREE_PAGE_HINT)) {
@@ -1118,7 +1342,7 @@ static int virtballoon_restore(struct virtio_device *vdev)
 
 	virtio_device_ready(vdev);
 
-	if (towards_target(vb))
+	if (towards_target(vb) || towards_hetero_target(vb))
 		virtballoon_changed(vdev);
 	update_balloon_size(vb);
 	return 0;
@@ -1138,6 +1362,11 @@ static int virtballoon_validate(struct virtio_device *vdev)
 	else if (!virtio_has_feature(vdev, VIRTIO_BALLOON_F_PAGE_POISON))
 		__virtio_clear_bit(vdev, VIRTIO_BALLOON_F_REPORTING);
 
+	// Heterogeneous memory is exposed as a separated numa node.
+	// Only enable support when such configuration is possible.
+	if (num_online_nodes() < 2)
+		__virtio_clear_bit(vdev, VIRTIO_BALLOON_F_HETERO_MEM);
+
 	__virtio_clear_bit(vdev, VIRTIO_F_ACCESS_PLATFORM);
 	return 0;
 }
@@ -1149,6 +1378,7 @@ static unsigned int features[] = {
 	VIRTIO_BALLOON_F_FREE_PAGE_HINT,
 	VIRTIO_BALLOON_F_PAGE_POISON,
 	VIRTIO_BALLOON_F_REPORTING,
+	VIRTIO_BALLOON_F_HETERO_MEM,
 };
 
 static struct virtio_driver virtio_balloon_driver = {

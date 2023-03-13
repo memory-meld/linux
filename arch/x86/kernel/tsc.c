@@ -249,6 +249,7 @@ noinstr u64 native_sched_clock(void)
 	/* No locking but a rare wrong value is not a big deal: */
 	return (jiffies_64 - INITIAL_JIFFIES) * (1000000000 / HZ);
 }
+EXPORT_SYMBOL_GPL(native_sched_clock);
 
 /*
  * Generate a sched_clock if you already have a TSC value.
