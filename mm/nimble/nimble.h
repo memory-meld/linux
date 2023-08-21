@@ -6,6 +6,10 @@
 
 #include "../internal.h"
 
+extern int shrink_lists(struct task_struct *p, struct mm_struct *mm,
+			const nodemask_t *from, const nodemask_t *to,
+			unsigned long nr_to_scan);
+
 extern void nimble_shrink_active_list(unsigned long nr_to_scan, struct lruvec *lruvec,
 			       struct scan_control *sc, enum lru_list lru);
 
