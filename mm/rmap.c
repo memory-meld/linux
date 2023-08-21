@@ -76,6 +76,7 @@
 #include <linux/userfaultfd_k.h>
 #include <linux/mm_inline.h>
 
+#include <asm/timer.h>
 #include <asm/tlbflush.h>
 
 #define CREATE_TRACE_POINTS
@@ -958,7 +959,7 @@ static bool invalid_folio_referenced_vma(struct vm_area_struct *vma, void *arg)
  * Return: The number of mappings which referenced the folio. Return -1 if
  * the function bailed out due to rmap lock contention.
  */
-int folio_referenced(struct folio *folio, int is_locked,
+int __folio_referenced(struct folio *folio, int is_locked,
 		     struct mem_cgroup *memcg, unsigned long *vm_flags)
 {
 	int we_locked = 0;
@@ -994,6 +995,16 @@ int folio_referenced(struct folio *folio, int is_locked,
 		folio_unlock(folio);
 
 	return rwc.contended ? -1 : pra.referenced;
+}
+int folio_referenced(struct folio *folio, int is_locked,
+		     struct mem_cgroup *memcg, unsigned long *vm_flags)
+{
+	int err = 0;
+	u64 start = native_sched_clock();
+	err = __folio_referenced(folio, is_locked, memcg, vm_flags);
+	count_vm_events(A_BIT_COLLECTION_COST, native_sched_clock() - start);
+	count_vm_event(A_BIT_SAMPLE_COLLECTED);
+	return err;
 }
 
 static int page_vma_mkclean_one(struct page_vma_mapped_walk *pvmw)
