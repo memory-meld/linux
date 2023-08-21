@@ -6,6 +6,14 @@
 
 #include "../internal.h"
 
+extern void nimble_shrink_active_list(unsigned long nr_to_scan, struct lruvec *lruvec,
+			       struct scan_control *sc, enum lru_list lru);
+
+extern unsigned long nimble_shrink_inactive_list(unsigned long nr_to_scan,
+					  struct lruvec *lruvec,
+					  struct scan_control *sc,
+					  enum lru_list lru);
+
 extern unsigned long mem_cgroup_node_nr_lru_pages(struct mem_cgroup *memcg,
 						  int nid,
 						  unsigned int lru_mask,
