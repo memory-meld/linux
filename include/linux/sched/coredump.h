@@ -65,6 +65,10 @@ static inline int get_dumpable(struct mm_struct *mm)
  */
 //#define MMF_EXE_FILE_CHANGED	18	/* see prctl_set_mm_exe_file() */
 
+#ifdef CONFIG_NIMBLE_PAGE_MANAGEMENT
+#define MMF_MM_MANAGE		18
+#endif
+
 #define MMF_HAS_UPROBES		19	/* has uprobes */
 #define MMF_RECALC_UPROBES	20	/* MMF_HAS_UPROBES can be wrong */
 #define MMF_OOM_SKIP		21	/* mm is of no interest for the OOM killer */
