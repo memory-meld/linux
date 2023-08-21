@@ -31,13 +31,20 @@ enum {
 #define MPOL_F_STATIC_NODES	(1 << 15)
 #define MPOL_F_RELATIVE_NODES	(1 << 14)
 #define MPOL_F_NUMA_BALANCING	(1 << 13) /* Optimize with NUMA balancing if possible */
+#ifdef CONFIG_NIMBLE_PAGE_MANAGEMENT
+#define MPOL_F_MEMCG		(1 << 12) /* Allocate on the first node of a group
+					     that has enough free space */
 
 /*
  * MPOL_MODE_FLAGS is the union of all possible optional mode flags passed to
  * either set_mempolicy() or mbind().
  */
+#define MPOL_MODE_FLAGS \
+	(MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES | MPOL_F_NUMA_BALANCING | MPOL_F_MEMCG)
+#else
 #define MPOL_MODE_FLAGS							\
 	(MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES | MPOL_F_NUMA_BALANCING)
+#endif
 
 /* Flags for get_mempolicy */
 #define MPOL_F_NODE	(1<<0)	/* return next IL mode instead of node mask */
@@ -55,6 +62,23 @@ enum {
 #define MPOL_MF_VALID	(MPOL_MF_STRICT   | 	\
 			 MPOL_MF_MOVE     | 	\
 			 MPOL_MF_MOVE_ALL)
+
+#ifdef CONFIG_NIMBLE_PAGE_MANAGEMENT
+/* Flags for nimble mm_manage */
+#define MPOL_NF_MOVE		MPOL_MF_MOVE
+#define MPOL_NF_MOVE_ALL	MPOL_MF_MOVE_ALL
+#define MPOL_NF_MOVE_MT		(1<<6)	/* Use multi-threaded page copy routine */
+#define MPOL_NF_MOVE_CONCUR	(1<<7)	/* Move pages in a batch */
+#define MPOL_NF_EXCHANGE	(1<<8)	/* Exchange pages */
+#define MPOL_NF_SHRINK_LISTS	(1<<9)	/* Exchange pages */
+
+#define MPOL_NF_VALID	(MPOL_NF_MOVE		|	\
+			 MPOL_NF_MOVE_ALL	|	\
+			 MPOL_NF_MOVE_MT	|	\
+			 MPOL_NF_MOVE_CONCUR	|	\
+			 MPOL_NF_EXCHANGE	|	\
+			 MPOL_NF_SHRINK_LISTS)
+#endif
 
 /*
  * Internal flags that share the struct mempolicy flags word with
