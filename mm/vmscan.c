@@ -492,7 +492,7 @@ static long add_nr_deferred(long nr, struct shrinker *shrinker,
 	return atomic_long_add_return(nr, &shrinker->nr_deferred[nid]);
 }
 
-static bool can_demote(int nid, struct scan_control *sc)
+bool can_demote(int nid, struct scan_control *sc)
 {
 	if (!numa_demotion_enabled)
 		return false;
@@ -1416,7 +1416,7 @@ void folio_putback_lru(struct folio *folio)
 	folio_put(folio);		/* drop ref from isolate */
 }
 
-static enum folio_references folio_check_references(struct folio *folio,
+enum folio_references folio_check_references(struct folio *folio,
 						  struct scan_control *sc)
 {
 	int referenced_ptes, referenced_folio;
@@ -2196,7 +2196,7 @@ static bool skip_cma(struct folio *folio, struct scan_control *sc)
  *
  * returns how many pages were moved onto *@dst.
  */
-static unsigned long isolate_lru_folios(unsigned long nr_to_scan,
+unsigned long isolate_lru_folios(unsigned long nr_to_scan,
 		struct lruvec *lruvec, struct list_head *dst,
 		unsigned long *nr_scanned, struct scan_control *sc,
 		enum lru_list lru)
@@ -2382,7 +2382,7 @@ static int too_many_isolated(struct pglist_data *pgdat, int file,
  *
  * Returns the number of pages moved to the given lruvec.
  */
-static unsigned int move_folios_to_lru(struct lruvec *lruvec,
+unsigned int move_folios_to_lru(struct lruvec *lruvec,
 		struct list_head *list)
 {
 	int nr_pages, nr_moved = 0;
