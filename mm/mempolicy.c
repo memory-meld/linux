@@ -1401,7 +1401,7 @@ static int get_bitmap(unsigned long *mask, const unsigned long __user *nmask,
 }
 
 /* Copy a node mask from user space. */
-static int get_nodes(nodemask_t *nodes, const unsigned long __user *nmask,
+int get_nodes(nodemask_t *nodes, const unsigned long __user *nmask,
 		     unsigned long maxnode)
 {
 	--maxnode;
