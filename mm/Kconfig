@@ -1243,4 +1243,6 @@ config IOMMU_MM_DATA
 
 source "mm/damon/Kconfig"
 
+source "mm/nimble/Kconfig"
+
 endmenu
