@@ -715,13 +715,6 @@ void folio_putback_lru(struct folio *folio)
 	folio_put(folio);		/* drop ref from isolate */
 }
 
-enum folio_references {
-	FOLIOREF_RECLAIM,
-	FOLIOREF_RECLAIM_CLEAN,
-	FOLIOREF_KEEP,
-	FOLIOREF_ACTIVATE,
-};
-
 static enum folio_references folio_check_references(struct folio *folio,
 						  struct scan_control *sc)
 {

@@ -1482,4 +1482,10 @@ struct scan_control {
 	struct reclaim_state reclaim_state;
 };
 
+enum folio_references {
+	FOLIOREF_RECLAIM,
+	FOLIOREF_RECLAIM_CLEAN,
+	FOLIOREF_KEEP,
+	FOLIOREF_ACTIVATE,
+};
 #endif	/* __MM_INTERNAL_H */
