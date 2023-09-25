@@ -11,6 +11,7 @@
 #include <linux/fs.h>
 #include <linux/mm.h>
 #include <linux/mman.h>
+#include <linux/userfaultfd_k.h>
 #include "dax-private.h"
 #include "bus.h"
 
@@ -114,11 +115,17 @@ static vm_fault_t __dev_dax_pte_fault(struct dev_dax *dev_dax,
 	if (dev_dax->align > PAGE_SIZE) {
 		dev_dbg(dev, "alignment (%#x) > fault size (%#x)\n",
 			dev_dax->align, fault_size);
-		return VM_FAULT_SIGBUS;
+		// return VM_FAULT_SIGBUS;
 	}
 
-	if (fault_size != dev_dax->align)
-		return VM_FAULT_SIGBUS;
+	// if (fault_size != dev_dax->align)
+	// 	return VM_FAULT_SIGBUS;
+
+	if (vmf->vma && userfaultfd_wp(vmf->vma))
+		return handle_userfault(vmf, VM_UFFD_WP);
+
+	if (vmf->vma && userfaultfd_missing(vmf->vma))
+		return handle_userfault(vmf, VM_UFFD_MISSING);
 
 	phys = dax_pgoff_to_phys(dev_dax, vmf->pgoff, PAGE_SIZE);
 	if (phys == -1) {
@@ -161,6 +168,12 @@ static vm_fault_t __dev_dax_pmd_fault(struct dev_dax *dev_dax,
 	if (pmd_addr < vmf->vma->vm_start ||
 			(pmd_addr + PMD_SIZE) > vmf->vma->vm_end)
 		return VM_FAULT_SIGBUS;
+
+	if (vmf->vma && userfaultfd_wp(vmf->vma))
+		return handle_userfault(vmf, VM_UFFD_WP);
+
+	if (vmf->vma && userfaultfd_missing(vmf->vma))
+		return handle_userfault(vmf, VM_UFFD_MISSING);
 
 	pgoff = linear_page_index(vmf->vma, pmd_addr);
 	phys = dax_pgoff_to_phys(dev_dax, pgoff, PMD_SIZE);
@@ -206,6 +219,12 @@ static vm_fault_t __dev_dax_pud_fault(struct dev_dax *dev_dax,
 	if (pud_addr < vmf->vma->vm_start ||
 			(pud_addr + PUD_SIZE) > vmf->vma->vm_end)
 		return VM_FAULT_SIGBUS;
+
+	if (vmf->vma && userfaultfd_wp(vmf->vma))
+		return handle_userfault(vmf, VM_UFFD_WP);
+
+	if (vmf->vma && userfaultfd_missing(vmf->vma))
+		return handle_userfault(vmf, VM_UFFD_MISSING);
 
 	pgoff = linear_page_index(vmf->vma, pud_addr);
 	phys = dax_pgoff_to_phys(dev_dax, pgoff, PUD_SIZE);

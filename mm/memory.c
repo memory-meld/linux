@@ -4837,6 +4837,11 @@ static inline vm_fault_t wp_huge_pmd(struct vm_fault *vmf)
 		return do_huge_pmd_wp_page(vmf);
 	}
 
+	if (vma_is_dax(vmf->vma)) {
+		if (userfaultfd_huge_pmd_wp(vmf->vma, vmf->orig_pmd))
+			return handle_userfault(vmf, VM_UFFD_WP);
+	}
+
 	if (vmf->vma->vm_flags & (VM_SHARED | VM_MAYSHARE)) {
 		if (vmf->vma->vm_ops->huge_fault) {
 			ret = vmf->vma->vm_ops->huge_fault(vmf, PE_SIZE_PMD);
