@@ -720,7 +720,7 @@ retry:
 	 * it will overwrite vm_ops, so vma_is_anonymous must return false.
 	 */
 	if (WARN_ON_ONCE(vma_is_anonymous(dst_vma) &&
-	    dst_vma->vm_flags & VM_SHARED))
+			dst_vma->vm_flags & VM_SHARED && !vma_is_dax(dst_vma)))
 		goto out_unlock;
 
 	/*
@@ -737,7 +737,8 @@ retry:
 		return  mfill_atomic_hugetlb(ctx, dst_vma, dst_start,
 					     src_start, len, flags);
 
-	if (!vma_is_anonymous(dst_vma) && !vma_is_shmem(dst_vma))
+	if (!vma_is_anonymous(dst_vma) && !vma_is_shmem(dst_vma) &&
+	    !vma_is_dax(dst_vma))
 		goto out_unlock;
 	if (!vma_is_shmem(dst_vma) &&
 	    uffd_flags_mode_is(flags, MFILL_ATOMIC_CONTINUE))

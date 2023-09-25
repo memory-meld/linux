@@ -241,7 +241,7 @@ static inline bool vma_can_userfault(struct vm_area_struct *vma,
 
 	/* By default, allow any of anon|shmem|hugetlb */
 	return vma_is_anonymous(vma) || is_vm_hugetlb_page(vma) ||
-	    vma_is_shmem(vma);
+		vma_is_shmem(vma) || vma_is_dax(vma);
 }
 
 extern int dup_userfaultfd(struct vm_area_struct *, struct list_head *);
