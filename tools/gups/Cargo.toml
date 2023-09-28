@@ -1,0 +1,17 @@
+[package]
+name = "gups"
+version = "0.1.0"
+edition = "2021"
+authors = ["Junliang HU <jlhu@cse.cuhk.edu.hk>"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.4", features = ["derive"] }
+memmap = "0.7"
+mix-distribution = "0.2"
+rand = "0.6"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
