@@ -1413,6 +1413,8 @@ const char * const vmstat_text[] = {
 	"vma_lock_retry",
 	"vma_lock_miss",
 #endif
+	"pebs_sample_collected",
+	"pebs_collection_cost",
 	"a_bit_sample_collected",
 	"a_bit_collection_cost",
 	"hint_fault_sample_collected",
