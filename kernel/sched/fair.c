@@ -50,6 +50,7 @@
 #include <linux/rbtree_augmented.h>
 
 #include <asm/switch_to.h>
+#include <asm/timer.h>
 
 #include "sched.h"
 #include "stats.h"
@@ -3199,6 +3200,7 @@ static bool vma_is_accessed(struct mm_struct *mm, struct vm_area_struct *vma)
  */
 static void task_numa_work(struct callback_head *work)
 {
+	unsigned long begin = native_sched_clock(), cost = 0;
 	unsigned long migrate, next_scan, now = jiffies;
 	struct task_struct *p = current;
 	struct mm_struct *mm = p->mm;
@@ -3390,7 +3392,10 @@ retry_pids:
 			if (pages <= 0 || virtpages <= 0)
 				goto out;
 
+			count_vm_events(HINT_FAULT_COLLECTION_COST,
+					native_sched_clock() - begin);
 			cond_resched();
+			begin = native_sched_clock();
 		} while (end != vma->vm_end);
 
 		/* VMA scan is complete, do not scan until next sequence. */
@@ -3437,6 +3442,8 @@ out:
 		u64 diff = p->se.sum_exec_runtime - runtime;
 		p->node_stamp += 32 * diff;
 	}
+	count_vm_events(HINT_FAULT_COLLECTION_COST,
+			native_sched_clock() - begin);
 }
 
 void init_numa_balancing(unsigned long clone_flags, struct task_struct *p)

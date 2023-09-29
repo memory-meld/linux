@@ -87,6 +87,7 @@
 #include <linux/uaccess.h>
 #include <asm/tlb.h>
 #include <asm/tlbflush.h>
+#include <asm/timer.h>
 
 #include "pgalloc-track.h"
 #include "internal.h"
@@ -5043,6 +5044,7 @@ int numa_migrate_prep(struct folio *folio, struct vm_area_struct *vma,
 	/* Record the current PID acceesing VMA */
 	vma_set_access_pid_bit(vma);
 
+	count_vm_event(HINT_FAULT_SAMPLE_COLLECTED);
 	count_vm_numa_event(NUMA_HINT_FAULTS);
 	if (page_nid == numa_node_id()) {
 		count_vm_numa_event(NUMA_HINT_FAULTS_LOCAL);
@@ -5062,6 +5064,10 @@ static vm_fault_t do_numa_page(struct vm_fault *vmf)
 	int target_nid;
 	pte_t pte, old_pte;
 	int flags = 0;
+
+	if (vmf->regs)
+		count_vm_events(HINT_FAULT_COLLECTION_COST,
+				native_sched_clock() - vmf->regs->r11);
 
 	/*
 	 * The pte cannot be used safely until we verify, while holding the page
@@ -5353,7 +5359,8 @@ unlock:
  * and __folio_lock_or_retry().
  */
 static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
-		unsigned long address, unsigned int flags)
+				    unsigned long address, unsigned int flags,
+				    struct pt_regs *regs)
 {
 	struct vm_fault vmf = {
 		.vma = vma,
@@ -5362,6 +5369,7 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
 		.flags = flags,
 		.pgoff = linear_page_index(vma, address),
 		.gfp_mask = __get_fault_gfp_mask(vma),
+		.regs = regs,
 	};
 	struct mm_struct *mm = vma->vm_mm;
 	unsigned long vm_flags = vma->vm_flags;
@@ -5608,7 +5616,7 @@ vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
 	if (unlikely(is_vm_hugetlb_page(vma)))
 		ret = hugetlb_fault(vma->vm_mm, vma, address, flags);
 	else
-		ret = __handle_mm_fault(vma, address, flags);
+		ret = __handle_mm_fault(vma, address, flags, regs);
 
 	lru_gen_exit_fault();
 

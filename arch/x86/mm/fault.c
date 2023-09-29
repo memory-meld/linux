@@ -37,6 +37,8 @@
 #include <asm/fred.h>
 #include <asm/sev.h>			/* snp_dump_hva_rmpentry()	*/
 
+#include <asm/timer.h>
+
 #define CREATE_TRACE_POINTS
 #include <asm/trace/exceptions.h>
 
@@ -1502,7 +1504,10 @@ handle_page_fault(struct pt_regs *regs, unsigned long error_code,
 	if (unlikely(fault_in_kernel_space(address))) {
 		do_kern_addr_fault(regs, error_code, address);
 	} else {
+		unsigned long r11 = regs->r11;
+		regs->r11 = native_sched_clock();
 		do_user_addr_fault(regs, error_code, address);
+		regs->r11 = r11;
 		/*
 		 * User address page fault handling might have reenabled
 		 * interrupts. Fixing up all potential exit points of
