@@ -7497,7 +7497,7 @@ void perf_output_sample(struct perf_output_handle *handle,
 	}
 }
 
-static u64 perf_virt_to_phys(u64 virt)
+u64 perf_virt_to_phys(u64 virt)
 {
 	u64 phys_addr = 0;
 
@@ -7531,6 +7531,7 @@ static u64 perf_virt_to_phys(u64 virt)
 
 	return phys_addr;
 }
+EXPORT_SYMBOL_GPL(perf_virt_to_phys);
 
 /*
  * Return the pagetable size of a given virtual address.
