@@ -530,6 +530,7 @@ struct vm_fault {
 					 * page table to avoid allocation from
 					 * atomic context.
 					 */
+	struct pt_regs *regs;
 };
 
 /* page entry size for vm->huge_fault() */

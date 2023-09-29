@@ -49,6 +49,7 @@
 #include <linux/task_work.h>
 
 #include <asm/switch_to.h>
+#include <asm/timer.h>
 
 #include <linux/sched/cond_resched.h>
 
@@ -2952,6 +2953,7 @@ static bool vma_is_accessed(struct vm_area_struct *vma)
  */
 static void task_numa_work(struct callback_head *work)
 {
+	unsigned long begin = native_sched_clock(), cost = 0;
 	unsigned long migrate, next_scan, now = jiffies;
 	struct task_struct *p = current;
 	struct mm_struct *mm = p->mm;
@@ -3106,7 +3108,10 @@ static void task_numa_work(struct callback_head *work)
 			if (pages <= 0 || virtpages <= 0)
 				goto out;
 
+			count_vm_events(HINT_FAULT_COLLECTION_COST,
+					native_sched_clock() - begin);
 			cond_resched();
+			begin = native_sched_clock();
 		} while (end != vma->vm_end);
 	} for_each_vma(vmi, vma);
 
@@ -3133,6 +3138,8 @@ out:
 		u64 diff = p->se.sum_exec_runtime - runtime;
 		p->node_stamp += 32 * diff;
 	}
+	count_vm_events(HINT_FAULT_COLLECTION_COST,
+			native_sched_clock() - begin);
 }
 
 void init_numa_balancing(unsigned long clone_flags, struct task_struct *p)
