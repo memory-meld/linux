@@ -1415,6 +1415,8 @@ const char * const vmstat_text[] = {
 #endif
 	"a_bit_sample_collected",
 	"a_bit_collection_cost",
+	"hint_fault_sample_collected",
+	"hint_fault_collection_cost",
 #endif /* CONFIG_VM_EVENT_COUNTERS || CONFIG_MEMCG */
 };
 #endif /* CONFIG_PROC_FS || CONFIG_SYSFS || CONFIG_NUMA || CONFIG_MEMCG */
