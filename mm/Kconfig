@@ -1245,4 +1245,6 @@ source "mm/damon/Kconfig"
 
 source "mm/nimble/Kconfig"
 
+source "mm/hagent/Kconfig"
+
 endmenu
