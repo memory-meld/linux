@@ -1,0 +1,6 @@
+config HAGENT
+	tristate "Heterogeneous memory agent"
+	default m
+	help
+	  Enable heterogeneous memory guest agent to rebalance memory across different memory media.
+
