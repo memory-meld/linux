@@ -59,9 +59,8 @@ enum {
 #define MPOL_MF_LAZY	 (1<<3)	/* UNSUPPORTED FLAG: Lazy migrate on fault */
 #define MPOL_MF_INTERNAL (1<<4)	/* Internal flags start here */
 
-#define MPOL_MF_VALID	(MPOL_MF_STRICT   | 	\
-			 MPOL_MF_MOVE     | 	\
-			 MPOL_MF_MOVE_ALL)
+#define MPOL_MF_VALID \
+	(MPOL_MF_STRICT | MPOL_MF_MOVE | MPOL_MF_MOVE_ALL | MPOL_MF_LAZY)
 
 #ifdef CONFIG_NIMBLE_PAGE_MANAGEMENT
 /* Flags for nimble mm_manage */
@@ -70,7 +69,7 @@ enum {
 #define MPOL_NF_MOVE_MT		(1<<6)	/* Use multi-threaded page copy routine */
 #define MPOL_NF_MOVE_CONCUR	(1<<7)	/* Move pages in a batch */
 #define MPOL_NF_EXCHANGE	(1<<8)	/* Exchange pages */
-#define MPOL_NF_SHRINK_LISTS	(1<<9)	/* Exchange pages */
+#define MPOL_NF_SHRINK_LISTS (1 << 9) /* Shrink lists */
 
 #define MPOL_NF_VALID	(MPOL_NF_MOVE		|	\
 			 MPOL_NF_MOVE_ALL	|	\
