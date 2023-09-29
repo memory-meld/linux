@@ -2272,6 +2272,7 @@ static void intel_pmu_drain_pebs_icl(struct pt_regs *iregs, struct perf_sample_d
 	void *base, *at, *top;
 	int bit, size;
 	u64 mask;
+	u64 begin = native_sched_clock();
 
 	if (!x86_pmu.pebs_active)
 		return;
@@ -2299,6 +2300,7 @@ static void intel_pmu_drain_pebs_icl(struct pt_regs *iregs, struct perf_sample_d
 		for_each_set_bit(bit, (unsigned long *)&pebs_status, size)
 			counts[bit]++;
 	}
+	count_vm_events(PEBS_COLLECTION_COST, native_sched_clock() - begin);
 
 	for_each_set_bit(bit, (unsigned long *)&mask, size) {
 		if (counts[bit] == 0)
@@ -2314,6 +2316,7 @@ static void intel_pmu_drain_pebs_icl(struct pt_regs *iregs, struct perf_sample_d
 		__intel_pmu_pebs_event(event, iregs, data, base,
 				       top, bit, counts[bit],
 				       setup_pebs_adaptive_sample_data);
+		count_vm_events(PEBS_SAMPLE_COLLECTED, counts[bit]);
 	}
 }
 
