@@ -1296,7 +1296,7 @@ static long do_mbind(unsigned long start, unsigned long len,
 		return PTR_ERR(new);
 
 	if (flags & MPOL_MF_LAZY)
-		new->flags |= MPOL_F_MOF;
+		new->flags |= MPOL_F_MOF | MPOL_F_MORON;
 
 	/*
 	 * If we are using the default policy then operation
