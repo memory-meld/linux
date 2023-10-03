@@ -44,18 +44,12 @@ fn main() -> Result<()> {
 
     // warm up
     let start = Instant::now();
-    let handles = gups.start_workers()?;
-    for w in handles {
-        w.join().expect("failed wating for worker threads");
-    }
+    gups.start_workers()?;
     info!("warm up took: {:?}", start.elapsed());
 
     // timed iteration
     let start = Instant::now();
-    let handles = gups.start_workers()?;
-    for w in handles {
-        w.join().expect("failed wating for worker threads");
-    }
+    gups.start_workers()?;
     info!("timed iteration took: {:?}", start.elapsed());
 
     // shifted hotset
@@ -66,10 +60,7 @@ fn main() -> Result<()> {
     .unwrap();
     gups.reset_distribution(dist);
     let start = Instant::now();
-    let handles = gups.start_workers()?;
-    for w in handles {
-        w.join().expect("failed wating for worker threads");
-    }
+    gups.start_workers()?;
     info!("shifted iteration took: {:?}", start.elapsed());
 
     Ok(())
