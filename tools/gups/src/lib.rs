@@ -1,4 +1,5 @@
 use std::{
+    hint, ptr,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Barrier,
@@ -107,65 +108,76 @@ impl<D: Distribution<usize> + Clone + Send + 'static> Gups<D> {
         Ok(handle)
     }
 
-    pub fn start_workers(&mut self) -> Result<Vec<JoinHandle<()>>> {
+    pub fn start_workers(&mut self) -> Result<()> {
         let fire = Arc::new(Barrier::new(self.common.threads));
         let goal = Arc::new(Barrier::new(self.common.threads));
-        let handles: std::result::Result<Vec<_>, _> = self
-            .memory
-            .chunks_exact_mut(self.common.len / self.common.threads)
-            .enumerate()
-            .map(|(tid, thread_mem)| {
-                let mut thread_mem = thread_mem.to_owned();
-                let common = self.common.clone();
-                let shared = self.shared.clone();
-                let fire = fire.clone();
-                let goal = goal.clone();
-                info!(
-                    "thread {tid} memory region [{:?}, {:?}) len 0x{:x}",
-                    thread_mem.as_ptr(),
-                    thread_mem.as_ptr().wrapping_add(thread_mem.len()),
-                    thread_mem.len()
-                );
-                let f = move || {
-                    // all threads should start together
-                    fire.wait();
-                    let start = Instant::now();
-                    let mut read = vec![0; common.granularity];
-                    for (finished, i) in common
-                        .distribution
-                        .sample_iter(&mut thread_rng())
-                        .take(common.updates)
-                        .enumerate()
-                    {
-                        let elem =
-                            &mut thread_mem[i * common.granularity..(i + 1) * common.granularity];
-                        // update
-                        read.copy_from_slice(elem);
-                        elem.copy_from_slice(&read);
-                        if finished % 10000 == 0 {
-                            shared.finished.fetch_add(10000, Ordering::SeqCst);
+        let _ = crossbeam::scope(|scope| {
+            let handles: Vec<_> = self
+                .memory
+                .chunks_exact_mut(self.common.len / self.common.threads)
+                .enumerate()
+                .map(|(tid, thread_mem)| {
+                    // let mut thread_mem = thread_mem.to_owned();
+                    let common = self.common.clone();
+                    let shared = self.shared.clone();
+                    let fire = fire.clone();
+                    let goal = goal.clone();
+                    info!(
+                        "thread {tid} memory region [{:?}, {:?}) len 0x{:x}",
+                        thread_mem.as_ptr(),
+                        thread_mem.as_ptr().wrapping_add(thread_mem.len()),
+                        thread_mem.len()
+                    );
+                    scope.spawn(move |_| {
+                        // all threads should start together
+                        fire.wait();
+                        let start = Instant::now();
+                        let mut read = vec![0; common.granularity];
+                        for (finished, i) in common
+                            .distribution
+                            .sample_iter(&mut thread_rng())
+                            .take(common.updates)
+                            .enumerate()
+                        {
+                            let elem = &mut thread_mem
+                                [i * common.granularity..(i + 1) * common.granularity];
+                            if common.granularity <= 8 {
+                                unsafe {
+                                    let ptr = elem.as_mut_ptr() as *mut u64;
+                                    let read = ptr::read(ptr);
+                                    ptr::write(ptr, read + 1);
+                                }
+                            } else {
+                                // update
+                                read.copy_from_slice(elem);
+                                hint::black_box(&mut read);
+                                elem.copy_from_slice(&read);
+                            }
+                            if finished % 10000 == 0 {
+                                shared.finished.fetch_add(10000, Ordering::SeqCst);
+                            }
                         }
-                    }
-                    goal.wait();
-                    if tid == 0 {
-                        // only the last thread should do the book-keeping
-                        let elapsed = start.elapsed();
-                        info!("iteration took {elapsed:?}");
-                        let gups =
-                            (common.updates * common.threads) as f64 / elapsed.as_nanos() as f64;
-                        info!("iteration gups {gups}");
-                        shared
-                            .elapsed_ns
-                            .fetch_add(elapsed.as_nanos() as _, Ordering::SeqCst);
-                    }
-                };
-                thread::Builder::new()
-                    .name(format!("gups worker {tid}"))
-                    .spawn(f)
-            })
-            .collect();
+                        goal.wait();
+                        if tid == 0 {
+                            // only the last thread should do the book-keeping
+                            let elapsed = start.elapsed();
+                            info!("iteration took {elapsed:?}");
+                            let gups = (common.updates * common.threads) as f64
+                                / elapsed.as_nanos() as f64;
+                            info!("iteration gups {gups}");
+                            shared
+                                .elapsed_ns
+                                .fetch_add(elapsed.as_nanos() as _, Ordering::SeqCst);
+                        }
+                    })
+                })
+                .collect();
+            // wait for all worker threads to complete
+            drop(handles);
+        })
+        .expect("failed to start workers");
 
-        Ok(handles?)
+        Ok(())
     }
 }
 
