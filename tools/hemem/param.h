@@ -27,7 +27,7 @@ ENVCONST(COOLING_PAGES, ulong, 8192)
 
 // #define PEBS_NPROCS 4
 ENVCONST(PEBS_NPROCS, ulong, 4) // Has to be == 1+2^n
-ENVCONST(PERF_PAGES, ulong, 1 + (2 << 9)) // Has to be == 1+2^n
+ENVCONST(PERF_PAGES, ulong, 1 + (2048)) // Has to be == 1+2^n
 ENVCONST(SAMPLE_PERIOD, ulong, 19997)
 // ENVCONST(SAMPLE_PERIOD, ulong, 10007)
 // ENVCONST(SAMPLE_PERIOD, ulong, 100)

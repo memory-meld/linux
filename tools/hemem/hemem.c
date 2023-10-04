@@ -468,8 +468,13 @@ void *hemem_mmap(void *addr, size_t length, int prot, int flags, int fd,
 	return addr;
 }
 
+extern void pebs_dump_lists();
 int hemem_munmap(void *addr, size_t length)
 {
+	if (length > SMALLALLOCSIZE()) {
+		pebs_dump_lists();
+	}
+
 	// for each page in region specified...
 	for (uint64_t page_boundry = (uint64_t)addr;
 	     page_boundry < (uint64_t)addr + length;) {

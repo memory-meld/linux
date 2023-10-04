@@ -86,6 +86,8 @@ static struct perf_event_mmap_page *perf_setup(__u64 config, __u64 config1,
 		attr.type, attr.config, attr.config1, attr.sample_period, cpu,
 		*fd);
 
+	assert(sizeof(struct perf_sample) <
+	       sysconf(_SC_PAGESIZE) * (PERF_PAGES() - 1));
 	return UNWRAP(mmap(NULL, sysconf(_SC_PAGESIZE) * PERF_PAGES(),
 			   PROT_READ | PROT_WRITE, MAP_SHARED, *fd, 0));
 }
@@ -167,6 +169,39 @@ static void handle_perf_sample(struct perf_sample *ps, enum pbuftype j)
 	}
 }
 
+// return true indicate the read is success, otherwise there is nothing to read
+// this function handles the corner case of a sample spanning across ring boundary
+static bool pebs_sample_read(struct perf_event_mmap_page *p, void *dest,
+			     ulong len)
+{
+	// This points to the head of the data section.  The value
+	// continuously increases, it does not wrap.  The value needs
+	// to be manually wrapped by the size of the mmap buffer
+	// before accessing the samples.
+	// On SMP-capable platforms, after reading the data_head
+	// value, user space should issue an rmb().
+	ulong data_head = p->data_head;
+	__sync_synchronize();
+	if (data_head <= p->data_tail) {
+		return false;
+	}
+	void *begin = (void *)p + p->data_offset;
+	void *end = begin + p->data_size;
+	void *head = begin + (p->data_tail % p->data_size);
+	ulong remains = end - head;
+	if (remains >= len) {
+		memcpy(dest, head, len);
+	} else {
+		memcpy(dest, head, remains);
+		memcpy(dest + remains, begin, len - remains);
+	}
+	ulong size = ((struct perf_event_header *)dest)->size;
+	p->data_tail += size;
+	// the stack might be corrupted if the sample is too large
+	assert(size <= len);
+	return true;
+}
+
 static void *pebs_scan_thread(void *)
 {
 	sample_collected = 0;
@@ -183,19 +218,14 @@ static void *pebs_scan_thread(void *)
 			for (uint64_t j = 0; j < NPBUFTYPES; j++) {
 				struct perf_event_mmap_page *p =
 					*perf_page_at(i, j);
-				void *pbuf = (void *)p + p->data_offset;
 				// LOG("perf page %p buf %p\n", p, pbuf);
-
-				__sync_synchronize();
-
-				if (p->data_head == p->data_tail) {
+				struct perf_sample sample;
+				if (!pebs_sample_read(
+					    p, &sample,
+					    sizeof(struct perf_sample))) {
 					continue;
 				}
-
-				struct perf_sample *ps =
-					pbuf + (p->data_tail % p->data_size);
-				handle_perf_sample(ps, j);
-				p->data_tail += ps->header.size;
+				handle_perf_sample(&sample, j);
 			}
 		}
 		if (!(z % (16L << 20)))
@@ -740,6 +770,11 @@ void pebs_shutdown()
 	// free(perf_page);
 	sleep(5);
 
+	LOG_ALWAYS("pebs_shutdown\n");
+}
+
+void pebs_dump_lists()
+{
 	LOG_STATS("%s: dram_hot_list va:", __func__);
 	ulong len = fifo_for_each(&dram_hot_list, dump_list_element_va);
 	LOG_STATS("\n%s: dram_hot_list len %lu\n", __func__, len);
@@ -755,8 +790,6 @@ void pebs_shutdown()
 	LOG_STATS("%s: nvm_cold_list va:", __func__);
 	len = fifo_for_each(&nvm_cold_list, dump_list_element_va);
 	LOG_STATS("\n%s: nvm_cold_list len %lu\n", __func__, len);
-
-	LOG_ALWAYS("pebs_shutdown\n");
 }
 
 void pebs_stats()
