@@ -80,8 +80,52 @@ unsafe impl GlobalAlloc for KernelAllocator {
     }
 }
 
-#[global_allocator]
 static ALLOCATOR: KernelAllocator = KernelAllocator;
+
+struct KvmallocAllocator;
+
+unsafe fn kvrealloc_aligned(
+    ptr: *mut u8,
+    old: Layout,
+    new_size: usize,
+    flags: bindings::gfp_t,
+) -> *mut u8 {
+    let new = unsafe { Layout::from_size_align_unchecked(new_size, old.align()) }.pad_to_align();
+    let mut size = new.size();
+    if new.align() > bindings::BINDINGS_ARCH_SLAB_MINALIGN {
+        size = size.next_power_of_two();
+    }
+    unsafe { bindings::kvrealloc(ptr as _, old.size(), size, flags) as _ }
+}
+
+unsafe impl GlobalAlloc for KvmallocAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let old = unsafe { Layout::from_size_align_unchecked(0, layout.align()) };
+        unsafe { kvrealloc_aligned(ptr::null_mut(), old, layout.size(), bindings::GFP_KERNEL) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+        unsafe { bindings::kvfree(ptr as _) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        unsafe { kvrealloc_aligned(ptr, layout, new_size, bindings::GFP_KERNEL) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        unsafe {
+            kvrealloc_aligned(
+                ptr::null_mut(),
+                Layout::from_size_align_unchecked(0, layout.align()),
+                layout.size(),
+                bindings::GFP_KERNEL | bindings::__GFP_ZERO,
+            )
+        }
+    }
+}
+
+#[global_allocator]
+static VMALLOCATOR: KvmallocAllocator = KvmallocAllocator;
 
 // See <https://github.com/rust-lang/rust/pull/86844>.
 #[no_mangle]
