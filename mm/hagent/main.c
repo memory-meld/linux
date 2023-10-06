@@ -1,4 +1,3 @@
-#include "spsc.h"
 #include <linux/cpumask.h>
 #include <linux/printk.h>
 #include <linux/perf_event.h>
@@ -10,8 +9,9 @@
 
 #include "hagent.h"
 #include "module.h"
-#include "sdh.h"
 #include "pebs.h"
+#include "sdh.h"
+#include "spsc.h"
 
 static unsigned long task_vsize(struct mm_struct *mm)
 {

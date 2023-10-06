@@ -5,8 +5,6 @@
 #include <linux/mutex.h>
 #include <linux/types.h>
 
-#include "sdh.h"
-
 void hagent_callback_mmap(pid_t tgid, unsigned long address, unsigned long len,
 			  unsigned long mapped);
 void hagent_callback_exit_group(pid_t tgid);
@@ -14,6 +12,7 @@ void hagent_callback_exit_group(pid_t tgid);
 int __init hagent_init(void);
 void __exit hagent_exit(void);
 
+struct sdh;
 // The hagent only tracks the virtual memory usage of the dominating process.
 // To ensure we are always managing the dominating process, we always keep its
 // pid and vsz.
