@@ -30,6 +30,8 @@ obj-$(CONFIG_RUST) += exports.o
 
 obj-$(CONFIG_RUST) += hashbrown.o
 
+obj-$(CONFIG_RUST) += spin.o
+
 # Avoids running `$(RUSTC)` for the sysroot when it may not be available.
 ifdef CONFIG_RUST
 
@@ -437,6 +439,10 @@ $(obj)/kernel.o: $(src)/kernel/lib.rs $(obj)/alloc.o $(obj)/build_error.o \
 $(obj)/hashbrown.o: private rustc_target_flags = --extern alloc \
 		--cfg 'feature="nightly"'
 $(obj)/hashbrown.o: $(src)/hashbrown/lib.rs $(obj)/alloc.o FORCE
+	$(call if_changed_dep,rustc_library)
+
+$(obj)/spin.o: private rustc_target_flags = --cfg 'feature="once"'
+$(obj)/spin.o: $(src)/spin/lib.rs FORCE
 	$(call if_changed_dep,rustc_library)
 
 endif # CONFIG_RUST
