@@ -96,6 +96,12 @@ def generate_crates(srctree, objtree, sysroot_src, external_src):
         "exclude_dirs": [],
     }
 
+    append_crate(
+        "hashbrown",
+        srctree / "rust" / "hashbrown" / "lib.rs",
+        ["core", "alloc", "macros", "build_error", "bindings"],
+    )
+
     def is_root_crate(build_file, target):
         try:
             return f"{target}.o" in open(build_file).read()

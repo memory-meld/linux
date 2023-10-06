@@ -14,7 +14,8 @@ no-clean-files += libmacros.so
 always-$(CONFIG_RUST) += bindings/bindings_generated.rs bindings/bindings_helpers_generated.rs
 obj-$(CONFIG_RUST) += alloc.o bindings.o kernel.o
 always-$(CONFIG_RUST) += exports_alloc_generated.h exports_bindings_generated.h \
-    exports_kernel_generated.h
+    exports_kernel_generated.h \
+    exports_hashbrown_generated.h
 
 always-$(CONFIG_RUST) += uapi/uapi_generated.rs
 obj-$(CONFIG_RUST) += uapi.o
@@ -26,6 +27,8 @@ always-$(CONFIG_RUST) += build_error.o
 endif
 
 obj-$(CONFIG_RUST) += exports.o
+
+obj-$(CONFIG_RUST) += hashbrown.o
 
 # Avoids running `$(RUSTC)` for the sysroot when it may not be available.
 ifdef CONFIG_RUST
@@ -348,6 +351,9 @@ $(obj)/exports_bindings_generated.h: $(obj)/bindings.o FORCE
 $(obj)/exports_kernel_generated.h: $(obj)/kernel.o FORCE
 	$(call if_changed,exports)
 
+$(obj)/exports_hashbrown_generated.h: $(obj)/hashbrown.o FORCE
+	$(call if_changed,exports)
+
 quiet_cmd_rustc_procmacro = $(RUSTC_OR_CLIPPY_QUIET) P $@
       cmd_rustc_procmacro = \
 	$(RUSTC_OR_CLIPPY) $(rust_common_flags) \
@@ -426,6 +432,11 @@ $(obj)/kernel.o: private rustc_target_flags = --extern alloc \
     --extern build_error --extern macros --extern bindings --extern uapi
 $(obj)/kernel.o: $(src)/kernel/lib.rs $(obj)/alloc.o $(obj)/build_error.o \
     $(obj)/libmacros.so $(obj)/bindings.o $(obj)/uapi.o FORCE
+	$(call if_changed_dep,rustc_library)
+
+$(obj)/hashbrown.o: private rustc_target_flags = --extern alloc \
+		--cfg 'feature="nightly"'
+$(obj)/hashbrown.o: $(src)/hashbrown/lib.rs $(obj)/alloc.o FORCE
 	$(call if_changed_dep,rustc_library)
 
 endif # CONFIG_RUST
