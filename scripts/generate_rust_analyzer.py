@@ -119,6 +119,12 @@ def generate_crates(srctree, objtree, sysroot_src, external_src, cfgs):
         ["core", "alloc", "macros", "build_error", "bindings"],
     )
 
+    append_crate(
+        "lazy_static",
+        srctree / "rust" / "lazy_static" / "lib.rs",
+        ["core", "alloc", "macros", "build_error", "bindings", "spin"],
+    )
+
     def is_root_crate(build_file, target):
         try:
             return f"{target}.o" in open(build_file).read()
