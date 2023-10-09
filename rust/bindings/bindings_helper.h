@@ -12,6 +12,10 @@
 #include <linux/wait.h>
 #include <linux/sched.h>
 
+#include <linux/perf_event.h>
+#include <linux/workqueue.h>
+#include <linux/irq_work.h>
+
 /* `bindgen` gets confused at certain things. */
 const size_t BINDINGS_ARCH_SLAB_MINALIGN = ARCH_SLAB_MINALIGN;
 const gfp_t BINDINGS_GFP_KERNEL = GFP_KERNEL;
