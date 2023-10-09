@@ -18,6 +18,10 @@
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 
+#include <linux/perf_event.h>
+#include <linux/workqueue.h>
+#include <linux/irq_work.h>
+
 /* `bindgen` gets confused at certain things. */
 const size_t RUST_CONST_HELPER_ARCH_SLAB_MINALIGN = ARCH_SLAB_MINALIGN;
 const gfp_t RUST_CONST_HELPER_GFP_KERNEL = GFP_KERNEL;
