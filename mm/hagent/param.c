@@ -1,15 +1,4 @@
-#include "linux/printk.h"
 #include <linux/moduleparam.h>
-#include <linux/kallsyms.h>
-#include <linux/module.h>
-
-#include "hagent.h"
-#include "hook.h"
-#include "hooked.h"
-
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Junliang Hu");
-MODULE_DESCRIPTION("Heterogeneous memory management guest agent");
 
 unsigned long hagent_sdh_w = 8192;
 module_param_named(sdh_w, hagent_sdh_w, ulong, 0644);
@@ -50,27 +39,3 @@ module_param_named(dump_topk, hagent_dump_topk, bool, 0644);
 MODULE_PARM_DESC(
 	dump_topk,
 	"Whether to dump the top-k hottest pages at profiling target exit");
-
-static int __init hagent_module_init(void)
-{
-	BUG_ON(hagent_init());
-	pr_info("hagent structure allocated");
-	syscall_hook_install(__NR_exit_group, hagent_hooked_exit_group);
-	pr_info("exit_group hook installed");
-	syscall_hook_install(__NR_mmap, hagent_hooked_mmap);
-	pr_info("mmap hook installed");
-	return 0;
-}
-
-static void __exit hagent_module_exit(void)
-{
-	syscall_hook_remove(__NR_mmap);
-	pr_info("mmap hook removed");
-	syscall_hook_remove(__NR_exit_group);
-	pr_info("exit_group hook removed");
-	hagent_exit();
-	pr_info("hagent structure deallocated");
-}
-
-module_init(hagent_module_init);
-module_exit(hagent_module_exit);

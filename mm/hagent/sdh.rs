@@ -7,7 +7,7 @@ use core::{
 
 use crate::alloc::*;
 use crate::iheap::{FnvHasher, IHeap};
-use kernel::prelude::*;
+use kernel::{pr_cont, prelude::*};
 
 pub struct SDH<H: BuildHasher = BuildHasherDefault<FnvHasher>, A: Allocator = Global> {
     w: usize,
@@ -141,6 +141,14 @@ impl<H: BuildHasher, A: Allocator + Clone> SDH<H, A> {
 
         count
     }
+
+    pub fn dump_topk(&self) {
+        pr_info!("top-k (address, count):");
+        self.topk
+            .data()
+            .iter()
+            .for_each(|(k, c)| pr_cont!(" (0x{k:x}, {c})"));
+    }
 }
 
 pub mod ffi {
@@ -169,12 +177,7 @@ pub mod ffi {
 
     #[no_mangle]
     pub extern "C" fn sdh_show_topk(sdh: Option<&SDH>) {
-        pr_info!("top-k (address, count):");
-        sdh.unwrap()
-            .topk
-            .data()
-            .iter()
-            .for_each(|(k, c)| pr_cont!(" (0x{k:x}, {c})"));
+        sdh.unwrap().dump_topk()
     }
 }
 
