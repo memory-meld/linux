@@ -3,7 +3,7 @@
 
 #include <linux/ptrace.h>
 
-typedef asmlinkage long (*sys_call_ptr_t)(struct pt_regs const *);
+typedef asmlinkage long (*sys_call_ptr_t)(struct pt_regs *);
 
 void syscall_hook_install(int id, sys_call_ptr_t new);
 void syscall_hook_remove(int id);
