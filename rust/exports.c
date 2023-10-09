@@ -20,6 +20,7 @@
 #include "exports_bindings_generated.h"
 #include "exports_kernel_generated.h"
 #include "exports_hashbrown_generated.h"
+#include "exports_spin_generated.h"
 
 // For modules using `rust/build_error.rs`.
 #ifdef CONFIG_RUST_BUILD_ASSERT_ALLOW
