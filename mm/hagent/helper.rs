@@ -50,7 +50,8 @@ extern "C" {
         wq: *mut bindings::workqueue_struct,
         work: *mut bindings::work_struct,
     ) -> bool;
-    pub(crate) fn flush_work(work: *mut bindings::work_struct) -> bool;
+    pub(crate) fn work_busy(work: *mut bindings::work_struct) -> u32;
+    pub(crate) fn cancel_work_sync(work: *mut bindings::work_struct) -> bool;
 
 }
 
@@ -69,6 +70,8 @@ mod param {
     pub(crate) const HPAGE_MASK: u64 = !((1 << 21) - 1);
     pub(crate) const CPU_IDENTIFICATION: i32 = 0;
     pub(crate) const CPU_MIGRATION: i32 = 1;
+    pub(crate) const DRAIN_REPORT_PERIOD: u64 = 4096;
+    pub(crate) const MIGRATION_PERIOD: u64 = 32;
 }
 
 pub use event::*;

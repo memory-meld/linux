@@ -89,7 +89,8 @@ struct IdentificationContext {
     irq_work: IrqWork,
     rx: Vec<Receiver<Sample>>,
     sdh: SDH,
-    tx: Sender<Vec<u64>>,
+    promotion_tx: Sender<u64>,
+    demotion_tx: Sender<u64>,
     migration: Arc<MigrationContext>,
 }
 
@@ -104,15 +105,25 @@ impl IdentificationContext {
     }
 
     fn drain_pebs(&mut self) {
+        let mut sent = 0;
+        let mut queued = false;
         for rx in self.rx.iter() {
             while let Some(sample) = rx.recv() {
-                self.sdh.add(sample.va & HPAGE_MASK);
-                let n = sample.id;
-                if n % 4096 == 0 {
-                    pr_info!("drained {n} samples");
+                let va = sample.va & HPAGE_MASK;
+                let (_, hot, replaced) = self.sdh.add(va);
+                if hot {
+                    self.promotion_tx.send(va).is_ok().then(|| sent += 1);
                 }
-                if n % u64::MAX == 0 {
+                if let Some(va) = replaced {
+                    self.demotion_tx.send(va).is_ok().then(|| sent += 1);
+                }
+                if !queued && sent % MIGRATION_PERIOD == 0 {
                     self.migration.queue();
+                    queued = true;
+                }
+                let n = sample.id;
+                if n % DRAIN_REPORT_PERIOD == 0 {
+                    pr_info!("drained {n} samples");
                 }
             }
         }
@@ -120,7 +131,8 @@ impl IdentificationContext {
 
     fn new(
         rx: Vec<Receiver<Sample>>,
-        tx: Sender<Vec<u64>>,
+        promotion_tx: Sender<u64>,
+        demotion_tx: Sender<u64>,
         sdh: SDH,
         migration: Arc<MigrationContext>,
     ) -> impl PinInit<Self> {
@@ -129,7 +141,8 @@ impl IdentificationContext {
                 irq_work <- Opaque::ffi_init(move |slot| helper_init_irq_work(slot, Self::ffi_handler)),
                 rx,
                 sdh,
-                tx,
+                promotion_tx,
+                demotion_tx,
                 migration
             })
         }
@@ -155,24 +168,45 @@ impl PinnedDrop for IdentificationContext {
 struct MigrationContext {
     #[pin]
     work: Work,
-    rx: Receiver<Vec<u64>>,
+    promotion_rx: Receiver<u64>,
+    demotion_rx: Receiver<u64>,
 }
 
 impl MigrationContext {
     fn queue(&self) -> bool {
-        unsafe { queue_work_on(CPU_MIGRATION, system_wq, self.work.get()) }
+        let work = self.work.get();
+        unsafe {
+            if work_busy(work) == 0 {
+                queue_work_on(CPU_MIGRATION, system_wq, work)
+            } else {
+                false
+            }
+        }
     }
 
     extern "C" fn ffi_handler(work: *mut bindings::work_struct) {
         let this = unsafe { &mut *(work as *mut Self) };
-        pr_info!("calling migration handler {:?}", this as *mut _);
+        this.migrate();
     }
 
-    fn new(rx: Receiver<Vec<u64>>) -> impl PinInit<Self> {
+    fn migrate(&mut self) {
+        let mut promotion = 0;
+        while let Some(addr) = self.promotion_rx.recv() {
+            promotion += 1;
+        }
+        let mut demotion = 0;
+        while let Some(addr) = self.demotion_rx.recv() {
+            demotion += 1;
+        }
+        pr_info!("migration handler processed {promotion} promotion and {demotion} demotion");
+    }
+
+    fn new(promotion_rx: Receiver<u64>, demotion_rx: Receiver<u64>) -> impl PinInit<Self> {
         unsafe {
             pin_init!(Self {
                 work <- Opaque::ffi_init(move |slot| helper_init_work(slot, Self::ffi_handler)),
-                rx,
+                promotion_rx,
+                demotion_rx
             })
         }
     }
@@ -182,7 +216,7 @@ impl MigrationContext {
 impl PinnedDrop for MigrationContext {
     fn drop(self: Pin<&mut Self>) {
         pr_info!("migration context exiting");
-        unsafe { flush_work(self.work.get()) };
+        unsafe { cancel_work_sync(self.work.get()) };
         pr_info!("migration context exited");
     }
 }
@@ -199,8 +233,9 @@ unsafe impl Send for Inner {}
 impl Inner {
     fn new() -> Self {
         let channel_capacity = unsafe { hagent_channel_capacity };
-        let (migration_tx, migration_rx) = spsc::channel(channel_capacity);
-        let migration = Arc::pin_init(MigrationContext::new(migration_rx)).unwrap();
+        let (promotion_tx, promotion_rx) = spsc::channel(channel_capacity);
+        let (demotion_tx, demotion_rx) = spsc::channel(channel_capacity);
+        let migration = Arc::pin_init(MigrationContext::new(promotion_rx, demotion_rx)).unwrap();
 
         let ncpu = num_online_cpus() as usize;
         let mut collection_tx = Vec::try_with_capacity(ncpu).unwrap();
@@ -213,7 +248,8 @@ impl Inner {
         let sdh = unsafe { SDH::new(hagent_sdh_w, hagent_sdh_d, hagent_sdh_k) };
         let identification = Arc::pin_init(IdentificationContext::new(
             collection_rx,
-            migration_tx,
+            promotion_tx,
+            demotion_tx,
             sdh,
             migration.clone(),
         ))

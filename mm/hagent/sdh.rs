@@ -75,7 +75,7 @@ impl<H: BuildHasher, A: Allocator + Clone> SDH<H, A> {
             .unwrap_or(0)
     }
 
-    pub fn add(&mut self, key: u64) -> u16 {
+    pub fn add(&mut self, key: u64) -> (u16, bool, Option<u64>) {
         let topk = self.topk.get(&key).copied();
         let fp = self.fingerprint(key);
         let count = (0..self.d)
@@ -112,25 +112,31 @@ impl<H: BuildHasher, A: Allocator + Clone> SDH<H, A> {
             .max()
             .unwrap_or(0);
 
+        let mut replaced = None;
+        let mut new_hot = false;
+
         topk.map(|idx| {
             // we have queried in the beginning, it must not be None
             if count > 0 {
                 self.topk.update(idx, count);
             } else {
-                self.topk.remove(idx);
+                self.topk.remove(idx).map(|(k, _)| replaced.replace(k));
             }
         })
         .or_else(|| {
             if self.topk.len() < self.k {
                 if count > 0 {
                     self.topk.push((key, count));
+                    new_hot = true;
                 }
             } else {
                 // full, replace the heap min
                 // the length is k, it must not be None
-                let (_, v) = self.topk.peek().unwrap();
-                // = is included because recency wins
-                if *v <= count {
+                let (k, v) = self.topk.peek().unwrap();
+                // = is not included to avoid bouncing
+                if *v < count {
+                    new_hot = true;
+                    replaced.replace(*k);
                     self.topk.replace(0, (key, count));
                 } else {
                     // discard rarely accessed addresses
@@ -139,7 +145,7 @@ impl<H: BuildHasher, A: Allocator + Clone> SDH<H, A> {
             Some(())
         });
 
-        count
+        (count, new_hot, replaced)
     }
 
     pub fn dump_topk(&self) {
@@ -148,6 +154,7 @@ impl<H: BuildHasher, A: Allocator + Clone> SDH<H, A> {
             .data()
             .iter()
             .for_each(|(k, c)| pr_cont!(" (0x{k:x}, {c})"));
+        pr_info!("top-k len: {}", self.topk.len());
     }
 }
 
