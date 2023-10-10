@@ -1,6 +1,6 @@
 #![allow(missing_docs)]
 
-use crate::helper::{install_hook, remove_hook};
+use crate::helper::{helper_install_hook, helper_remove_hook};
 use kernel::prelude::*;
 
 pub mod alloc {
@@ -35,14 +35,14 @@ impl kernel::Module for HeteroModule {
     fn init(_module: &'static ThisModule) -> Result<Self> {
         pr_info!("Rust heterogeneous memory management guest agent (init)\n");
         pr_info!("Am I built-in? {}\n", !cfg!(MODULE));
-        install_hook();
+        unsafe { helper_install_hook() }
         Ok(Self)
     }
 }
 
 impl Drop for HeteroModule {
     fn drop(&mut self) {
-        remove_hook();
+        unsafe { helper_remove_hook() }
         pr_info!("Rust heterogeneous memory management guest agent (exit)\n");
     }
 }

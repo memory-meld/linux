@@ -1,71 +1,57 @@
-use kernel::bindings;
+use kernel::{bindings, types::Opaque};
 
 pub type Pid = bindings::pid_t;
-pub type Work = bindings::work_struct;
-pub type IrqWork = bindings::irq_work;
-pub type WorkQueue = bindings::work_struct;
-pub(crate) use inner::{system_highpri_wq, system_long_wq, system_wq};
+pub type Work = Opaque<bindings::work_struct>;
+pub type IrqWork = Opaque<bindings::irq_work>;
+pub type WorkQueue = bindings::workqueue_struct;
 pub(crate) use param::*;
 
-pub fn install_hook() {
-    unsafe { inner::helper_install_hook() }
-}
-pub fn remove_hook() {
-    unsafe { inner::helper_remove_hook() }
-}
-
 pub fn task_vsize(pid: Pid) -> u64 {
-    unsafe { inner::helper_task_vsize(pid) }
-}
-pub fn ram_size() -> u64 {
-    unsafe { inner::helper_ram_size() }
-}
-pub fn irq_work_queue_on(work: *mut IrqWork, cpu: i32) -> bool {
-    unsafe { inner::irq_work_queue_on(work, cpu) }
-}
-pub fn irq_work_sync(work: *mut IrqWork) {
-    unsafe { inner::irq_work_sync(work) }
-}
-pub fn init_irq_work(work: *mut IrqWork, f: fn(&IrqWork)) {
-    unsafe { inner::helper_init_irq_work(work, f) }
-}
-pub fn init_work(work: *mut Work, f: fn(&Work)) {
-    unsafe { inner::helper_init_work(work, f) }
-}
-pub fn queue_work_on(cpu: i32, wq: *mut WorkQueue, work: *mut Work) -> bool {
-    unsafe { inner::queue_work_on(cpu, wq, work) }
-}
-pub fn flush_work(work: *mut Work) -> bool {
-    unsafe { inner::flush_work(work) }
-}
-pub fn num_online_cpus() -> u32 {
-    unsafe { inner::helper_num_online_cpus() }
-}
-
-mod inner {
-    use super::*;
-
     extern "C" {
-        pub(crate) fn helper_install_hook();
-        pub(crate) fn helper_remove_hook();
-
-        pub(crate) fn helper_task_vsize(pid: Pid) -> u64;
-        pub(crate) fn helper_ram_size() -> u64;
-
-        pub(crate) fn helper_init_irq_work(work: *mut IrqWork, f: fn(&IrqWork));
-        pub(crate) fn irq_work_queue_on(work: *mut IrqWork, cpu: i32) -> bool;
-        pub(crate) fn irq_work_sync(work: *mut IrqWork);
-
-        pub(crate) static system_wq: *mut WorkQueue;
-        pub(crate) static system_long_wq: *mut WorkQueue;
-        pub(crate) static system_highpri_wq: *mut WorkQueue;
-        pub(crate) fn helper_init_work(work: *mut Work, f: fn(&Work));
-        pub(crate) fn queue_work_on(cpu: i32, wq: *mut WorkQueue, work: *mut Work) -> bool;
-        pub(crate) fn flush_work(work: *mut Work) -> bool;
-
-        pub(crate) fn helper_num_online_cpus() -> u32;
-
+        fn helper_task_vsize(pid: Pid) -> u64;
     }
+    unsafe { helper_task_vsize(pid) }
+}
+
+pub fn ram_size() -> u64 {
+    extern "C" {
+        fn helper_ram_size() -> u64;
+    }
+    unsafe { helper_ram_size() }
+}
+
+pub fn num_online_cpus() -> u32 {
+    extern "C" {
+        fn helper_num_online_cpus() -> u32;
+    }
+    unsafe { helper_num_online_cpus() }
+}
+
+extern "C" {
+    pub(crate) fn helper_install_hook();
+    pub(crate) fn helper_remove_hook();
+
+    pub(crate) fn helper_init_irq_work(
+        work: *mut bindings::irq_work,
+        f: extern "C" fn(*mut bindings::irq_work),
+    );
+    pub(crate) fn irq_work_queue_on(work: *mut bindings::irq_work, cpu: i32) -> bool;
+    pub(crate) fn irq_work_sync(work: *mut bindings::irq_work);
+
+    pub(crate) static system_wq: *mut bindings::workqueue_struct;
+    pub(crate) static system_long_wq: *mut bindings::workqueue_struct;
+    pub(crate) static system_highpri_wq: *mut bindings::workqueue_struct;
+    pub(crate) fn helper_init_work(
+        work: *mut bindings::work_struct,
+        f: extern "C" fn(*mut bindings::work_struct),
+    );
+    pub(crate) fn queue_work_on(
+        cpu: i32,
+        wq: *mut bindings::workqueue_struct,
+        work: *mut bindings::work_struct,
+    ) -> bool;
+    pub(crate) fn flush_work(work: *mut bindings::work_struct) -> bool;
+
 }
 
 mod param {
@@ -176,7 +162,7 @@ mod event {
             attr: &EventAttr,
             cpu: i32,
             task: Option<&Task>,
-            handler: fn(&PerfEvent, &SampleData, &PtRegs),
+            handler: extern "C" fn(&PerfEvent, &SampleData, &PtRegs),
             context: *mut c_void,
         ) -> &'static PerfEvent;
 
