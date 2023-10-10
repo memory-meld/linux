@@ -13,7 +13,7 @@ use crate::{
     sdh::SDH,
     spsc::{self, Receiver, Sender},
 };
-use kernel::{error::to_result, init::*, new_mutex, prelude::*, sync::*};
+use kernel::{bindings, error::to_result, init::*, new_mutex, prelude::*, sync::*, types::Opaque};
 
 #[repr(C)]
 #[pin_data(PinnedDrop)]
@@ -58,7 +58,7 @@ impl CollectionContext {
         }
     }
 
-    fn ffi_handler(event: &PerfEvent, data: &SampleData, _regs: &PtRegs) {
+    extern "C" fn ffi_handler(event: &PerfEvent, data: &SampleData, _regs: &PtRegs) {
         static NTH: AtomicU64 = AtomicU64::new(0);
         let mut sample = Sample::from(data);
         sample.id = NTH.fetch_add(1, Ordering::Relaxed);
@@ -66,7 +66,7 @@ impl CollectionContext {
         let this = unsafe { &mut *(event.overflow_handler_context as *mut Self) };
         this.tx.send(sample).ok();
         if sample.id % 1024 == 0 {
-            this.identification.queue_on(CPU_IDENTIFICATION);
+            this.identification.queue();
         }
     }
 }
@@ -94,8 +94,13 @@ struct IdentificationContext {
 }
 
 impl IdentificationContext {
-    fn queue_on(&self, cpu: i32) -> bool {
-        irq_work_queue_on(&self.irq_work as *const _ as *mut _, cpu)
+    fn queue(&self) -> bool {
+        unsafe { irq_work_queue_on(self.irq_work.get(), CPU_IDENTIFICATION) }
+    }
+
+    extern "C" fn ffi_handler(irq_work: *mut bindings::irq_work) {
+        let this = unsafe { &mut *(irq_work as *mut Self) };
+        this.drain_pebs();
     }
 
     fn drain_pebs(&mut self) {
@@ -107,15 +112,10 @@ impl IdentificationContext {
                     pr_info!("drained {n} samples");
                 }
                 if n % u64::MAX == 0 {
-                    self.migration.queue_on(CPU_MIGRATION);
+                    self.migration.queue();
                 }
             }
         }
-    }
-
-    fn ffi_handler(irq_work: &IrqWork) {
-        let this = unsafe { &mut *(irq_work as *const _ as *mut Self) };
-        this.drain_pebs();
     }
 
     fn new(
@@ -126,10 +126,7 @@ impl IdentificationContext {
     ) -> impl PinInit<Self> {
         unsafe {
             pin_init!(Self {
-                irq_work <- pin_init_from_closure::<_, Infallible>(move |slot| {
-                    init_irq_work(slot, Self::ffi_handler);
-                    Ok(())
-                }),
+                irq_work <- Opaque::ffi_init(move |slot| helper_init_irq_work(slot, Self::ffi_handler)),
                 rx,
                 sdh,
                 tx,
@@ -143,10 +140,12 @@ impl IdentificationContext {
 impl PinnedDrop for IdentificationContext {
     fn drop(self: Pin<&mut Self>) {
         pr_info!("identification context exiting");
-        if unsafe { hagent_dump_topk } {
-            self.sdh.dump_topk();
+        unsafe {
+            if hagent_dump_topk {
+                self.sdh.dump_topk();
+            }
+            irq_work_sync(self.irq_work.get())
         }
-        irq_work_sync(self.get_mut() as *mut _ as *mut IrqWork);
         pr_info!("identification context exited");
     }
 }
@@ -160,22 +159,19 @@ struct MigrationContext {
 }
 
 impl MigrationContext {
-    fn queue_on(&self, cpu: i32) -> bool {
-        queue_work_on(cpu, unsafe { system_wq }, &self.work as *const _ as *mut _)
+    fn queue(&self) -> bool {
+        unsafe { queue_work_on(CPU_MIGRATION, system_wq, self.work.get()) }
     }
 
-    fn ffi_handler(work: &Work) {
-        let this = unsafe { &mut *(work as *const _ as *mut Self) };
+    extern "C" fn ffi_handler(work: *mut bindings::work_struct) {
+        let this = unsafe { &mut *(work as *mut Self) };
         pr_info!("calling migration handler {:?}", this as *mut _);
     }
 
     fn new(rx: Receiver<Vec<u64>>) -> impl PinInit<Self> {
         unsafe {
             pin_init!(Self {
-                work <- pin_init_from_closure::<_, Infallible>(move |slot| {
-                    init_work(slot, Self::ffi_handler);
-                    Ok(())
-                }),
+                work <- Opaque::ffi_init(move |slot| helper_init_work(slot, Self::ffi_handler)),
                 rx,
             })
         }
@@ -186,7 +182,7 @@ impl MigrationContext {
 impl PinnedDrop for MigrationContext {
     fn drop(self: Pin<&mut Self>) {
         pr_info!("migration context exiting");
-        flush_work(self.get_mut() as *mut _ as *mut Work);
+        unsafe { flush_work(self.work.get()) };
         pr_info!("migration context exited");
     }
 }
@@ -241,17 +237,27 @@ impl Inner {
     }
 }
 
-#[pin_data]
+#[pin_data(PinnedDrop)]
 pub struct Migrator {
     #[pin]
     inner: Mutex<Inner>,
+    pid: Pid,
 }
 
 impl Migrator {
-    pub fn new(p: Pid) -> impl PinInit<Self> {
-        pr_info!("enabling PEBS based heterogeneous memory management for pid {p}");
+    pub fn new(pid: Pid) -> impl PinInit<Self> {
+        pr_info!("enabling PEBS based heterogeneous memory management for pid {pid}");
         pin_init!(Self {
             inner <- new_mutex!(Inner::new(), "Migrator::inner"),
+            pid,
         })
+    }
+}
+
+#[pinned_drop]
+impl PinnedDrop for Migrator {
+    fn drop(self: Pin<&mut Self>) {
+        let pid = self.pid;
+        pr_info!("disabling PEBS based heterogeneous memory management for pid {pid}");
     }
 }

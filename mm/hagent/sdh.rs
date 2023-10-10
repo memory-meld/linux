@@ -151,36 +151,6 @@ impl<H: BuildHasher, A: Allocator + Clone> SDH<H, A> {
     }
 }
 
-pub mod ffi {
-    use super::SDH;
-    use kernel::{pr_cont, prelude::*};
-
-    #[no_mangle]
-    pub extern "C" fn sdh_new(w: usize, d: usize, k: usize) -> Box<SDH> {
-        Box::try_new(SDH::new(w, d, k)).unwrap()
-    }
-
-    #[no_mangle]
-    pub extern "C" fn sdh_get(sdh: Option<&SDH>, key: u64) -> u16 {
-        sdh.unwrap().get(key)
-    }
-
-    #[no_mangle]
-    pub extern "C" fn sdh_add(sdh: Option<&mut SDH>, key: u64) -> u16 {
-        sdh.unwrap().add(key)
-    }
-
-    #[no_mangle]
-    pub extern "C" fn sdh_drop(_sdh: Option<Box<SDH>>) {
-        // silently drop the boxed value
-    }
-
-    #[no_mangle]
-    pub extern "C" fn sdh_show_topk(sdh: Option<&SDH>) {
-        sdh.unwrap().dump_topk()
-    }
-}
-
 fn random() -> u64 {
     fn squares64(ctr: u64, key: u64) -> u64 {
         let mut x = Wrapping(ctr) * Wrapping(key);

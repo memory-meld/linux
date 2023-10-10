@@ -16,7 +16,7 @@ struct Inner {
 
 impl Inner {
     fn new() -> Self {
-        pr_info!("hagent initializing ");
+        pr_info!("hagent initializing");
         Self {
             tracking: None,
             info: HashMap::with_hasher(BuildHasherDefault::<FnvHasher>::default()),
