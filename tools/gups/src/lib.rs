@@ -57,7 +57,8 @@ impl<D: Distribution<usize> + Clone + Send + 'static> Gups<D> {
         distribution: D,
     ) -> Result<Self> {
         let start = Instant::now();
-        let memory = memmap::MmapOptions::new().len(len).map_anon()?;
+        let mut memory = memmap::MmapOptions::new().len(len).map_anon()?;
+        memory.fill(0);
         info!("mmap init took: {:?}", start.elapsed());
         info!(
             "global memory region [{:?}, {:?}) len 0x{:x}",
