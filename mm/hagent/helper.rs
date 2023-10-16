@@ -1,5 +1,5 @@
-use kernel::{bindings, types::Opaque};
 use core::ptr;
+use kernel::{bindings, task::Task, types::Opaque};
 
 pub type Pid = bindings::pid_t;
 pub type Work = Opaque<bindings::work_struct>;
@@ -83,6 +83,11 @@ extern "C" {
     pub(crate) fn work_busy(work: *mut bindings::work_struct) -> u32;
     pub(crate) fn cancel_work_sync(work: *mut bindings::work_struct) -> bool;
 
+    pub(crate) fn helper_pid_task(pid: Pid) -> *mut Task;
+    pub(crate) fn helper_in_mmap_region(va: u64) -> bool;
+    pub(crate) fn helper_find_random_candidate(task: &Task, buf: *mut u64, len: u64) -> u64;
+    pub(crate) fn helper_dram_node() -> i32;
+    pub(crate) fn helper_node_has_space(nid: i32) -> bool;
 }
 
 mod param {
@@ -97,11 +102,19 @@ mod param {
         pub(crate) static hagent_dump_topk: bool;
     }
 
-    pub(crate) const HPAGE_MASK: u64 = !((1 << 21) - 1);
+    pub(crate) const SIGNIFICANCE_RATIO: u64 = 3;
+    pub(crate) const PAGE_SIZE: u64 = 1 << 12;
+    pub(crate) const HPAGE_SIZE: u64 = 1 << 21;
+    pub(crate) const HPAGE_PAGES: usize = (HPAGE_SIZE / PAGE_SIZE) as _;
+    pub(crate) const HPAGE_MASK: u64 = !(HPAGE_SIZE - 1);
     pub(crate) const CPU_IDENTIFICATION: i32 = 0;
     pub(crate) const CPU_MIGRATION: i32 = 1;
     pub(crate) const DRAIN_REPORT_PERIOD: u64 = 4096;
-    pub(crate) const MIGRATION_PERIOD: u64 = 32;
+    pub(crate) const IDENTIFIATION_PERIOD: u64 = 1024;
+    pub(crate) const MIGRATION_PERIOD: u64 = 128;
+    pub(crate) const MPOL_MF_MOVE_ALL: i32 = 1 << 2;
+    pub(crate) const NUMA_NO_NODE: i32 = -1;
+    pub(crate) const BATCH_SIZE: usize = 64;
 }
 
 pub use event::*;
@@ -200,5 +213,6 @@ mod event {
         ) -> &'static PerfEvent;
 
         pub fn perf_event_release_kernel(event: &PerfEvent) -> i32;
+        pub fn perf_virt_to_phys(va: u64) -> u64;
     }
 }

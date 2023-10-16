@@ -4,7 +4,6 @@ use core::{
     iter::{IntoIterator, Iterator},
     mem::size_of,
     ptr,
-    sync::atomic::{AtomicU64, Ordering},
 };
 
 use crate::{
@@ -14,7 +13,16 @@ use crate::{
     sdh::SDH,
     spsc::{self, Receiver, Sender},
 };
-use kernel::{bindings, error::to_result, init::*, new_mutex, prelude::*, sync::*, types::Opaque};
+use kernel::{
+    bindings,
+    error::to_result,
+    init::*,
+    new_mutex,
+    prelude::*,
+    sync::*,
+    task::Task,
+    types::{ARef, Opaque},
+};
 
 #[repr(C)]
 #[pin_data(PinnedDrop)]
@@ -26,6 +34,8 @@ struct CollectionContext {
     event: &'static PerfEvent,
     tx: Sender<Sample>,
     identification: Arc<IdentificationContext>,
+    collected: u64,
+    invalid: u64,
 }
 
 impl CollectionContext {
@@ -55,19 +65,35 @@ impl CollectionContext {
                 }),
                 tx,
                 identification,
+                collected: 0,
+                invalid: 0,
             })
         }
     }
 
     extern "C" fn ffi_handler(event: &PerfEvent, data: &SampleData, _regs: &PtRegs) {
-        static NTH: AtomicU64 = AtomicU64::new(0);
-        let mut sample = Sample::from(data);
-        sample.id = NTH.fetch_add(1, Ordering::Relaxed);
+        let this = unsafe { &mut *event.overflow_handler_context.cast::<Self>() };
+        this.drain_pebs(data);
+    }
+
+    fn drain_pebs(&mut self, data: &SampleData) {
+        let va = data.addr;
+        if !unsafe { helper_in_mmap_region(va) } {
+            self.invalid += 1;
+            return;
+        }
+        let pa = unsafe { perf_virt_to_phys(va) };
+        if pa == 0 {
+            self.invalid += 1;
+            return;
+        }
+        let id = self.collected;
+        self.collected += 1;
+        let lat = data.weight;
         // ignore if full
-        let this = unsafe { &mut *(event.overflow_handler_context as *mut Self) };
-        this.tx.send(sample).ok();
-        if sample.id % 1024 == 0 {
-            this.identification.queue();
+        self.tx.send(Sample { id, va, lat, pa }).ok();
+        if id % IDENTIFIATION_PERIOD == 0 {
+            self.identification.queue();
         }
     }
 }
@@ -101,11 +127,11 @@ impl IdentificationContext {
     }
 
     extern "C" fn ffi_handler(irq_work: *mut bindings::irq_work) {
-        let this = unsafe { &mut *(irq_work as *mut Self) };
-        this.drain_pebs();
+        let this = unsafe { &mut *irq_work.cast::<Self>() };
+        this.identify_hotness();
     }
 
-    fn drain_pebs(&mut self) {
+    fn identify_hotness(&mut self) {
         let mut sent = 0;
         let mut queued = false;
         for rx in self.rx.iter() {
@@ -123,7 +149,7 @@ impl IdentificationContext {
                     queued = true;
                 }
                 let n = sample.id;
-                if n % DRAIN_REPORT_PERIOD == 0 {
+                if n > 0 && n % DRAIN_REPORT_PERIOD == 0 {
                     pr_info!("drained {n} samples");
                 }
             }
@@ -144,7 +170,8 @@ impl IdentificationContext {
                 sdh,
                 promotion_tx,
                 demotion_tx,
-                migration
+                // virt2phys,
+                migration,
             })
         }
     }
@@ -165,13 +192,92 @@ impl PinnedDrop for IdentificationContext {
 }
 
 #[repr(C)]
+struct MovePagesArgs<const LEN: usize> {
+    pid: Pid,
+    pages: Box<[u64; LEN]>,
+    nodes: Box<[i32; LEN]>,
+    status: Box<[i32; LEN]>,
+}
+
+impl<const LEN: usize> MovePagesArgs<LEN> {
+    fn new(pid: Pid, target_node: i32) -> Self {
+        let mut nodes: Box<[i32; LEN]> = Box::init(init::zeroed()).unwrap();
+        nodes.fill(target_node);
+        Self {
+            pid,
+            pages: Box::init(init::zeroed()).unwrap(),
+            nodes,
+            status: Box::init(init::zeroed()).unwrap(),
+        }
+    }
+
+    fn base_address(&mut self, address: u64) {
+        (0..LEN).for_each(|i| self.pages[i] = address + PAGE_SIZE * i as u64);
+    }
+
+    fn stat_pages(&mut self) -> Result<()> {
+        self.status.fill(NUMA_NO_NODE);
+        to_result(move_pages(
+            self.pid,
+            None,
+            &self.pages[..],
+            &mut self.status[..],
+            MPOL_MF_MOVE_ALL,
+        ))
+    }
+
+    fn count_node(&self, node: i32) -> usize {
+        self.status.iter().filter(|&&n| n == node).count()
+    }
+
+    fn count_status<P: FnMut(&&i32) -> bool>(&self, pred: P) -> usize {
+        self.status.iter().filter(pred).count()
+    }
+
+    fn consolidate_left(&mut self) -> usize {
+        let mut next = 0;
+        for (i, (&status, &node)) in self.status.iter().zip(self.nodes.iter()).enumerate() {
+            if status < 0 || status == node || i < next {
+                continue;
+            }
+            self.pages.swap(i, next);
+            next += 1;
+        }
+        self.status[..next].fill(NUMA_NO_NODE);
+        next
+    }
+
+    fn move_pages(&mut self, len: usize) -> Result<()> {
+        assert!(len <= LEN);
+        self.status.fill(NUMA_NO_NODE);
+        to_result(move_pages(
+            self.pid,
+            Some(&self.nodes[..]),
+            &self.pages[..len],
+            &mut self.status[..],
+            MPOL_MF_MOVE_ALL,
+        ))
+    }
+}
+
+#[repr(C)]
 #[pin_data(PinnedDrop)]
 struct MigrationContext {
     #[pin]
     work: Work,
+    task: ARef<Task>,
     promotion_rx: Receiver<u64>,
     demotion_rx: Receiver<u64>,
+    dram: HashSet<u64, BuildHasherDefault<FnvHasher>>,
+    pmem: HashSet<u64, BuildHasherDefault<FnvHasher>>,
+    promotion_pending: Vec<u64>,
+    demotion_pending: Vec<u64>,
+    dram_node: i32,
+    pmem_node: i32,
+    promotion_args: MovePagesArgs<HPAGE_PAGES>,
+    demotion_args: MovePagesArgs<HPAGE_PAGES>,
 }
+static_assert!(HPAGE_PAGES == 512);
 
 impl MigrationContext {
     fn queue(&self) -> bool {
@@ -186,28 +292,114 @@ impl MigrationContext {
     }
 
     extern "C" fn ffi_handler(work: *mut bindings::work_struct) {
-        let this = unsafe { &mut *(work as *mut Self) };
+        let this = unsafe { &mut *work.cast::<Self>() };
         this.migrate();
     }
 
     fn migrate(&mut self) {
-        let mut promotion = 0;
         while let Some(addr) = self.promotion_rx.recv() {
-            promotion += 1;
+            self.promotion_pending.try_push(addr).unwrap();
         }
-        let mut demotion = 0;
         while let Some(addr) = self.demotion_rx.recv() {
-            demotion += 1;
+            self.demotion_pending.try_push(addr).unwrap();
         }
-        pr_info!("migration handler processed {promotion} promotion and {demotion} demotion");
+        let mut promotion_success = 0;
+        let mut demotion_success = 0;
+        while let Some(promotion) = unsafe {
+            helper_node_has_space(self.pmem_node) && helper_node_has_space(self.dram_node)
+        }
+        .then_some(0)
+        .and_then(|_| self.promotion_pending.pop())
+        {
+            if self.dram.get(&promotion).is_some() {
+                continue;
+            }
+            self.promotion_args.base_address(promotion);
+            self.promotion_args.stat_pages().unwrap();
+            let promotion_todo = self.promotion_args.consolidate_left();
+            if promotion_todo == 0 {
+                self.dram.insert(promotion);
+                continue;
+            }
+            let mut demotion_needed = promotion_todo;
+            while demotion_needed != 0 {
+                let demotion = self.demotion_pending.pop().unwrap_or_else(|| {
+                    self.demotion_pending.try_resize(BATCH_SIZE, 0).unwrap();
+                    let failed = unsafe {
+                        helper_find_random_candidate(
+                            &self.task,
+                            self.demotion_pending.as_mut_ptr(),
+                            self.demotion_pending.len() as _,
+                        )
+                    };
+                    assert_eq!(failed, 0);
+                    self.demotion_pending.pop().unwrap()
+                });
+                // cannot find a suitable demotion address
+                assert_ne!(demotion, 0);
+                if self.pmem.get(&demotion).is_some() {
+                    continue;
+                }
+                self.demotion_args.base_address(demotion);
+                self.demotion_args.stat_pages().unwrap();
+                let demotion_todo = self.demotion_args.consolidate_left();
+                if demotion_todo == 0 {
+                    // try again
+                    self.pmem.insert(demotion);
+                    continue;
+                }
+                self.demotion_args.move_pages(demotion_todo).unwrap();
+                let demotion_done = self.demotion_args.count_node(self.pmem_node);
+                assert_eq!(demotion_todo, demotion_done);
+                self.pmem.insert(demotion);
+                demotion_success += demotion_done;
+
+                demotion_needed = demotion_needed.saturating_sub(demotion_done);
+            }
+
+            self.promotion_args.move_pages(promotion_todo).unwrap();
+            let promotion_done = self.promotion_args.count_node(self.dram_node);
+            assert_eq!(promotion_todo, promotion_done);
+            self.dram.insert(promotion);
+            promotion_success += promotion_done;
+        }
+
+        pr_info!("migration work for pid {} finished with {promotion_success} base pages promoted and {demotion_success} base pages demoted", self.task.pid());
     }
 
-    fn new(promotion_rx: Receiver<u64>, demotion_rx: Receiver<u64>) -> impl PinInit<Self> {
+    fn new(
+        task: ARef<Task>,
+        promotion_rx: Receiver<u64>,
+        demotion_rx: Receiver<u64>,
+    ) -> impl PinInit<Self> {
         unsafe {
+            let dram = HashSet::with_capacity_and_hasher(
+                2 * hagent_sdh_k,
+                BuildHasherDefault::<FnvHasher>::default(),
+            );
+            let pmem = HashSet::with_capacity_and_hasher(
+                2 * hagent_sdh_k,
+                BuildHasherDefault::<FnvHasher>::default(),
+            );
+            let promotion_pending = Vec::try_with_capacity(hagent_channel_capacity).unwrap();
+            let demotion_pending = Vec::try_with_capacity(hagent_channel_capacity).unwrap();
+            let dram_node = helper_dram_node();
+            let pmem_node = dram_node + 1;
+            let promotion_args = MovePagesArgs::new(task.pid(), dram_node);
+            let demotion_args = MovePagesArgs::new(task.pid(), pmem_node);
             pin_init!(Self {
                 work <- Opaque::ffi_init(move |slot| helper_init_work(slot, Self::ffi_handler)),
+                task,
                 promotion_rx,
-                demotion_rx
+                demotion_rx,
+                dram,
+                pmem,
+                promotion_pending,
+                demotion_pending,
+                dram_node,
+                pmem_node,
+                promotion_args,
+                demotion_args,
             })
         }
     }
@@ -232,11 +424,12 @@ struct Inner {
 unsafe impl Send for Inner {}
 
 impl Inner {
-    fn new() -> Self {
+    fn new(task: ARef<Task>) -> Self {
         let channel_capacity = unsafe { hagent_channel_capacity };
         let (promotion_tx, promotion_rx) = spsc::channel(channel_capacity);
         let (demotion_tx, demotion_rx) = spsc::channel(channel_capacity);
-        let migration = Arc::pin_init(MigrationContext::new(promotion_rx, demotion_rx)).unwrap();
+        let migration =
+            Arc::pin_init(MigrationContext::new(task, promotion_rx, demotion_rx)).unwrap();
 
         let ncpu = num_online_cpus() as usize;
         let mut collection_tx = Vec::try_with_capacity(ncpu).unwrap();
@@ -279,14 +472,19 @@ pub struct Migrator {
     #[pin]
     inner: Mutex<Inner>,
     pid: Pid,
+    task: ARef<Task>,
 }
 
 impl Migrator {
     pub fn new(pid: Pid) -> impl PinInit<Self> {
         pr_info!("enabling PEBS based heterogeneous memory management for pid {pid}");
+        // this reference will not outlive the task itself, because we will be destroyed by
+        // then via the hooked exit_group
+        let task = ARef::from(unsafe { &*helper_pid_task(pid) });
         pin_init!(Self {
-            inner <- new_mutex!(Inner::new(), "Migrator::inner"),
+            inner <- new_mutex!(Inner::new(task.clone()), "Migrator::inner"),
             pid,
+            task,
         })
     }
 }
