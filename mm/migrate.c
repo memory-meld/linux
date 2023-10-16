@@ -2027,7 +2027,7 @@ static int store_status(int __user *status, int start, int value, int nr)
 	return 0;
 }
 
-static int do_move_pages_to_node(struct mm_struct *mm,
+int do_move_pages_to_node(struct mm_struct *mm,
 		struct list_head *pagelist, int node)
 {
 	int err;
@@ -2042,6 +2042,7 @@ static int do_move_pages_to_node(struct mm_struct *mm,
 		putback_movable_pages(pagelist);
 	return err;
 }
+EXPORT_SYMBOL_GPL(do_move_pages_to_node);
 
 /*
  * Resolves the given address to a struct page, isolates it from the LRU and
@@ -2346,7 +2347,7 @@ static int do_pages_stat(struct mm_struct *mm, unsigned long nr_pages,
 	return nr_pages ? -EFAULT : 0;
 }
 
-static struct mm_struct *find_mm_struct(pid_t pid, nodemask_t *mem_nodes)
+struct mm_struct *find_mm_struct(pid_t pid, nodemask_t *mem_nodes)
 {
 	struct task_struct *task;
 	struct mm_struct *mm;
@@ -2392,6 +2393,7 @@ out:
 		mm = ERR_PTR(-EINVAL);
 	return mm;
 }
+EXPORT_SYMBOL_GPL(find_mm_struct);
 
 /*
  * Move a list of pages in the address space of the currently executing

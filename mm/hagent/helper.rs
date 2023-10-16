@@ -1,4 +1,5 @@
 use kernel::{bindings, types::Opaque};
+use core::ptr;
 
 pub type Pid = bindings::pid_t;
 pub type Work = Opaque<bindings::work_struct>;
@@ -25,6 +26,35 @@ pub fn num_online_cpus() -> u32 {
         fn helper_num_online_cpus() -> u32;
     }
     unsafe { helper_num_online_cpus() }
+}
+
+pub fn move_pages(
+    pid: Pid,
+    dest: Option<&[i32]>,
+    pages: &[u64],
+    status: &mut [i32],
+    flags: i32,
+) -> i32 {
+    extern "C" {
+        fn hagent_move_pages(
+            pid: Pid,
+            len: usize,
+            pages: *const u64,
+            dest: *const i32,
+            status: *mut i32,
+            flags: i32,
+        ) -> i32;
+    }
+    unsafe {
+        hagent_move_pages(
+            pid,
+            pages.len(),
+            pages.as_ptr(),
+            dest.map(|dest| dest.as_ptr()).unwrap_or(ptr::null()),
+            status.as_mut_ptr(),
+            flags,
+        )
+    }
 }
 
 extern "C" {

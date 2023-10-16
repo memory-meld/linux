@@ -912,6 +912,7 @@ void lru_add_drain_all(void)
 #endif /* CONFIG_SMP */
 
 atomic_t lru_disable_count = ATOMIC_INIT(0);
+EXPORT_SYMBOL_GPL(lru_disable_count);
 
 /*
  * lru_cache_disable() needs to be called before we start compiling
@@ -944,6 +945,7 @@ void lru_cache_disable(void)
 	lru_add_and_bh_lrus_drain();
 #endif
 }
+EXPORT_SYMBOL_GPL(lru_cache_disable);
 
 /**
  * release_pages - batched put_page()

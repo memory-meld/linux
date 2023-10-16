@@ -7374,6 +7374,7 @@ unlock:
 	spin_unlock_irq(&hugetlb_lock);
 	return ret;
 }
+EXPORT_SYMBOL_GPL(isolate_hugetlb);
 
 int get_hwpoison_hugetlb_folio(struct folio *folio, bool *hugetlb, bool unpoison)
 {
