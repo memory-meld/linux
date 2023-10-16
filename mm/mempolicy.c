@@ -1793,6 +1793,7 @@ bool vma_migratable(struct vm_area_struct *vma)
 		return false;
 	return true;
 }
+EXPORT_SYMBOL_GPL(vma_migratable);
 
 struct mempolicy *__get_vma_policy(struct vm_area_struct *vma,
 				   unsigned long addr, pgoff_t *ilx)

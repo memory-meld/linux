@@ -111,6 +111,7 @@ bool isolate_lru_page(struct page *page)
 		return false;
 	return folio_isolate_lru((struct folio *)page);
 }
+EXPORT_SYMBOL_GPL(isolate_lru_page);
 
 void putback_lru_page(struct page *page)
 {
