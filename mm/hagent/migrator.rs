@@ -9,6 +9,7 @@ use core::{
 
 use crate::{
     event::Sample,
+    hash::*,
     helper::*,
     sdh::SDH,
     spsc::{self, Receiver, Sender},
