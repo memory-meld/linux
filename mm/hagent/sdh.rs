@@ -5,8 +5,7 @@ use core::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use crate::alloc::*;
-use crate::iheap::{FnvHasher, IHeap};
+use crate::{alloc::*, hash::*, iheap::IHeap};
 use kernel::{pr_cont, prelude::*};
 
 pub struct SDH<H: BuildHasher = BuildHasherDefault<FnvHasher>, A: Allocator = Global> {

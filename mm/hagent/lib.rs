@@ -12,6 +12,7 @@ pub mod alloc {
 
 pub mod event;
 pub mod hagent;
+pub mod hash;
 pub mod helper;
 pub mod iheap;
 pub mod migrator;
