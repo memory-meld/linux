@@ -27,9 +27,6 @@ module! {
     license: "GPL",
 }
 
-// This should be defined by module!()
-// const __LOG_PREFIX: &[u8] = b"hagent\0";
-
 struct HeteroModule;
 
 impl kernel::Module for HeteroModule {

@@ -1,3 +1,4 @@
+use crate::{hash::*, helper::*, migrator::Migrator};
 use kernel::{
     new_mutex,
     prelude::*,
@@ -22,7 +23,9 @@ impl Inner {
     // only track the process with a visze larger than 1/3 of RAM size
     fn track(&mut self, process: Pid) {
         let vsize = task_vsize(process);
-        if vsize > self.tracking.map(task_vsize).unwrap_or(0) && vsize > ram_size() / 3 {
+        if vsize > self.tracking.map(task_vsize).unwrap_or(0)
+            && vsize > ram_size() / SIGNIFICANCE_RATIO
+        {
             self.switch(Some(process))
         }
     }
