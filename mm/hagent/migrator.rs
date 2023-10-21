@@ -324,11 +324,9 @@ impl MigrationContext {
         while let Some(addr) = self.demotion_rx.recv() {
             self.demotion_pending.try_push(addr).unwrap();
         }
-        while let Some(promotion) = unsafe {
-            helper_node_has_space(self.pmem_node) && helper_node_has_space(self.dram_node)
-        }
-        .then_some(0)
-        .and_then(|_| self.promotion_pending.pop())
+        while let Some(promotion) = node_has_space(self.pmem_node)
+            .then_some(0)
+            .and_then(|_| self.promotion_pending.pop())
         {
             if self.dram.get(&promotion).is_some() {
                 continue;
@@ -340,7 +338,9 @@ impl MigrationContext {
                 self.dram.insert(promotion);
                 continue;
             }
-            let mut demotion_needed = promotion_todo;
+            let mut demotion_needed = node_has_space(self.dram_node)
+                .then_some(0)
+                .unwrap_or(promotion_todo);
             while demotion_needed != 0 {
                 let demotion = self.demotion_pending.pop().unwrap_or_else(|| {
                     self.demotion_pending.try_resize(BATCH_SIZE, 0).unwrap();
@@ -447,6 +447,10 @@ impl PinnedDrop for MigrationContext {
     fn drop(self: Pin<&mut Self>) {
         pr_info!("migration context exiting");
         unsafe { cancel_delayed_work_sync(self.delayed_work.get()) };
+        pr_info!(
+            "total {} bytes of data migrated",
+            self.migrated_pages * PAGE_SIZE
+        );
         pr_info!("migration context exited");
     }
 }

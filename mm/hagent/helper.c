@@ -220,10 +220,9 @@ int helper_pmem_node(void)
 
 bool helper_node_has_space(int nid)
 {
-	struct zone *normal =
-		&NODE_DATA(helper_pmem_node())->node_zones[ZONE_NORMAL];
-	return normal && zone_page_state(normal, NR_FREE_PAGES) -
-				 high_wmark_pages(normal);
+	struct zone *normal = &NODE_DATA(nid)->node_zones[ZONE_NORMAL];
+	return normal && zone_page_state(normal, NR_FREE_PAGES) >
+				 high_wmark_pages(normal) * 2;
 }
 
 u64 helper_interrupt_context_level(void)

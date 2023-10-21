@@ -38,6 +38,12 @@ pub fn native_sched_clock() -> Duration {
     }
     Duration::from_nanos(unsafe { native_sched_clock() })
 }
+pub fn node_has_space(nid: i32) -> bool {
+    extern "C" {
+        fn helper_node_has_space(nid: i32) -> bool;
+    }
+    unsafe { helper_node_has_space(nid) }
+}
 
 pub fn move_pages(
     pid: Pid,
@@ -101,7 +107,6 @@ extern "C" {
     pub(crate) fn helper_in_mmap_region(va: u64) -> bool;
     pub(crate) fn helper_find_random_candidate(task: &Task, buf: *mut u64, len: u64) -> u64;
     pub(crate) fn helper_dram_node() -> i32;
-    pub(crate) fn helper_node_has_space(nid: i32) -> bool;
     pub(crate) fn helper_interrupt_context_level() -> u8;
 }
 
