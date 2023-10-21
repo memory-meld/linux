@@ -1,8 +1,8 @@
-use core::ptr;
-use kernel::{bindings, task::Task, types::Opaque};
+use core::{iter::successors, ptr, time::Duration};
+use kernel::{bindings, prelude::*, task::Task, types::Opaque};
 
 pub type Pid = bindings::pid_t;
-pub type Work = Opaque<bindings::work_struct>;
+pub type DelayedWork = Opaque<bindings::delayed_work>;
 pub type IrqWork = Opaque<bindings::irq_work>;
 pub type WorkQueue = bindings::workqueue_struct;
 pub(crate) use param::*;
@@ -26,6 +26,17 @@ pub fn num_online_cpus() -> u32 {
         fn helper_num_online_cpus() -> u32;
     }
     unsafe { helper_num_online_cpus() }
+}
+// We are able to use this for wall clock timer service.
+// The tsc driver will synchronize this for use.
+// However, there are some small variance, but it should be around 1microsecond
+// as reported here:
+// - https://community.intel.com/t5/Software-Tuning-Performance/TSC-Synchronization-Across-Cores/td-p/932561
+pub fn native_sched_clock() -> Duration {
+    extern "C" {
+        fn native_sched_clock() -> u64;
+    }
+    Duration::from_nanos(unsafe { native_sched_clock() })
 }
 
 pub fn move_pages(
@@ -71,23 +82,27 @@ extern "C" {
     pub(crate) static system_wq: *mut bindings::workqueue_struct;
     pub(crate) static system_long_wq: *mut bindings::workqueue_struct;
     pub(crate) static system_highpri_wq: *mut bindings::workqueue_struct;
-    pub(crate) fn helper_init_work(
-        work: *mut bindings::work_struct,
-        f: extern "C" fn(*mut bindings::work_struct),
+    pub(crate) fn helper_init_delayed_work(
+        work: *mut bindings::delayed_work,
+        f: extern "C" fn(*mut bindings::delayed_work),
     );
-    pub(crate) fn queue_work_on(
+    pub(crate) fn queue_delayed_work_on(
         cpu: i32,
         wq: *mut bindings::workqueue_struct,
-        work: *mut bindings::work_struct,
+        work: *mut bindings::delayed_work,
+        delay: u64,
     ) -> bool;
-    pub(crate) fn work_busy(work: *mut bindings::work_struct) -> u32;
-    pub(crate) fn cancel_work_sync(work: *mut bindings::work_struct) -> bool;
+    /// This should be work_busy(work: *mut bindings::work_struct) but work_struct is always at the
+    /// beginning of delayed_work
+    pub(crate) fn work_busy(work: *mut bindings::delayed_work) -> u32;
+    pub(crate) fn cancel_delayed_work_sync(work: *mut bindings::delayed_work) -> bool;
 
     pub(crate) fn helper_pid_task(pid: Pid) -> *mut Task;
     pub(crate) fn helper_in_mmap_region(va: u64) -> bool;
     pub(crate) fn helper_find_random_candidate(task: &Task, buf: *mut u64, len: u64) -> u64;
     pub(crate) fn helper_dram_node() -> i32;
     pub(crate) fn helper_node_has_space(nid: i32) -> bool;
+    pub(crate) fn helper_interrupt_context_level() -> u8;
 }
 
 mod param {
@@ -108,13 +123,15 @@ mod param {
     pub(crate) const HPAGE_PAGES: usize = (HPAGE_SIZE / PAGE_SIZE) as _;
     pub(crate) const HPAGE_MASK: u64 = !(HPAGE_SIZE - 1);
     pub(crate) const CPU_IDENTIFICATION: i32 = 0;
-    pub(crate) const CPU_MIGRATION: i32 = 1;
-    pub(crate) const DRAIN_REPORT_PERIOD: u64 = 4096;
+    pub(crate) const CPU_MIGRATION: i32 = WORK_CPU_UNBOUND;
+    pub(crate) const WORK_CPU_UNBOUND: i32 = 320;
     pub(crate) const IDENTIFIATION_PERIOD: u64 = 1024;
+    pub(crate) const DRAIN_REPORT_PERIOD: u64 = 4096;
     pub(crate) const MIGRATION_PERIOD: u64 = 128;
     pub(crate) const MPOL_MF_MOVE_ALL: i32 = 1 << 2;
     pub(crate) const NUMA_NO_NODE: i32 = -1;
     pub(crate) const BATCH_SIZE: usize = 64;
+    pub(crate) const THROTTLE_MBPS: u64 = 128;
 }
 
 pub use event::*;

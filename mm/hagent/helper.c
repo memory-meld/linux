@@ -81,10 +81,10 @@ void helper_init_irq_work(struct irq_work *work,
 	init_irq_work(work, func);
 }
 
-void helper_init_work(struct work_struct *work,
-		      void (*func)(struct work_struct *work))
+void helper_init_delayed_work(struct delayed_work *work,
+			      void (*func)(struct work_struct *work))
 {
-	INIT_WORK(work, func);
+	INIT_DELAYED_WORK(work, func);
 }
 
 u32 helper_num_online_cpus(void)
@@ -224,4 +224,9 @@ bool helper_node_has_space(int nid)
 		&NODE_DATA(helper_pmem_node())->node_zones[ZONE_NORMAL];
 	return normal && zone_page_state(normal, NR_FREE_PAGES) -
 				 high_wmark_pages(normal);
+}
+
+u64 helper_interrupt_context_level(void)
+{
+	return interrupt_context_level();
 }
