@@ -5,8 +5,11 @@ use std::{
         Arc, Barrier,
     },
     thread::{self, sleep, JoinHandle},
-    time::{Duration, Instant},
+    time::{Duration, SystemTime},
 };
+// We use SystemTime here because its backed by TSC, which is reliable under virtualization.
+// SystemTime calls clock_gettime (Realtime Clock) and in turns calls ktime_get_real_ts64,
+// which is the same as gettimeofday
 
 use anyhow::Result;
 use rand::{distributions::Distribution, thread_rng};
@@ -56,7 +59,7 @@ impl<D: Distribution<usize> + Clone + Send + 'static> Gups<D> {
         granularity: usize,
         distribution: D,
     ) -> Result<Self> {
-        let start = Instant::now();
+        let start = SystemTime::now();
         let mut memory = memmap::MmapOptions::new().len(len).map_anon()?;
         memory.fill(0);
         info!("mmap init took: {:?}", start.elapsed());
@@ -91,13 +94,14 @@ impl<D: Distribution<usize> + Clone + Send + 'static> Gups<D> {
         let shared = self.shared.clone();
         let f = move || {
             let mut prev = shared.finished.load(Ordering::SeqCst);
-            let mut start = Instant::now();
+            let mut start = SystemTime::now();
             while !shared.should_exit.load(Ordering::Relaxed) {
                 sleep(Duration::from_secs(1));
                 let current = shared.finished.load(Ordering::SeqCst);
-                let now = Instant::now();
+                let now = SystemTime::now();
                 // giga updates per second == updates per nano second
-                let gups = (current - prev) as f64 / (now - start).as_nanos() as f64;
+                let gups =
+                    (current - prev) as f64 / now.duration_since(start).unwrap().as_nanos() as f64;
                 info!("last second gups: {gups}");
                 prev = current;
                 start = now;
@@ -132,7 +136,7 @@ impl<D: Distribution<usize> + Clone + Send + 'static> Gups<D> {
                     scope.spawn(move |_| {
                         // all threads should start together
                         fire.wait();
-                        let start = Instant::now();
+                        let start = SystemTime::now();
                         let mut read = vec![0; common.granularity];
                         for (finished, i) in common
                             .distribution
@@ -161,7 +165,7 @@ impl<D: Distribution<usize> + Clone + Send + 'static> Gups<D> {
                         goal.wait();
                         if tid == 0 {
                             // only the last thread should do the book-keeping
-                            let elapsed = start.elapsed();
+                            let elapsed = start.elapsed().unwrap();
                             info!("iteration took {elapsed:?}");
                             let gups = (common.updates * common.threads) as f64
                                 / elapsed.as_nanos() as f64;
@@ -203,6 +207,10 @@ impl<D: Distribution<usize>> Drop for Gups<D> {
         let elapsed_ns = self.shared.elapsed_ns.load(Ordering::SeqCst);
         let gups = finished as f64 / elapsed_ns as f64;
         info!("overall gups: {gups}");
+        info!(
+            "overall elapsed: {:?}",
+            Duration::from_nanos(elapsed_ns as _)
+        );
     }
 }
 
