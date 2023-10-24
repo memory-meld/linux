@@ -1831,6 +1831,9 @@ bool should_numa_migrate_memory(struct task_struct *p, struct folio *folio,
 	int dst_nid = cpu_to_node(dst_cpu);
 	int last_cpupid, this_cpupid;
 
+	if (!node_state(dst_nid, N_MEMORY))
+		return false;
+
 	/*
 	 * Cannot migrate to memoryless nodes.
 	 */
