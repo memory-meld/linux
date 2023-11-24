@@ -9,7 +9,7 @@
 #include <unistd.h>
 
 enum {
-	NR_MM_MANAGE = 452,
+	NR_MM_MANAGE = 511,
 
 	MPOL_NF_MOVE = (1 << 1),
 	MPOL_NF_MOVE_ALL = (1 << 2),
