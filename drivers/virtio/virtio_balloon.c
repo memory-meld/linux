@@ -464,6 +464,10 @@ static unsigned int update_balloon_stats(struct virtio_balloon *vb)
 	update_stat(vb, idx++, VIRTIO_BALLOON_S_HTLB_PGFAIL,
 		    events[HTLB_BUDDY_PGALLOC_FAIL]);
 #endif
+	update_stat(vb, idx++, VIRTIO_BALLOON_S_DRAM_ACCESS,
+		    events[DRAM_ACCESS]);
+	update_stat(vb, idx++, VIRTIO_BALLOON_S_PMEM_ACCESS,
+		    events[PMEM_ACCESS]);
 #endif
 	update_stat(vb, idx++, VIRTIO_BALLOON_S_MEMFREE,
 				pages_to_bytes(i.freeram));
