@@ -1420,6 +1420,8 @@ const char * const vmstat_text[] = {
 	"hint_fault_sample_collected",
 	"hint_fault_collection_cost",
 	"hint_fault_page_migrated",
+	"dram_accesses",
+	"pmem_accesses",
 #endif /* CONFIG_VM_EVENT_COUNTERS || CONFIG_MEMCG */
 };
 #endif /* CONFIG_PROC_FS || CONFIG_SYSFS || CONFIG_NUMA || CONFIG_MEMCG */
