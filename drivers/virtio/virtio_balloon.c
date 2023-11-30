@@ -226,6 +226,16 @@ static void set_page_pfns(struct virtio_balloon *vb,
 					  page_to_balloon_pfn(page) + i);
 }
 
+static struct page *balloon_page_alloc_node(unsigned node)
+{
+	struct page *page =
+		alloc_pages_node(node,
+				 balloon_mapping_gfp_mask() | __GFP_NOMEMALLOC |
+					 __GFP_NORETRY | __GFP_NOWARN,
+				 0);
+	return page;
+}
+
 static unsigned int fill_balloon(struct virtio_balloon *vb, size_t num)
 {
 	unsigned int num_allocated_pages;
@@ -238,7 +248,8 @@ static unsigned int fill_balloon(struct virtio_balloon *vb, size_t num)
 
 	for (num_pfns = 0; num_pfns < num;
 	     num_pfns += VIRTIO_BALLOON_PAGES_PER_PAGE) {
-		struct page *page = balloon_page_alloc();
+		struct page *page = balloon_page_alloc_node(
+			first_node(node_states[N_MEMORY]));
 
 		if (!page) {
 			dev_info_ratelimited(&vb->vdev->dev,
@@ -277,16 +288,6 @@ static unsigned int fill_balloon(struct virtio_balloon *vb, size_t num)
 	return num_allocated_pages;
 }
 
-struct page *balloon_hetero_page_alloc(void)
-{
-	struct page *page =
-		alloc_pages_node(num_online_nodes() - 1,
-				 balloon_mapping_gfp_mask() | __GFP_NOMEMALLOC |
-					 __GFP_NORETRY | __GFP_NOWARN,
-				 0);
-	return page;
-}
-
 static unsigned int fill_hetero_balloon(struct virtio_balloon *vb, size_t num)
 {
 	unsigned int num_allocated_pages;
@@ -299,7 +300,8 @@ static unsigned int fill_hetero_balloon(struct virtio_balloon *vb, size_t num)
 
 	for (num_pfns = 0; num_pfns < num;
 	     num_pfns += VIRTIO_BALLOON_PAGES_PER_PAGE) {
-		struct page *page = balloon_hetero_page_alloc();
+		struct page *page = balloon_page_alloc_node(
+			last_node(node_states[N_MEMORY]));
 
 		if (!page) {
 			dev_info_ratelimited(
