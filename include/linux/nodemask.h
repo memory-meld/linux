@@ -271,6 +271,11 @@ static inline unsigned int __next_node(int n, const nodemask_t *srcp)
 {
 	return min_t(unsigned int, MAX_NUMNODES, find_next_bit(srcp->bits, MAX_NUMNODES, n+1));
 }
+#define last_node(src) __last_node(&(src))
+static inline unsigned int __last_node(const nodemask_t *srcp)
+{
+	return min_t(unsigned int, MAX_NUMNODES, find_last_bit(srcp->bits, MAX_NUMNODES));
+}
 
 /*
  * Find the next present node in src, starting after node n, wrapping around to
