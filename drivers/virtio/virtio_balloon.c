@@ -479,6 +479,16 @@ static unsigned int update_balloon_stats(struct virtio_balloon *vb)
 				pages_to_bytes(available));
 	update_stat(vb, idx++, VIRTIO_BALLOON_S_CACHES,
 				pages_to_bytes(caches));
+	si_meminfo_node(&i, first_node(node_states[N_MEMORY]));
+	update_stat(vb, idx++, VIRTIO_BALLOON_S_DRAM_MEMFREE,
+		    i.freeram * i.mem_unit);
+	update_stat(vb, idx++, VIRTIO_BALLOON_S_DRAM_MEMTOT,
+		    i.totalram * i.mem_unit);
+	si_meminfo_node(&i, last_node(node_states[N_MEMORY]));
+	update_stat(vb, idx++, VIRTIO_BALLOON_S_PMEM_MEMFREE,
+		    i.freeram * i.mem_unit);
+	update_stat(vb, idx++, VIRTIO_BALLOON_S_PMEM_MEMTOT,
+		    i.totalram * i.mem_unit);
 
 	return idx;
 }

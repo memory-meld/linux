@@ -77,9 +77,13 @@ struct virtio_balloon_config {
 #define VIRTIO_BALLOON_S_CACHES   7   /* Disk caches */
 #define VIRTIO_BALLOON_S_HTLB_PGALLOC  8  /* Hugetlb page allocations */
 #define VIRTIO_BALLOON_S_HTLB_PGFAIL   9  /* Hugetlb page allocation failures */
-#define VIRTIO_BALLOON_S_DRAM_ACCESS   10  /* DRAM accesses */
-#define VIRTIO_BALLOON_S_PMEM_ACCESS   11  /* PMEM accesses */
-#define VIRTIO_BALLOON_S_NR       12
+#define VIRTIO_BALLOON_S_DRAM_ACCESS   10 /* DRAM accesses */
+#define VIRTIO_BALLOON_S_DRAM_MEMFREE  11 /* Total amount of free DRAM */
+#define VIRTIO_BALLOON_S_DRAM_MEMTOT   12 /* Total amount of DRAM */
+#define VIRTIO_BALLOON_S_PMEM_ACCESS   13 /* PMEM accesses */
+#define VIRTIO_BALLOON_S_PMEM_MEMFREE  14 /* Total amount of free PMEM */
+#define VIRTIO_BALLOON_S_PMEM_MEMTOT   15 /* Total amount of PMEM */
+#define VIRTIO_BALLOON_S_NR 16
 
 #define VIRTIO_BALLOON_S_NAMES_WITH_PREFIX(VIRTIO_BALLOON_S_NAMES_prefix) { \
 	VIRTIO_BALLOON_S_NAMES_prefix "swap-in", \
