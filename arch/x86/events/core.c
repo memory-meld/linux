@@ -1579,6 +1579,7 @@ void perf_event_print_debug(void)
 	}
 	local_irq_restore(flags);
 }
+EXPORT_SYMBOL(perf_event_print_debug);
 
 void x86_pmu_stop(struct perf_event *event, int flags)
 {
