@@ -34,6 +34,7 @@ enum param_defaults {
 	SDS_WIDTH = 8192,
 	SDS_DEPTH = 4,
 	MIGRATION_NCANDIDATE = 131072,
+	MIGRATION_TARGET_DRAM_ACCESS_PERCENTILE = 95,
 };
 
 unsigned long ring_buffer_pages = RING_BUFFER_PAGES;
@@ -76,6 +77,14 @@ module_param_named(indexable_heap_capacity, migration_candidate_size, ulong,
 		   0644);
 MODULE_PARM_DESC(indexable_heap_capacity,
 		 "Capacity for indexable heap, defaults to 131072");
+
+unsigned long migration_target_dram_access_percentile =
+	MIGRATION_TARGET_DRAM_ACCESS_PERCENTILE;
+module_param_named(migration_target_dram_access_percentile,
+		   migration_target_dram_access_percentile, ulong, 0644);
+MODULE_PARM_DESC(
+	migration_target_dram_access_percentile,
+	"Target percentile of DRAM accesses for migration, defaults to 95");
 
 enum event_index {
 	EI_READ = 0,
@@ -537,10 +546,57 @@ static int __must_check spsc_pop(struct spsc *ch, void *buf, u64 len)
 	return 0;
 }
 
+struct placement_shared_state {
+	u64 total_samples, dram_samples, pmem_samples;
+};
+
+static void placement_shared_state_count(struct placement_shared_state *state,
+					 struct spsc_elem *sample)
+{
+	if (!sample->phys_addr) {
+		return;
+	}
+	++state->total_samples;
+	u64 pfn = PFN_DOWN(sample->phys_addr);
+	bool in_dram = pfn_to_nid(pfn) == first_node(node_states[N_MEMORY]);
+	if (in_dram) {
+		++state->dram_samples;
+	} else {
+		++state->pmem_samples;
+	}
+}
+
+static void placement_shared_state_merge(struct placement_shared_state *state,
+					 struct placement_shared_state *diff)
+{
+#define __INC_ONCE(x, val)                            \
+	do {                                          \
+		*(volatile typeof(x) *)&(x) += (val); \
+	} while (0)
+
+	__INC_ONCE(state->total_samples, diff->total_samples);
+	__INC_ONCE(state->dram_samples, diff->dram_samples);
+	__INC_ONCE(state->pmem_samples, diff->pmem_samples);
+
+#undef __INC_ONCE
+}
+
+static struct placement_shared_state
+placement_shared_state_copy(struct placement_shared_state *state)
+{
+	struct placement_shared_state ret = {
+		.total_samples = READ_ONCE(state->total_samples),
+		.dram_samples = READ_ONCE(state->dram_samples),
+		.pmem_samples = READ_ONCE(state->pmem_samples),
+	};
+	return ret;
+}
+
 struct placement {
 	struct perf_event *events[NR_CPUS][EI_MAX];
 	struct spsc chan[NR_CPUS][EI_MAX];
 	struct task_struct *threads[TI_MAX];
+	struct placement_shared_state state;
 };
 
 #define for_each_cpu_x_event(p, cpu, eidx, e)         \
@@ -704,6 +760,7 @@ static int placement_thread_fn_policy(struct placement *p)
 		int cpu, eidx;
 		struct perf_event *e;
 		struct spsc_elem s;
+		struct placement_shared_state diff = {};
 		for_each_sample_from_cpu_x_event(p, cpu, eidx, e, s)
 		{
 			++valid;
@@ -743,8 +800,12 @@ static int placement_thread_fn_policy(struct placement *p)
 					pfn, count, old.value);
 				break;
 			}
+			placement_shared_state_count(&diff, &s);
 		}
+		placement_shared_state_merge(&p->state, &diff);
+
 		// give up cpu
+		pr_info_ratelimited("%s: thread giving up cpu\n", __func__);
 		schedule_timeout_interruptible(timeout);
 	}
 	return 0;
@@ -754,8 +815,21 @@ static int placement_thread_fn_migration(struct placement *p)
 {
 	pr_info("%s: thread started\n", __func__);
 	u64 timeout = usecs_to_jiffies(1000);
+
 	while (!kthread_should_stop()) {
+		struct placement_shared_state state =
+			placement_shared_state_copy(&p->state);
+		u64 target = migration_target_dram_access_percentile;
+		u64 has = state.dram_samples * 100 / (state.total_samples + 1);
+		pr_info_ratelimited(
+			"%s: migration starting: DRAM access percentile target=%llu has=%llu\n",
+			__func__, target, has);
+		if (has >= target) {
+			goto sleep;
+		}
+sleep:
 		// give up cpu
+		pr_info_ratelimited("%s: thread giving up cpu\n", __func__);
 		schedule_timeout_interruptible(timeout);
 	}
 	return 0;
@@ -763,11 +837,12 @@ static int placement_thread_fn_migration(struct placement *p)
 
 static int placement_thread_start(struct placement *p)
 {
-	for (int i = 0; i < EI_MAX; ++i) {
+	for (int i = 0; i < TI_MAX; ++i) {
 		struct task_struct *t = p->threads[i];
-		if (!t)
+		if (!t) {
 			continue;
-		TRY(wake_up_process(t));
+		}
+		wake_up_process(t);
 	}
 	return 0;
 }
@@ -788,28 +863,32 @@ static void placement_thread_drop(struct placement *p)
 	placement_thread_stop(p);
 }
 
+static int (*placement_thread_fn[TI_MAX])(void *) = {
+	[TI_POLICY] = (int (*)(void *))placement_thread_fn_policy,
+	[TI_MIGRATION] = (int (*)(void *))placement_thread_fn_migration,
+};
+static char *placement_thread_name[TI_MAX] = {
+	[TI_POLICY] = "placement_policy",
+	[TI_MIGRATION] = "placement_migration",
+};
+// static int placement_thread_nice[TI_MAX] = {
+// 	[TI_POLICY] = 1,
+// 	[TI_MIGRATION] = -1,
+// };
+
 static int __must_check placement_thread_init(struct placement *p)
 {
 	for (int i = 0; i < TI_MAX; ++i) {
-		struct task_struct **t = &p->threads[i];
-		switch (i) {
-		case TI_POLICY:
-			*t = kthread_create(
-				(int (*)(void *))placement_thread_fn_policy, p,
-				"placement_policy");
-			break;
-		case TI_MIGRATION:
-			*t = kthread_create(
-				(int (*)(void *))placement_thread_fn_migration,
-				p, "placement_migration");
-			break;
-		default:
-			return -EINVAL;
-		}
-
+		struct task_struct *t = kthread_create(
+			placement_thread_fn[i], p, placement_thread_name[i]);
+		pr_info("%s: kthread_create(%s) = 0x%px\n", __func__,
+			placement_thread_name[i], t);
 		if (IS_ERR(t)) {
 			placement_thread_drop(p);
 			return PTR_ERR(t);
+		} else {
+			// sched_set_normal(t, placement_thread_nice[i]);
+			p->threads[i] = t;
 		}
 	}
 
