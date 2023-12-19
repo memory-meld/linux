@@ -27,7 +27,7 @@ struct min_heap {
 struct min_heap_callbacks {
 	int elem_size;
 	bool (*less)(const void *lhs, const void *rhs);
-	void (*swp)(void *lhs, void *rhs);
+	void (*swp)(struct min_heap *heap, void *lhs, void *rhs);
 };
 
 /* Sift the element at pos down the heap. */
@@ -61,7 +61,7 @@ void min_heapify(struct min_heap *heap, int pos,
 	j = i;
 	while (i != pos) {
 		i = (i - 1) / 2;
-		func->swp(data + i * func->elem_size, data + j * func->elem_size);
+		func->swp(heap, data + i * func->elem_size, data + j * func->elem_size);
 	}
 }
 
@@ -106,13 +106,29 @@ void min_heap_pop_push(struct min_heap *heap,
 	min_heapify(heap, 0, func);
 }
 
+static __always_inline
+void min_heap_sift_up(struct min_heap *heap, int pos,
+		const struct min_heap_callbacks *func)
+{
+	void *data = heap->data;
+	void *child, *parent;
+
+	/* Sift child at pos up. */
+	for (; pos > 0; pos = (pos - 1) / 2) {
+		child = data + (pos * func->elem_size);
+		parent = data + ((pos - 1) / 2) * func->elem_size;
+		if (func->less(parent, child))
+			break;
+		func->swp(heap, parent, child);
+	}
+}
+
 /* Push an element on to the heap, O(log2(nr)). */
 static __always_inline
 void min_heap_push(struct min_heap *heap, const void *element,
 		const struct min_heap_callbacks *func)
 {
 	void *data = heap->data;
-	void *child, *parent;
 	int pos;
 
 	if (WARN_ONCE(heap->nr >= heap->size, "Pushing on a full heap"))
@@ -123,14 +139,42 @@ void min_heap_push(struct min_heap *heap, const void *element,
 	memcpy(data + (pos * func->elem_size), element, func->elem_size);
 	heap->nr++;
 
-	/* Sift child at pos up. */
-	for (; pos > 0; pos = (pos - 1) / 2) {
-		child = data + (pos * func->elem_size);
-		parent = data + ((pos - 1) / 2) * func->elem_size;
-		if (func->less(parent, child))
-			break;
-		func->swp(parent, child);
-	}
+	min_heap_sift_up(heap, pos, func);
+}
+
+static __always_inline
+void *min_heap_begin(struct min_heap *heap)
+{
+	return heap->data;
+}
+
+static __always_inline
+void *min_heap_end(struct min_heap *heap,
+		const struct min_heap_callbacks *func)
+{
+	return heap->data + (heap->nr * func->elem_size);
+}
+
+static __always_inline
+void *min_heap_back(struct min_heap *heap,
+		const struct min_heap_callbacks *func)
+{
+	if (WARN_ONCE(heap->nr <= 0, "Accessing an empty heap"))
+		return NULL;
+
+	return heap->data + ((heap->nr - 1) * func->elem_size);
+}
+
+/* Remove the last element from the heap, O(log2(nr)). */
+static __always_inline
+void min_heap_pop_back(struct min_heap *heap,
+		const struct min_heap_callbacks *func)
+{
+	if (WARN_ONCE(heap->nr <= 0, "Popping an empty heap"))
+		return;
+
+	/* Place last element at the root (position 0) and then sift down. */
+	heap->nr--;
 }
 
 #endif /* _LINUX_MIN_HEAP_H */

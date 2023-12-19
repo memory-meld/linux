@@ -3691,7 +3691,7 @@ static bool perf_less_group_idx(const void *l, const void *r)
 	return le->group_index < re->group_index;
 }
 
-static void swap_ptr(void *l, void *r)
+static void swap_ptr(struct min_heap *heap, void *l, void *r)
 {
 	void **lp = l, **rp = r;
 
@@ -12915,10 +12915,10 @@ err:
 EXPORT_SYMBOL_GPL(perf_event_create_kernel_counter);
 
 int perf_event_create_kernel_counter_buffer(struct perf_event *event,
-					    unsigned long nr_pages)
+					    unsigned long nr_pages, int flags)
 {
 	struct perf_buffer *rb = NULL;
-	int ret = 0, flags = 0;
+	int ret = 0;
 
 	if (event->cpu == -1 && event->attr.inherit)
 		return -EINVAL;
