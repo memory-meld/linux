@@ -1031,6 +1031,7 @@ unsigned long node_page_state(struct pglist_data *pgdat,
 
 	return node_page_state_pages(pgdat, item);
 }
+EXPORT_SYMBOL(node_page_state);
 #endif
 
 #ifdef CONFIG_COMPACTION

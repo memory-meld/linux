@@ -22,6 +22,14 @@
 		__err;                                                        \
 	})
 
+// return a - b when a >= b, return 0 when b > a
+#define saturating_sub(a, b)                \
+	({                                  \
+		__typeof__((a)) __aa = (a); \
+		__typeof__((b)) __bb = (b); \
+		__aa - min(__aa, __bb);     \
+	})
+
 DEFINE_LOCK_GUARD_0(lru, lru_cache_disable(), lru_cache_enable());
 
 struct perf_sample {
@@ -41,7 +49,7 @@ enum param_defaults {
 	SDS_DEPTH = 4,
 	MIGRATION_NCANDIDATE = 131072,
 	MIGRATION_TARGET_DRAM_ACCESS_PERCENTILE = 95,
-	MIGRATION_BATCH_SIZE = 512,
+	MIGRATION_BATCH_SIZE = 4096,
 };
 
 ulong ring_buffer_pages = RING_BUFFER_PAGES;
@@ -96,7 +104,7 @@ MODULE_PARM_DESC(
 ulong migration_batch_size = MIGRATION_BATCH_SIZE;
 module_param_named(migration_batch_size, migration_batch_size, ulong, 0644);
 MODULE_PARM_DESC(migration_batch_size,
-		 "Batch size for migration, defaults to 512 pages");
+		 "Batch size for migration, defaults to 4096 pages");
 
 enum event_index {
 	EI_READ = 0,
@@ -262,15 +270,39 @@ streaming_decaying_sketch_at(struct streaming_decaying_sketch *s, u64 i, u64 j)
 	return &s->slots[i * s->w + j];
 }
 
+// clang-format off
+#define streaming_decaying_sketch_for_each_slot_of(sds, key, hash, slot)			\
+	for (u64 __i = 0, __depth = (sds)->d, __width = (sds)->w, __done; __i < __depth; ++__i) \
+		for ((hash) = streaming_decaying_sketch_hash((key), __i),			\
+		    (slot) = streaming_decaying_sketch_at((sds), __i, (hash) % __width),	\
+		    __done = 0; !__done; __done = 1)
+// clang-format on
+
+static u16 streaming_decaying_sketch_get(struct streaming_decaying_sketch *s,
+					 u64 key)
+{
+	u16 count = 0;
+	u64 hash;
+	struct streaming_decaying_sketch_slot *slot;
+	streaming_decaying_sketch_for_each_slot_of(s, key, hash, slot)
+	{
+		if (slot->fingerprint != (u16)hash) {
+			continue;
+		}
+		count = max(slot->count, count);
+	}
+	return count;
+}
+
 static u16 streaming_decaying_sketch_push(struct streaming_decaying_sketch *s,
 					  u64 key)
 {
 	// pr_info_ratelimited("%s: key=0x%llx\n", __func__, key);
 	u16 count = 0;
-	for (u64 i = 0; i < s->d; ++i) {
-		u64 hash = streaming_decaying_sketch_hash(key, i);
-		struct streaming_decaying_sketch_slot *slot =
-			streaming_decaying_sketch_at(s, i, hash % s->w);
+	u64 hash;
+	struct streaming_decaying_sketch_slot *slot;
+	streaming_decaying_sketch_for_each_slot_of(s, key, hash, slot)
+	{
 		u16 fingerprint = hash;
 		u16 *f = &slot->fingerprint, *c = &slot->count;
 		if (*f == fingerprint) {
@@ -282,7 +314,7 @@ static u16 streaming_decaying_sketch_push(struct streaming_decaying_sketch *s,
 				// pr_info_ratelimited(
 				// 	"%s: decaying key=0x%llx i=%llu fingerprint=0x%x count=%u\n",
 				// 	__func__, key, i, *f, *c);
-				*c = *c > 0 ? *c - 1 : *c;
+				*c = saturating_sub(*c, (u16)1);
 				if (*c == 0) {
 					*f = fingerprint;
 					*c = 1;
@@ -616,17 +648,15 @@ enum placement_shared_state_chan_index {
 struct placement_shared_state {
 	struct mutex lock;
 	struct placement_shared_counter counters;
-	struct indexable_heap demotion, promotion;
+	struct indexable_heap candidate[CHI_MAX];
 	// struct spsc *chan[CHI_MAX];
+	u64 candidate_not_enough[CHI_MAX];
 };
-
-DEFINE_LOCK_GUARD_1(placement_shared_state, struct placement_shared_state,
-		    mutex_lock(&_T->lock->lock), mutex_unlock(&_T->lock->lock))
 
 static void placement_shared_state_drop(struct placement_shared_state *s)
 {
-	indexable_heap_drop(&s->demotion);
-	indexable_heap_drop(&s->promotion);
+	for (int i = 0; i < CHI_MAX; ++i)
+		indexable_heap_drop(&s->candidate[i]);
 	mutex_destroy(&s->lock);
 }
 
@@ -636,10 +666,9 @@ static int placement_shared_state_init(struct placement_shared_state *s)
 	s->counters = (struct placement_shared_counter){};
 	indexable_heap_update_param();
 	// This is correct, we use max_heap to keep the smallest counts for DRAM
-	BUG_ON(indexable_heap_init(&s->demotion, false,
-				   migration_candidate_size));
-	BUG_ON(indexable_heap_init(&s->promotion, true,
-				   migration_candidate_size));
+	for (int i = 0; i < CHI_MAX; ++i)
+		BUG_ON(indexable_heap_init(&s->candidate[i], i == CHI_DEMOTION,
+					   migration_candidate_size));
 	return 0;
 }
 
@@ -786,6 +815,90 @@ static void intel_pmu_print_debug_all(void)
 // 	return 0;
 // }
 
+static void memcg_print_debug(struct mem_cgroup *memcg)
+{
+	u64 page_state[NR_LRU_LISTS + 1] = {};
+	int nid;
+	for_each_node_state(nid, N_MEMORY) {
+		enum lru_list lru;
+		scoped_guard(lru) for_each_evictable_lru(lru)
+		{
+			struct lruvec *lruvec =
+				mem_cgroup_lruvec(memcg, NODE_DATA(nid));
+			// u64 nr = lruvec_page_state_local(lruvec, NR_LRU_BASE + lru);
+			// page_state[lru] += nr;
+			// page_state[NR_LRU_LISTS] += nr;
+			scoped_guard(spinlock_irqsave, &lruvec->lru_lock)
+			{
+				u64 nr = list_count_nodes(&lruvec->lists[lru]);
+				page_state[lru] += nr;
+				page_state[NR_LRU_LISTS] += nr;
+			}
+		}
+	}
+	pr_info("%s: memcg=0x%px inactive_anon=%llu active_anon=%llu inactive_file=%llu active_file=%llu unevictable=%llu total=%llu\n",
+		__func__, memcg, page_state[LRU_INACTIVE_ANON],
+		page_state[LRU_ACTIVE_ANON], page_state[LRU_INACTIVE_FILE],
+		page_state[LRU_ACTIVE_FILE], page_state[LRU_UNEVICTABLE],
+		page_state[NR_LRU_LISTS]);
+}
+
+static void memcg_print_debug_all(void)
+{
+	for (struct mem_cgroup *memcg = mem_cgroup_iter(NULL, NULL, NULL);
+	     memcg != NULL; memcg = mem_cgroup_iter(NULL, memcg, NULL)) {
+		memcg_print_debug(memcg);
+	}
+}
+
+#define for_each_node_lruvec(nid, lruvec)                                   \
+	for (struct mem_cgroup *memcg = mem_cgroup_iter(NULL, NULL, NULL);  \
+	     memcg != NULL; memcg = mem_cgroup_iter(NULL, memcg, NULL))     \
+		for ((lruvec) = mem_cgroup_lruvec(memcg, NODE_DATA((nid))); \
+		     !(lruvec); (lruvec) = NULL)
+
+#define LRU_ALL_ACTIVE (BIT(LRU_ACTIVE_FILE) | BIT(LRU_ACTIVE_ANON))
+#define LRU_ALL_INACTIVE (BIT(LRU_INACTIVE_FILE) | BIT(LRU_INACTIVE_ANON))
+#define LRU_ALL ((1 << NR_LRU_LISTS) - 1)
+
+// clang-format off
+#define for_each_node_lru_folio_locked(nid, lru_mask, folio)		\
+	scoped_guard(lru)						\
+	for (struct mem_cgroup *memcg = mem_cgroup_iter(NULL, NULL, NULL); memcg != NULL; memcg = mem_cgroup_iter(NULL, memcg, NULL))	\
+	for (struct lruvec *lruvec = mem_cgroup_lruvec(memcg, NODE_DATA((nid))); lruvec; lruvec = NULL)					\
+	scoped_guard(spinlock_irqsave, &lruvec->lru_lock)		\
+	for (enum lru_list lru = 0; lru < LRU_UNEVICTABLE; lru++)	\
+	if (!(BIT(lru) & (lru_mask))) continue;				\
+	else list_for_each_entry((folio), &lruvec->lists[lru], lru)
+// clang-format on
+
+static u64 policy_drain_lruvec(struct streaming_decaying_sketch *sds,
+			       struct indexable_heap *heap, bool demotion)
+{
+	int source_nid = demotion ? first_node(node_states[N_MEMORY]) :
+				    last_node(node_states[N_MEMORY]);
+	// u64 lru_mask = demotion ?
+	// 		       BIT(LRU_INACTIVE_FILE) | BIT(LRU_INACTIVE_ANON) :
+	// 		       BIT(LRU_ACTIVE_FILE) | BIT(LRU_ACTIVE_ANON);
+	struct folio *folio;
+	u64 drained = 0;
+	for_each_node_lru_folio_locked(source_nid, LRU_ALL, folio)
+	{
+		u64 pfn = folio_pfn(folio);
+		u64 count = streaming_decaying_sketch_get(sds, pfn);
+		struct pair elem = { pfn, count },
+			    old = indexable_heap_insert(heap, &elem);
+		drained += old.key == -ENOENT;
+		if (drained / 10 > migration_batch_size) {
+			goto enough;
+		}
+	}
+enough:
+	pr_info_ratelimited("%s: drained %llu pages from nid=%d\n", __func__,
+			    drained, source_nid);
+	return drained;
+}
+
 static int placement_thread_fn_policy(struct placement *p)
 {
 	pr_info("%s: thread started\n", __func__);
@@ -801,71 +914,85 @@ static int placement_thread_fn_policy(struct placement *p)
 	while (!kthread_should_stop()) {
 		if (iter++ % interval == 0) {
 			// intel_pmu_print_debug_all();
-			scoped_guard(placement_shared_state, &p->state)
+			struct placement_shared_state *state = &p->state;
+			scoped_guard(mutex, &state->lock)
 			{
-				struct placement_shared_state *state =
-					&p->state;
-				indexable_heap_print_debug(&state->demotion);
-				indexable_heap_print_debug(&state->promotion);
+				for (int i = 0; i < CHI_MAX; ++i)
+					indexable_heap_print_debug(
+						&state->candidate[i]);
 			}
+			memcg_print_debug_all();
 		}
 		int cpu, eidx;
 		struct perf_event *e;
 		struct perf_sample s;
 		struct placement_shared_counter diff = {};
-		for_each_sample_from_cpu_x_event(p, cpu, eidx, e, s)
-		{
-			++valid;
-			// pr_info_ratelimited(
-			// 	"%s: got %llu-th sample: cpu=%d eidx=%d pid=%u tid=%u time=%llu addr=0x%llx weight=%llu phys_addr=0x%llx\n",
-			// 	__func__, valid, cpu, eidx, s.pid, s.tid,
-			// 	s.time, s.addr, s.weight, s.phys_addr);
-			if (!s.phys_addr) {
-				continue;
-			}
 
-			u64 pfn = PFN_DOWN(s.phys_addr);
-			bool in_dram = pfn_to_nid(pfn) ==
-				       first_node(node_states[N_MEMORY]);
-			u64 count = streaming_decaying_sketch_push(&sds, pfn);
-			struct pair elem = { pfn, count }, old = {};
-			scoped_guard(placement_shared_state, &p->state)
+		struct placement_shared_state *state = &p->state;
+		scoped_guard(mutex, &state->lock)
+		{
+			for_each_sample_from_cpu_x_event(p, cpu, eidx, e, s)
 			{
-				struct placement_shared_state *state =
-					&p->state;
-				old = indexable_heap_insert(
-					in_dram ? &state->demotion :
-						  &state->promotion,
-					&elem);
-			}
-			// switch (old.key) {
-			// case -EFBIG:
-			// 	break;
-			// case -ENOENT:
-			// 	pr_info_ratelimited(
-			// 		"%s: %s candidate insert  pfn=0x%llx count=%llu\n",
-			// 		__func__,
-			// 		in_dram ? " demotion" : "promotion",
-			// 		pfn, count);
-			// 	break;
-			// default:
-			// 	pr_info_ratelimited(
-			// 		"%s: %s candidate %s pfn=0x%llx count=%llu old_count=%llu\n",
-			// 		__func__,
-			// 		in_dram ? " demotion" : "promotion",
-			// 		old.key == elem.key ? "update " :
-			// 				      "replace",
-			// 		pfn, count, old.value);
-			// 	break;
-			// }
-			placement_shared_counter_count(&diff, &s);
-		}
+				++valid;
+				// pr_info_ratelimited(
+				// 	"%s: got %llu-th sample: cpu=%d eidx=%d pid=%u tid=%u time=%llu addr=0x%llx weight=%llu phys_addr=0x%llx\n",
+				// 	__func__, valid, cpu, eidx, s.pid, s.tid,
+				// 	s.time, s.addr, s.weight, s.phys_addr);
+				if (!s.phys_addr) {
+					continue;
+				}
 
-		scoped_guard(placement_shared_state, &p->state)
-		{
-			struct placement_shared_state *state = &p->state;
+				u64 pfn = PFN_DOWN(s.phys_addr);
+				bool in_dram =
+					pfn_to_nid(pfn) ==
+					first_node(node_states[N_MEMORY]);
+				u64 count = streaming_decaying_sketch_push(&sds,
+									   pfn);
+				struct pair elem = { pfn, count }, old = {};
+
+				int idx = in_dram ? CHI_DEMOTION :
+						    CHI_PROMOTION;
+				old = indexable_heap_insert(
+					state->candidate + idx, &elem);
+				// switch (old.key) {
+				// case -EFBIG:
+				// 	break;
+				// case -ENOENT:
+				// 	pr_info_ratelimited(
+				// 		"%s: %s candidate insert  pfn=0x%llx count=%llu\n",
+				// 		__func__,
+				// 		in_dram ? " demotion" : "promotion",
+				// 		pfn, count);
+				// 	break;
+				// default:
+				// 	pr_info_ratelimited(
+				// 		"%s: %s candidate %s pfn=0x%llx count=%llu old_count=%llu\n",
+				// 		__func__,
+				// 		in_dram ? " demotion" : "promotion",
+				// 		old.key == elem.key ? "update " :
+				// 				      "replace",
+				// 		pfn, count, old.value);
+				// 	break;
+				// }
+				placement_shared_counter_count(&diff, &s);
+			}
 
 			placement_shared_counter_merge(&state->counters, &diff);
+
+			for (int i = 0; i < CHI_MAX; ++i) {
+				u64 *not_eough =
+					state->candidate_not_enough + i;
+				if (*not_eough == 0) {
+					continue;
+				}
+				// should drain_lru
+				u64 drained = policy_drain_lruvec(
+					&sds, &state->candidate[i],
+					i == CHI_DEMOTION);
+				*not_eough = saturating_sub(
+					*not_eough,
+					drained / migration_batch_size);
+			}
 		}
 
 		// give up cpu
@@ -891,7 +1018,7 @@ static void zone_wmark_print_debug(struct zone *z)
 static int migration_isolate_folios(struct indexable_heap *heap, bool demotion,
 				    struct list_head *isolated)
 {
-	int got = 0;
+	int got = 0, filtered = 0, failed = 0;
 	while (got < migration_batch_size && indexable_heap_length(heap) > 0) {
 		struct pair *p = indexable_heap_pop_back(heap);
 		BUG_ON(!p);
@@ -900,12 +1027,14 @@ static int migration_isolate_folios(struct indexable_heap *heap, bool demotion,
 		// For demotion, we only want to migrate pages with count <= 5.
 		// And for promotion, we only want to migrate pages with count > 5.
 		if ((count > 5) ^ demotion) {
+			++filtered;
 			continue;
 		}
 		// FIXME: make sure huge page is disabled
 		struct folio *folio = pfn_folio(pfn);
 		if (!folio || !folio_test_lru(folio) ||
 		    !folio_isolate_lru(folio)) {
+			++failed;
 			continue;
 		}
 		// pr_info_ratelimited(
@@ -916,6 +1045,11 @@ static int migration_isolate_folios(struct indexable_heap *heap, bool demotion,
 				    NR_ISOLATED_ANON + folio_is_file_lru(folio),
 				    folio_nr_pages(folio));
 		++got;
+	}
+	if (got < migration_batch_size / 10 && !indexable_heap_length(heap)) {
+		pr_info_ratelimited(
+			"%s: not enough migration candidate got=%d filtered=%d failed=%d\n",
+			__func__, got, filtered, failed);
 	}
 
 	return got;
@@ -981,10 +1115,12 @@ static int migration_do(struct indexable_heap *heap, bool demotion)
 	}
 	return migrated;
 }
+
 static int placement_thread_fn_migration(struct placement *p)
 {
 	pr_info("%s: thread started\n", __func__);
 	u64 timeout = usecs_to_jiffies(10000);
+	u64 interval = 10000, iter = 0;
 
 	struct pglist_data *dram_node =
 		NODE_DATA(first_node(node_states[N_MEMORY]));
@@ -1001,19 +1137,20 @@ static int placement_thread_fn_migration(struct placement *p)
 
 	u64 last_demoted = migration_batch_size;
 	while (!kthread_should_stop()) {
-		scoped_guard(placement_shared_state, &p->state)
+		struct placement_shared_state *state = &p->state;
+		scoped_guard(mutex, &state->lock)
 		{
-			struct placement_shared_state *state = &p->state;
 			struct placement_shared_counter counters =
 				placement_shared_counter_copy(&state->counters);
 
 			u64 target = migration_target_dram_access_percentile;
 			u64 has = counters.dram_samples * 100 /
 				  (counters.total_samples + 1);
-			// pr_info_ratelimited(
-			// 	"%s: DRAM access percentile target=%llu has=%llu\n",
-			// 	__func__, target, has);
-
+			if (iter++ % interval == 0) {
+				pr_info_ratelimited(
+					"%s: DRAM access percentile target=%llu has=%llu\n",
+					__func__, target, has);
+			}
 			if (!has || has >= target) {
 				goto yield;
 			}
@@ -1023,9 +1160,14 @@ static int placement_thread_fn_migration(struct placement *p)
 			// if last demoted is too small, we should wait
 			if (last_demoted > migration_batch_size / 10) {
 				// pr_info_ratelimited("%s: demotion\n", __func__);
-				err = migration_do(&state->demotion, true);
+				err = migration_do(
+					&state->candidate[CHI_DEMOTION], true);
 				if (err == -EAGAIN) {
 					goto yield;
+				}
+				if (err < migration_batch_size / 100) {
+					++state->candidate_not_enough
+						  [CHI_DEMOTION];
 				}
 				last_demoted = err;
 			} else {
@@ -1034,9 +1176,13 @@ static int placement_thread_fn_migration(struct placement *p)
 
 			// However, promotion should be done continuously
 			// pr_info_ratelimited("%s: promotion\n", __func__);
-			err = migration_do(&state->promotion, false);
+			err = migration_do(&state->candidate[CHI_PROMOTION],
+					   false);
 			if (err == -EAGAIN) {
 				goto yield;
+			}
+			if (err < migration_batch_size / 100) {
+				++state->candidate_not_enough[CHI_DEMOTION];
 			}
 			// TODO: switch to move_pages API
 			// kernel_move_pages(pid_t pid, unsigned long nr_pages, const u64 *pages, const int *nodes, int *status, int flags)
