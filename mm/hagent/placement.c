@@ -6,6 +6,7 @@
 #include <linux/xxhash.h>
 #include <linux/module.h>
 #include <linux/perf_event.h>
+#include <linux/prime_numbers.h>
 
 #include <../../kernel/events/internal.h>
 #include <../../mm/internal.h>
@@ -21,6 +22,11 @@
 		}                                                             \
 		__err;                                                        \
 	})
+
+#define DRAM_NID (first_node(node_states[N_MEMORY]))
+#define PMEM_NID (last_node(node_states[N_MEMORY]))
+#define DRAM_NODE (NODE_DATA(DRAM_NID))
+#define PMEM_NODE (NODE_DATA(PMEM_NID))
 
 // return a - b when a >= b, return 0 when b > a
 #define saturating_sub(a, b)                \
@@ -105,6 +111,11 @@ ulong migration_batch_size = MIGRATION_BATCH_SIZE;
 module_param_named(migration_batch_size, migration_batch_size, ulong, 0644);
 MODULE_PARM_DESC(migration_batch_size,
 		 "Batch size for migration, defaults to 4096 pages");
+
+bool debug_log_samples = false;
+module_param_named(debug_log_samples, debug_log_samples, bool, 0644);
+MODULE_PARM_DESC(debug_log_samples,
+		 "Log every collected pebs sample (only for debugging)");
 
 enum event_index {
 	EI_READ = 0,
@@ -232,7 +243,8 @@ static void streaming_decaying_sketch_update_param(void)
 		for_each_node_state(nid, N_MEMORY) {
 			spanned += NODE_DATA(nid)->node_spanned_pages;
 		}
-		streaming_decaying_sketch_width = spanned * 7 / 10000;
+		streaming_decaying_sketch_width =
+			next_prime_number(spanned * 7 / 10000 / 3);
 		pr_info("%s: streaming_decaying_sketch_width=%lu\n", __func__,
 			streaming_decaying_sketch_width);
 	}
@@ -418,8 +430,7 @@ static void indexable_heap_update_param(void)
 	if (migration_candidate_size == MIGRATION_NCANDIDATE) {
 		// Setting candiate queue size to 10% of DRAM size
 		// It will be the upper bound on the batch size of migration
-		u64 dram_spanned = NODE_DATA(first_node(node_states[N_MEMORY]))
-					   ->node_spanned_pages;
+		u64 dram_spanned = DRAM_NODE->node_spanned_pages;
 		migration_candidate_size = dram_spanned / 10;
 		pr_info("%s: migration_candidate_size=%lu\n", __func__,
 			migration_candidate_size);
@@ -568,7 +579,7 @@ static int __must_check spsc_init(struct spsc *ch, u64 size)
 
 // We will assume the buffer size is the multiple of the element size
 // Producer side only modify the head pointer.
-static int __must_check spsc_push(struct spsc *ch, void *buf, u64 len)
+static int __must_check spsc_push(struct spsc *ch, void const *buf, u64 len)
 {
 	u64 head = READ_ONCE(ch->head), diff = head - READ_ONCE(ch->tail);
 	if (diff && diff % ch->size == 0) {
@@ -604,7 +615,7 @@ placement_shared_counter_count(struct placement_shared_counter *state,
 	}
 	++state->total_samples;
 	u64 pfn = PFN_DOWN(sample->phys_addr);
-	bool in_dram = pfn_to_nid(pfn) == first_node(node_states[N_MEMORY]);
+	bool in_dram = pfn_to_nid(pfn) == DRAM_NID;
 	if (in_dram) {
 		++state->dram_samples;
 	} else {
@@ -866,8 +877,8 @@ static void memcg_print_debug_all(void)
 	scoped_guard(lru)						\
 	for (struct mem_cgroup *memcg = mem_cgroup_iter(NULL, NULL, NULL); memcg != NULL; memcg = mem_cgroup_iter(NULL, memcg, NULL))	\
 	for (struct lruvec *lruvec = mem_cgroup_lruvec(memcg, NODE_DATA((nid))); lruvec; lruvec = NULL)					\
-	scoped_guard(spinlock_irqsave, &lruvec->lru_lock)		\
 	for (enum lru_list lru = 0; lru < LRU_UNEVICTABLE; lru++)	\
+	scoped_guard(spinlock_irqsave, &lruvec->lru_lock)		\
 	if (!(BIT(lru) & (lru_mask))) continue;				\
 	else list_for_each_entry((folio), &lruvec->lists[lru], lru)
 // clang-format on
@@ -875,28 +886,58 @@ static void memcg_print_debug_all(void)
 static u64 policy_drain_lruvec(struct streaming_decaying_sketch *sds,
 			       struct indexable_heap *heap, bool demotion)
 {
-	int source_nid = demotion ? first_node(node_states[N_MEMORY]) :
-				    last_node(node_states[N_MEMORY]);
+	int source_nid = demotion ? DRAM_NID : PMEM_NID;
 	// u64 lru_mask = demotion ?
 	// 		       BIT(LRU_INACTIVE_FILE) | BIT(LRU_INACTIVE_ANON) :
 	// 		       BIT(LRU_ACTIVE_FILE) | BIT(LRU_ACTIVE_ANON);
+	u64 histo[64 + 1] = {}, scanned = 0, duplicated = 0;
 	struct folio *folio;
 	u64 drained = 0;
 	for_each_node_lru_folio_locked(source_nid, LRU_ALL, folio)
 	{
 		u64 pfn = folio_pfn(folio);
 		u64 count = streaming_decaying_sketch_get(sds, pfn);
-		struct pair elem = { pfn, count },
-			    old = indexable_heap_insert(heap, &elem);
-		drained += old.key == -ENOENT;
+
+		if (!!count ^ demotion) {
+			struct pair elem = { pfn, count },
+				    old = indexable_heap_insert(heap, &elem);
+			drained += old.key == -ENOENT;
+			duplicated += old.key == elem.key;
+		}
+		++scanned;
+		++histo[count ? 1 + ilog2(count) : 0];
 		if (drained / 10 > migration_batch_size) {
 			goto enough;
 		}
+		// if (indexable_heap_length(heap) >= migration_candidate_size) {
+		// 	goto enough;
+		// }
 	}
 enough:
-	pr_info_ratelimited("%s: drained %llu pages from nid=%d\n", __func__,
-			    drained, source_nid);
+	pr_info_ratelimited(
+		"%s: %s scanned %llu pages duplicated %llu drained %llu pages from nid=%d\n",
+		__func__, demotion ? " demotion" : "promotion", scanned,
+		duplicated, drained, source_nid);
+	for (u64 i = 0; i < ARRAY_SIZE(histo); ++i) {
+		if (histo[i]) {
+			pr_info_ratelimited("%s: [%llu, %llu) = %llu\n",
+					    __func__, i ? 1ull << (i - 1) : 0,
+					    i ? 1ull << i : 1, histo[i]);
+		}
+	}
 	return drained;
+}
+
+static ssize_t debug_log_samples_write(void *buf, size_t len)
+{
+	if (likely(!debug_log_samples)) {
+		return 0;
+	}
+	struct file *file = TRY(filp_open("/out/debug_samples",
+					  O_WRONLY | O_CREAT | O_TRUNC, 0644));
+	ssize_t written = TRY(kernel_write(file, buf, len, 0));
+	TRY(filp_close(file, NULL));
+	return written;
 }
 
 static int placement_thread_fn_policy(struct placement *p)
@@ -911,16 +952,24 @@ static int placement_thread_fn_policy(struct placement *p)
 					   streaming_decaying_sketch_width,
 					   streaming_decaying_sketch_depth));
 
+	u64 debug_samples_len = 0, debug_samples_cap = 2ul << 20;
+	struct perf_sample *debug_samples_store =
+		unlikely(debug_log_samples) ?
+			kvmalloc(sizeof(struct perf_sample) *
+					 (debug_samples_cap),
+				 GFP_KERNEL) :
+			NULL;
+
 	while (!kthread_should_stop()) {
 		if (iter++ % interval == 0) {
 			// intel_pmu_print_debug_all();
-			struct placement_shared_state *state = &p->state;
-			scoped_guard(mutex, &state->lock)
-			{
-				for (int i = 0; i < CHI_MAX; ++i)
-					indexable_heap_print_debug(
-						&state->candidate[i]);
-			}
+			// struct placement_shared_state *state = &p->state;
+			// scoped_guard(mutex, &state->lock)
+			// {
+			// 	for (int i = 0; i < CHI_MAX; ++i)
+			// 		indexable_heap_print_debug(
+			// 			&state->candidate[i]);
+			// }
 			memcg_print_debug_all();
 		}
 		int cpu, eidx;
@@ -933,6 +982,13 @@ static int placement_thread_fn_policy(struct placement *p)
 		{
 			for_each_sample_from_cpu_x_event(p, cpu, eidx, e, s)
 			{
+				if (unlikely(debug_log_samples &&
+					     debug_samples_store)) {
+					debug_samples_store[debug_samples_len++ %
+							    debug_samples_cap] =
+						s;
+				}
+
 				++valid;
 				// pr_info_ratelimited(
 				// 	"%s: got %llu-th sample: cpu=%d eidx=%d pid=%u tid=%u time=%llu addr=0x%llx weight=%llu phys_addr=0x%llx\n",
@@ -943,9 +999,7 @@ static int placement_thread_fn_policy(struct placement *p)
 				}
 
 				u64 pfn = PFN_DOWN(s.phys_addr);
-				bool in_dram =
-					pfn_to_nid(pfn) ==
-					first_node(node_states[N_MEMORY]);
+				bool in_dram = pfn_to_nid(pfn) == DRAM_NID;
 				u64 count = streaming_decaying_sketch_push(&sds,
 									   pfn);
 				struct pair elem = { pfn, count }, old = {};
@@ -999,6 +1053,10 @@ static int placement_thread_fn_policy(struct placement *p)
 		// pr_info_ratelimited("%s: thread giving up cpu\n", __func__);
 		schedule_timeout_interruptible(timeout);
 	}
+
+	debug_log_samples_write(debug_samples_store,
+				min(debug_samples_len, debug_samples_cap) *
+					sizeof(struct perf_sample));
 	return 0;
 }
 
@@ -1018,15 +1076,14 @@ static void zone_wmark_print_debug(struct zone *z)
 static int migration_isolate_folios(struct indexable_heap *heap, bool demotion,
 				    struct list_head *isolated)
 {
-	int got = 0, filtered = 0, failed = 0;
+	int got = 0, filtered = 0, failed = 0,
+	    candidate = indexable_heap_length(heap);
 	while (got < migration_batch_size && indexable_heap_length(heap) > 0) {
 		struct pair *p = indexable_heap_pop_back(heap);
 		BUG_ON(!p);
 		u64 pfn = p->key, count = p->value;
 
-		// For demotion, we only want to migrate pages with count <= 5.
-		// And for promotion, we only want to migrate pages with count > 5.
-		if ((count > 5) ^ demotion) {
+		if ((count > 1) ^ !demotion) {
 			++filtered;
 			continue;
 		}
@@ -1048,8 +1105,9 @@ static int migration_isolate_folios(struct indexable_heap *heap, bool demotion,
 	}
 	if (got < migration_batch_size / 10 && !indexable_heap_length(heap)) {
 		pr_info_ratelimited(
-			"%s: not enough migration candidate got=%d filtered=%d failed=%d\n",
-			__func__, got, filtered, failed);
+			"%s: not enough %s candidate candidate=%d got=%d filtered=%d failed=%d\n",
+			__func__, demotion ? " demotion" : "promotion",
+			candidate, got, filtered, failed);
 	}
 
 	return got;
@@ -1057,8 +1115,7 @@ static int migration_isolate_folios(struct indexable_heap *heap, bool demotion,
 
 static int migration_migrate_folios(struct list_head *isolated, bool demotion)
 {
-	int target_nid = demotion ? last_node(node_states[N_MEMORY]) :
-				    first_node(node_states[N_MEMORY]);
+	int target_nid = demotion ? PMEM_NID : DRAM_NID;
 	nodemask_t target_mask = nodemask_of_node(target_nid);
 	struct migration_target_control mtc = {
 		.gfp_mask = (GFP_HIGHUSER_MOVABLE & ~__GFP_RECLAIM) |
@@ -1085,8 +1142,7 @@ static int migration_migrate_folios(struct list_head *isolated, bool demotion)
 
 static int migration_do(struct indexable_heap *heap, bool demotion)
 {
-	int to_nid = demotion ? last_node(node_states[N_MEMORY]) :
-				first_node(node_states[N_MEMORY]);
+	int to_nid = demotion ? PMEM_NID : DRAM_NID;
 	struct zone *to_zone = NODE_DATA(to_nid)->node_zones + ZONE_NORMAL;
 
 	u64 free = zone_page_state(to_zone, NR_FREE_PAGES),
@@ -1119,15 +1175,11 @@ static int migration_do(struct indexable_heap *heap, bool demotion)
 static int placement_thread_fn_migration(struct placement *p)
 {
 	pr_info("%s: thread started\n", __func__);
-	u64 timeout = usecs_to_jiffies(10000);
-	u64 interval = 10000, iter = 0;
+	u64 timeout = usecs_to_jiffies(100000);
+	u64 interval = 1000, iter = 0;
 
-	struct pglist_data *dram_node =
-		NODE_DATA(first_node(node_states[N_MEMORY]));
-	struct pglist_data *pmem_node =
-		NODE_DATA(last_node(node_states[N_MEMORY]));
-	struct zone *dram_normal = dram_node->node_zones + ZONE_NORMAL;
-	struct zone *pmem_normal = pmem_node->node_zones + ZONE_NORMAL;
+	struct zone *dram_normal = DRAM_NODE->node_zones + ZONE_NORMAL;
+	struct zone *pmem_normal = PMEM_NODE->node_zones + ZONE_NORMAL;
 
 	pr_info("%s: DRAM normal zone:\n", __func__);
 	zone_wmark_print_debug(dram_normal);
@@ -1148,8 +1200,10 @@ static int placement_thread_fn_migration(struct placement *p)
 				  (counters.total_samples + 1);
 			if (iter++ % interval == 0) {
 				pr_info_ratelimited(
-					"%s: DRAM access percentile target=%llu has=%llu\n",
-					__func__, target, has);
+					"%s: DRAM access percentile target=%llu has=%llu (%llu/%llu)\n",
+					__func__, target, has,
+					counters.dram_samples,
+					counters.total_samples);
 			}
 			if (!has || has >= target) {
 				goto yield;
@@ -1157,8 +1211,10 @@ static int placement_thread_fn_migration(struct placement *p)
 
 			int err = 0;
 
-			// if last demoted is too small, we should wait
-			if (last_demoted > migration_batch_size / 10) {
+			// demotion can always find something to do
+			// so, we should skip, if the wmark permits
+			if (zone_page_state(dram_normal, NR_FREE_PAGES) <
+			    wmark_pages(dram_normal, WMARK_PROMO)) {
 				// pr_info_ratelimited("%s: demotion\n", __func__);
 				err = migration_do(
 					&state->candidate[CHI_DEMOTION], true);
@@ -1166,12 +1222,12 @@ static int placement_thread_fn_migration(struct placement *p)
 					goto yield;
 				}
 				if (err < migration_batch_size / 100) {
-					++state->candidate_not_enough
-						  [CHI_DEMOTION];
+					// ++state->candidate_not_enough
+					// 	  [CHI_DEMOTION];
 				}
-				last_demoted = err;
+				// last_demoted = err;
 			} else {
-				last_demoted += max(1ull, last_demoted / 10);
+				// last_demoted += max(1ull, last_demoted / 10);
 			}
 
 			// However, promotion should be done continuously
@@ -1182,10 +1238,8 @@ static int placement_thread_fn_migration(struct placement *p)
 				goto yield;
 			}
 			if (err < migration_batch_size / 100) {
-				++state->candidate_not_enough[CHI_DEMOTION];
+				// ++state->candidate_not_enough[CHI_PROMOTION];
 			}
-			// TODO: switch to move_pages API
-			// kernel_move_pages(pid_t pid, unsigned long nr_pages, const u64 *pages, const int *nodes, int *status, int flags)
 		}
 
 yield:
