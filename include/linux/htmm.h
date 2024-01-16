@@ -1,4 +1,10 @@
-#include <uapi/linux/perf_event.h>
+#ifndef _LINUX_HTMM_H
+#define _LINUX_HTMM_H
+
+#include <linux/cleanup.h>
+#include <linux/mm.h>
+#include <linux/perf_event.h>
+#include <linux/sched/clock.h>
 
 #define DEFERRED_SPLIT_ISOLATED 1
 
@@ -219,3 +225,18 @@ extern unsigned long get_memcg_promotion_watermark(unsigned long max_nr_pages);
 extern void kmigraterd_wakeup(int nid);
 extern int kmigraterd_init(void);
 extern void kmigraterd_stop(void);
+
+struct vmevent {
+	enum vm_event_item item;
+	u64 begin;
+};
+static inline struct vmevent vmevent_ctor(enum vm_event_item item)
+{
+	struct vmevent t = { .begin = local_clock(), .item = item };
+	return t;
+}
+DEFINE_CLASS(vmevent, struct vmevent,
+	     count_vm_events(_T.item, local_clock() - _T.begin),
+	     vmevent_ctor(item), enum vm_event_item item);
+
+#endif
