@@ -1242,9 +1242,9 @@ static int free_tail_pages_check(struct page *head_page, struct page *page)
 #ifdef CONFIG_HTMM
 		/* from the third tail page ~  */
 		if (page - head_page < 132) {
-		    ClearPageHtmm(page);
-		    page->mapping = TAIL_MAPPING;
-		    break;
+			ClearPageHtmm(page);
+			page->mapping = TAIL_MAPPING;
+			break;
 		}
 #endif
 		if (page->mapping != TAIL_MAPPING) {

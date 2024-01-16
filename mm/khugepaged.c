@@ -1092,26 +1092,26 @@ static int collapse_huge_page(struct mm_struct *mm,
 #ifdef CONFIG_HTMM
 	/* check whether there is enough free space in target memory node */
 	if (node_is_toptier(node)) {
-	    struct mem_cgroup *memcg = get_mem_cgroup_from_mm(mm);
-	    unsigned long max_nr_pages, cur_nr_pages;
-	    pg_data_t *pgdat;
+		struct mem_cgroup *memcg = get_mem_cgroup_from_mm(mm);
+		unsigned long max_nr_pages, cur_nr_pages;
+		pg_data_t *pgdat;
 
-	    if (!memcg || !memcg->htmm_enabled)
-		goto normal_exec;
-	    
-	    pgdat = NODE_DATA(node);
-	    cur_nr_pages = get_nr_lru_pages_node(memcg, pgdat);
-	    max_nr_pages = memcg->nodeinfo[node]->max_nr_base_pages;
+		if (!memcg || !memcg->htmm_enabled)
+			goto normal_exec;
 
-	    if (max_nr_pages == ULONG_MAX)
-		goto normal_exec;
-	    else if (cur_nr_pages + HPAGE_PMD_NR <= max_nr_pages)
-		goto normal_exec;
-	    else {
-		result = SCAN_ALLOC_HUGE_PAGE_FAIL;
-		//ret = 1;
-		goto out_nolock;
-	    }
+		pgdat = NODE_DATA(node);
+		cur_nr_pages = get_nr_lru_pages_node(memcg, pgdat);
+		max_nr_pages = memcg->nodeinfo[node]->max_nr_base_pages;
+
+		if (max_nr_pages == ULONG_MAX)
+			goto normal_exec;
+		else if (cur_nr_pages + HPAGE_PMD_NR <= max_nr_pages)
+			goto normal_exec;
+		else {
+			result = SCAN_ALLOC_HUGE_PAGE_FAIL;
+			//ret = 1;
+			goto out_nolock;
+		}
 	}
 normal_exec:
 	new_page = khugepaged_alloc_page(hpage, gfp, node);
@@ -1326,12 +1326,12 @@ static int khugepaged_scan_pmd(struct mm_struct *mm,
 			writable = true;
 #ifdef CONFIG_HTMM
 		if (mm->htmm_enabled) {
-		    pginfo = get_pginfo_from_pte(_pte);
-		    if (!pginfo)
-			goto out_unmap;
-		    
-		    if (!pginfo->may_hot)
-			goto out_unmap;
+			pginfo = get_pginfo_from_pte(_pte);
+			if (!pginfo)
+				goto out_unmap;
+
+			if (!pginfo->may_hot)
+				goto out_unmap;
 		}
 #endif
 		page = vm_normal_page(vma, _address, pteval);
@@ -1702,26 +1702,26 @@ static int collapse_file(struct mm_struct *mm,
 #ifdef CONFIG_HTMM
 	/* check whether there is enough free space in target memory node */
 	if (node_is_toptier(node)) {
-	    struct mem_cgroup *memcg = get_mem_cgroup_from_mm(mm);
-	    unsigned long max_nr_pages, cur_nr_pages;
-	    pg_data_t *pgdat;
+		struct mem_cgroup *memcg = get_mem_cgroup_from_mm(mm);
+		unsigned long max_nr_pages, cur_nr_pages;
+		pg_data_t *pgdat;
 
-	    if (!memcg || !memcg->htmm_enabled)
-		goto normal_exec_file;
-	    
-	    pgdat = NODE_DATA(node);
-	    cur_nr_pages = get_nr_lru_pages_node(memcg, pgdat);
-	    max_nr_pages = memcg->nodeinfo[node]->max_nr_base_pages;
+		if (!memcg || !memcg->htmm_enabled)
+			goto normal_exec_file;
 
-	    if (max_nr_pages == ULONG_MAX)
-		goto normal_exec_file;
-	    else if (cur_nr_pages + HPAGE_PMD_NR <= max_nr_pages)
-		goto normal_exec_file;
-	    else {
-		result = SCAN_ALLOC_HUGE_PAGE_FAIL;
-		//ret = 1;
-		goto out;
-	    }
+		pgdat = NODE_DATA(node);
+		cur_nr_pages = get_nr_lru_pages_node(memcg, pgdat);
+		max_nr_pages = memcg->nodeinfo[node]->max_nr_base_pages;
+
+		if (max_nr_pages == ULONG_MAX)
+			goto normal_exec_file;
+		else if (cur_nr_pages + HPAGE_PMD_NR <= max_nr_pages)
+			goto normal_exec_file;
+		else {
+			result = SCAN_ALLOC_HUGE_PAGE_FAIL;
+			//ret = 1;
+			goto out;
+		}
 	}
 normal_exec_file:
 	new_page = khugepaged_alloc_page(hpage, gfp, node);

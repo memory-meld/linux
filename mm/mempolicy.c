@@ -2106,49 +2106,54 @@ struct page *alloc_pages_vma(gfp_t gfp, int order, struct vm_area_struct *vma,
 
 #ifdef CONFIG_HTMM /* alloc_pages_vma() */
 	if (vma->vm_mm && vma->vm_mm->htmm_enabled) {
-	    struct task_struct *p = current;
-	    struct mem_cgroup *memcg = mem_cgroup_from_task(p);
-	    unsigned long max_nr_pages;
-	    int nid = pol->mode == MPOL_PREFERRED ? first_node(pol->nodes) : node;
-	    int orig_nid = nid;
-	    unsigned int nr_pages = 1U << order;
-	    pg_data_t *pgdat = NODE_DATA(nid);
-	    
-	    if (!memcg || !memcg->htmm_enabled)
-		goto use_default_pol;
+		struct task_struct *p = current;
+		struct mem_cgroup *memcg = mem_cgroup_from_task(p);
+		unsigned long max_nr_pages;
+		int nid = pol->mode == MPOL_PREFERRED ? first_node(pol->nodes) :
+							node;
+		int orig_nid = nid;
+		unsigned int nr_pages = 1U << order;
+		pg_data_t *pgdat = NODE_DATA(nid);
 
-	    max_nr_pages = READ_ONCE(memcg->nodeinfo[nid]->max_nr_base_pages);
-	    if (max_nr_pages == ULONG_MAX)
-		goto use_default_pol;
+		if (!memcg || !memcg->htmm_enabled)
+			goto use_default_pol;
 
-	    while (max_nr_pages <= (get_nr_lru_pages_node(memcg, pgdat) + nr_pages)) {
-		if (htmm_cxl_mode) {
-		    nid = 1;
-		    break;
+		max_nr_pages =
+			READ_ONCE(memcg->nodeinfo[nid]->max_nr_base_pages);
+		if (max_nr_pages == ULONG_MAX)
+			goto use_default_pol;
+
+		while (max_nr_pages <=
+		       (get_nr_lru_pages_node(memcg, pgdat) + nr_pages)) {
+			if (htmm_cxl_mode) {
+				nid = 1;
+				break;
+			}
+			if ((nid = next_demotion_node(nid)) == NUMA_NO_NODE) {
+				nid = first_memory_node;
+				break;
+			}
+			max_nr_pages = READ_ONCE(
+				memcg->nodeinfo[nid]->max_nr_base_pages);
+			pgdat = NODE_DATA(nid);
 		}
-		if ((nid = next_demotion_node(nid)) == NUMA_NO_NODE) {
-		    nid = first_memory_node;
-		    break;
+
+		//nid = orig_nid;
+
+		if (orig_nid != nid) {
+			WRITE_ONCE(memcg->nodeinfo[orig_nid]->need_demotion,
+				   true);
+			kmigraterd_wakeup(orig_nid);
+		} else if (max_nr_pages <=
+			   (get_nr_lru_pages_node(memcg, pgdat) +
+			    get_memcg_demotion_watermark(max_nr_pages))) {
+			WRITE_ONCE(memcg->nodeinfo[nid]->need_demotion, true);
+			kmigraterd_wakeup(nid);
 		}
-		max_nr_pages = READ_ONCE(memcg->nodeinfo[nid]->max_nr_base_pages);
-		pgdat = NODE_DATA(nid);
-	    }
 
-	    //nid = orig_nid;
-
-	    if (orig_nid != nid) {
-		WRITE_ONCE(memcg->nodeinfo[orig_nid]->need_demotion, true);
-		kmigraterd_wakeup(orig_nid);
-	    }
-	    else if (max_nr_pages <= (get_nr_lru_pages_node(memcg, pgdat) +
-			get_memcg_demotion_watermark(max_nr_pages))) {
-		WRITE_ONCE(memcg->nodeinfo[nid]->need_demotion, true);
-		kmigraterd_wakeup(nid);
-	    }
-	    
-	    mpol_cond_put(pol);
-	    page = __alloc_pages_node(nid, gfp | __GFP_THISNODE, order);
-	    goto out;
+		mpol_cond_put(pol);
+		page = __alloc_pages_node(nid, gfp | __GFP_THISNODE, order);
+		goto out;
 	}
 use_default_pol:
 #endif
@@ -3108,14 +3113,14 @@ delete_obj:
 subsys_initcall(numa_init_sysfs);
 #ifdef CONFIG_HTMM
 static ssize_t htmm_sample_period_show(struct kobject *kobj,
-				   struct kobj_attribute *attr, char *buf)
+				       struct kobj_attribute *attr, char *buf)
 {
 	return sysfs_emit(buf, "%u\n", htmm_sample_period);
 }
 
 static ssize_t htmm_sample_period_store(struct kobject *kobj,
-				    struct kobj_attribute *attr,
-				    const char *buf, size_t count)
+					struct kobj_attribute *attr,
+					const char *buf, size_t count)
 {
 	int err;
 	unsigned int period;
@@ -3133,14 +3138,15 @@ static struct kobj_attribute htmm_sample_period_attr =
 	       htmm_sample_period_store);
 
 static ssize_t htmm_inst_sample_period_show(struct kobject *kobj,
-				   struct kobj_attribute *attr, char *buf)
+					    struct kobj_attribute *attr,
+					    char *buf)
 {
 	return sysfs_emit(buf, "%u\n", htmm_inst_sample_period);
 }
 
 static ssize_t htmm_inst_sample_period_store(struct kobject *kobj,
-				    struct kobj_attribute *attr,
-				    const char *buf, size_t count)
+					     struct kobj_attribute *attr,
+					     const char *buf, size_t count)
 {
 	int err;
 	unsigned int period;
@@ -3158,14 +3164,14 @@ static struct kobj_attribute htmm_inst_sample_period_attr =
 	       htmm_inst_sample_period_store);
 
 static ssize_t htmm_split_period_show(struct kobject *kobj,
-				   struct kobj_attribute *attr, char *buf)
+				      struct kobj_attribute *attr, char *buf)
 {
 	return sysfs_emit(buf, "%u\n", htmm_split_period);
 }
 
 static ssize_t htmm_split_period_store(struct kobject *kobj,
-				    struct kobj_attribute *attr,
-				    const char *buf, size_t count)
+				       struct kobj_attribute *attr,
+				       const char *buf, size_t count)
 {
 	int err;
 	unsigned int thres;
@@ -3181,7 +3187,6 @@ static ssize_t htmm_split_period_store(struct kobject *kobj,
 static struct kobj_attribute htmm_split_period_attr =
 	__ATTR(htmm_split_period, 0644, htmm_split_period_show,
 	       htmm_split_period_store);
-
 
 static ssize_t htmm_thres_hot_show(struct kobject *kobj,
 				   struct kobj_attribute *attr, char *buf)
@@ -3205,18 +3210,17 @@ static ssize_t htmm_thres_hot_store(struct kobject *kobj,
 }
 
 static struct kobj_attribute htmm_thres_hot_attr =
-	__ATTR(htmm_thres_hot, 0644, htmm_thres_hot_show,
-	       htmm_thres_hot_store);
+	__ATTR(htmm_thres_hot, 0644, htmm_thres_hot_show, htmm_thres_hot_store);
 
 static ssize_t htmm_cooling_period_show(struct kobject *kobj,
-				    struct kobj_attribute *attr, char *buf)
+					struct kobj_attribute *attr, char *buf)
 {
 	return sysfs_emit(buf, "%u\n", htmm_cooling_period);
 }
 
 static ssize_t htmm_cooling_period_store(struct kobject *kobj,
-				     struct kobj_attribute *attr,
-				     const char *buf, size_t count)
+					 struct kobj_attribute *attr,
+					 const char *buf, size_t count)
 {
 	int err;
 	unsigned int period;
@@ -3234,14 +3238,15 @@ static struct kobj_attribute htmm_cooling_period_attr =
 	       htmm_cooling_period_store);
 
 static ssize_t ksampled_min_sample_ratio_show(struct kobject *kobj,
-				    struct kobj_attribute *attr, char *buf)
+					      struct kobj_attribute *attr,
+					      char *buf)
 {
 	return sysfs_emit(buf, "%u\n", ksampled_min_sample_ratio);
 }
 
 static ssize_t ksampled_min_sample_ratio_store(struct kobject *kobj,
-				     struct kobj_attribute *attr,
-				     const char *buf, size_t count)
+					       struct kobj_attribute *attr,
+					       const char *buf, size_t count)
 {
 	int err;
 	unsigned int interval;
@@ -3259,14 +3264,15 @@ static struct kobj_attribute ksampled_min_sample_ratio_attr =
 	       ksampled_min_sample_ratio_store);
 
 static ssize_t ksampled_max_sample_ratio_show(struct kobject *kobj,
-				    struct kobj_attribute *attr, char *buf)
+					      struct kobj_attribute *attr,
+					      char *buf)
 {
 	return sysfs_emit(buf, "%u\n", ksampled_max_sample_ratio);
 }
 
 static ssize_t ksampled_max_sample_ratio_store(struct kobject *kobj,
-				     struct kobj_attribute *attr,
-				     const char *buf, size_t count)
+					       struct kobj_attribute *attr,
+					       const char *buf, size_t count)
 {
 	int err;
 	unsigned int interval;
@@ -3284,14 +3290,14 @@ static struct kobj_attribute ksampled_max_sample_ratio_attr =
 	       ksampled_max_sample_ratio_store);
 
 static ssize_t htmm_demotion_period_show(struct kobject *kobj,
-				   struct kobj_attribute *attr, char *buf)
+					 struct kobj_attribute *attr, char *buf)
 {
 	return sysfs_emit(buf, "%u\n", htmm_demotion_period_in_ms);
 }
 
 static ssize_t htmm_demotion_period_store(struct kobject *kobj,
-				    struct kobj_attribute *attr,
-				    const char *buf, size_t count)
+					  struct kobj_attribute *attr,
+					  const char *buf, size_t count)
 {
 	int err;
 	unsigned int thres;
@@ -3309,14 +3315,15 @@ static struct kobj_attribute htmm_demotion_period_attr =
 	       htmm_demotion_period_store);
 
 static ssize_t htmm_promotion_period_show(struct kobject *kobj,
-				   struct kobj_attribute *attr, char *buf)
+					  struct kobj_attribute *attr,
+					  char *buf)
 {
 	return sysfs_emit(buf, "%u\n", htmm_promotion_period_in_ms);
 }
 
 static ssize_t htmm_promotion_period_store(struct kobject *kobj,
-				    struct kobj_attribute *attr,
-				    const char *buf, size_t count)
+					   struct kobj_attribute *attr,
+					   const char *buf, size_t count)
 {
 	int err;
 	unsigned int thres;
@@ -3334,14 +3341,15 @@ static struct kobj_attribute htmm_promotion_period_attr =
 	       htmm_promotion_period_store);
 
 static ssize_t ksampled_soft_cpu_quota_show(struct kobject *kobj,
-				   struct kobj_attribute *attr, char *buf)
+					    struct kobj_attribute *attr,
+					    char *buf)
 {
 	return sysfs_emit(buf, "%u\n", ksampled_soft_cpu_quota);
 }
 
 static ssize_t ksampled_soft_cpu_quota_store(struct kobject *kobj,
-				    struct kobj_attribute *attr,
-				    const char *buf, size_t count)
+					     struct kobj_attribute *attr,
+					     const char *buf, size_t count)
 {
 	int err;
 	unsigned int sp_count;
@@ -3359,14 +3367,14 @@ static struct kobj_attribute ksampled_soft_cpu_quota_attr =
 	       ksampled_soft_cpu_quota_store);
 
 static ssize_t htmm_thres_split_show(struct kobject *kobj,
-				   struct kobj_attribute *attr, char *buf)
+				     struct kobj_attribute *attr, char *buf)
 {
 	return sysfs_emit(buf, "%u\n", htmm_thres_split);
 }
 
 static ssize_t htmm_thres_split_store(struct kobject *kobj,
-				    struct kobj_attribute *attr,
-				    const char *buf, size_t count)
+				      struct kobj_attribute *attr,
+				      const char *buf, size_t count)
 {
 	int err;
 	unsigned int thres;
@@ -3379,19 +3387,18 @@ static ssize_t htmm_thres_split_store(struct kobject *kobj,
 	return count;
 }
 
-static struct kobj_attribute htmm_thres_split_attr =
-	__ATTR(htmm_thres_split, 0644, htmm_thres_split_show,
-	       htmm_thres_split_store);
+static struct kobj_attribute htmm_thres_split_attr = __ATTR(
+	htmm_thres_split, 0644, htmm_thres_split_show, htmm_thres_split_store);
 
 static ssize_t htmm_nowarm_show(struct kobject *kobj,
-				   struct kobj_attribute *attr, char *buf)
+				struct kobj_attribute *attr, char *buf)
 {
 	return sysfs_emit(buf, "%u\n", htmm_nowarm);
 }
 
 static ssize_t htmm_nowarm_store(struct kobject *kobj,
-				    struct kobj_attribute *attr,
-				    const char *buf, size_t count)
+				 struct kobj_attribute *attr, const char *buf,
+				 size_t count)
 {
 	int err;
 	unsigned int thres;
@@ -3405,18 +3412,18 @@ static ssize_t htmm_nowarm_store(struct kobject *kobj,
 }
 
 static struct kobj_attribute htmm_nowarm_attr =
-	__ATTR(htmm_nowarm, 0644, htmm_nowarm_show,
-	       htmm_nowarm_store);
+	__ATTR(htmm_nowarm, 0644, htmm_nowarm_show, htmm_nowarm_store);
 
 static ssize_t htmm_adaptation_period_show(struct kobject *kobj,
-				   struct kobj_attribute *attr, char *buf)
+					   struct kobj_attribute *attr,
+					   char *buf)
 {
 	return sysfs_emit(buf, "%u\n", htmm_adaptation_period);
 }
 
 static ssize_t htmm_adaptation_period_store(struct kobject *kobj,
-				    struct kobj_attribute *attr,
-				    const char *buf, size_t count)
+					    struct kobj_attribute *attr,
+					    const char *buf, size_t count)
 {
 	int err;
 	unsigned int period;
@@ -3434,14 +3441,14 @@ static struct kobj_attribute htmm_adaptation_period_attr =
 	       htmm_adaptation_period_store);
 
 static ssize_t htmm_util_weight_show(struct kobject *kobj,
-				   struct kobj_attribute *attr, char *buf)
+				     struct kobj_attribute *attr, char *buf)
 {
 	return sysfs_emit(buf, "%u\n", htmm_util_weight);
 }
 
 static ssize_t htmm_util_weight_store(struct kobject *kobj,
-				    struct kobj_attribute *attr,
-				    const char *buf, size_t count)
+				      struct kobj_attribute *attr,
+				      const char *buf, size_t count)
 {
 	int err;
 	unsigned int util_w;
@@ -3454,9 +3461,8 @@ static ssize_t htmm_util_weight_store(struct kobject *kobj,
 	return count;
 }
 
-static struct kobj_attribute htmm_util_weight_attr =
-	__ATTR(htmm_util_weight, 0644, htmm_util_weight_show,
-	       htmm_util_weight_store);
+static struct kobj_attribute htmm_util_weight_attr = __ATTR(
+	htmm_util_weight, 0644, htmm_util_weight_show, htmm_util_weight_store);
 
 static ssize_t htmm_gamma_show(struct kobject *kobj,
 			       struct kobj_attribute *attr, char *buf)
@@ -3465,8 +3471,8 @@ static ssize_t htmm_gamma_show(struct kobject *kobj,
 }
 
 static ssize_t htmm_gamma_store(struct kobject *kobj,
-				struct kobj_attribute *attr,
-				const char *buf, size_t count)
+				struct kobj_attribute *attr, const char *buf,
+				size_t count)
 {
 	int err;
 	unsigned int g;
@@ -3480,53 +3486,60 @@ static ssize_t htmm_gamma_store(struct kobject *kobj,
 }
 
 static struct kobj_attribute htmm_gamma_attr =
-	__ATTR(htmm_gamma, 0644, htmm_gamma_show,
-	       htmm_gamma_store);
-
+	__ATTR(htmm_gamma, 0644, htmm_gamma_show, htmm_gamma_store);
 
 static ssize_t htmm_cxl_mode_show(struct kobject *kobj,
 				  struct kobj_attribute *attr, char *buf)
 {
 	if (htmm_cxl_mode)
-	    return sysfs_emit(buf, "CXL-emulated: %s\n", "[enabled] disabled");
+		return sysfs_emit(buf, "CXL-emulated: %s\n",
+				  "[enabled] disabled");
 	else
-	    return sysfs_emit(buf, "CXL-emulated: %s\n", "enabled [disabled]");
+		return sysfs_emit(buf, "CXL-emulated: %s\n",
+				  "enabled [disabled]");
 }
 
 static ssize_t htmm_cxl_mode_store(struct kobject *kobj,
-				   struct kobj_attribute *attr,
-				   const char *buf, size_t count)
+				   struct kobj_attribute *attr, const char *buf,
+				   size_t count)
 {
-    if (sysfs_streq(buf, "enabled"))
-	htmm_cxl_mode = true;
-    else if (sysfs_streq(buf, "disabled"))
-	htmm_cxl_mode = false;
-    else
-	return -EINVAL;
+	if (sysfs_streq(buf, "enabled"))
+		htmm_cxl_mode = true;
+	else if (sysfs_streq(buf, "disabled"))
+		htmm_cxl_mode = false;
+	else
+		return -EINVAL;
 
-    return count;
+	return count;
 }
 
-static struct kobj_attribute htmm_cxl_mode_attr = 
-	__ATTR(htmm_cxl_mode, 0644, htmm_cxl_mode_show,
-	       htmm_cxl_mode_store);
+static struct kobj_attribute htmm_cxl_mode_attr =
+	__ATTR(htmm_cxl_mode, 0644, htmm_cxl_mode_show, htmm_cxl_mode_store);
 
-static ssize_t htmm_mode_show(struct kobject *kobj,
-			      struct kobj_attribute *attr, char *buf)
+static ssize_t htmm_mode_show(struct kobject *kobj, struct kobj_attribute *attr,
+			      char *buf)
 {
 	if (htmm_mode == HTMM_NO_MIG)
-		return sysfs_emit(buf, "%s\n", "[NO MIG-0], BASELINE-1, HUGEPAGE_OPT-2, HUGEPAGE_OPT_V2-3");
+		return sysfs_emit(
+			buf, "%s\n",
+			"[NO MIG-0], BASELINE-1, HUGEPAGE_OPT-2, HUGEPAGE_OPT_V2-3");
 	else if (htmm_mode == HTMM_BASELINE)
-		return sysfs_emit(buf, "%s\n", "NO MIG-0, [BASELINE-1], HUGEPAGE_OPT-2, HUGEPAGE_OPT_V2");
+		return sysfs_emit(
+			buf, "%s\n",
+			"NO MIG-0, [BASELINE-1], HUGEPAGE_OPT-2, HUGEPAGE_OPT_V2");
 	else if (htmm_mode == HTMM_HUGEPAGE_OPT)
-		return sysfs_emit(buf, "%s\n", "NO MIG-0, BASELINE-1, [HUGEPAGE_OPT-2], HUGEPAGE_OPT_V2-3");
+		return sysfs_emit(
+			buf, "%s\n",
+			"NO MIG-0, BASELINE-1, [HUGEPAGE_OPT-2], HUGEPAGE_OPT_V2-3");
 	else /* htmm_mode == HTMM_HUGEPAGE_OPT_V2 */
-		return sysfs_emit(buf, "%s\n", "NO MIG-0, BASELINE-1, HUGEPAGE_OPT-2, [HUGEPAGE_OPT_V2]");
+		return sysfs_emit(
+			buf, "%s\n",
+			"NO MIG-0, BASELINE-1, HUGEPAGE_OPT-2, [HUGEPAGE_OPT_V2]");
 }
 
 static ssize_t htmm_mode_store(struct kobject *kobj,
-			       struct kobj_attribute *attr,
-			       const char *buf, size_t count)
+			       struct kobj_attribute *attr, const char *buf,
+			       size_t count)
 {
 	int err;
 	unsigned int mode;
@@ -3536,43 +3549,42 @@ static ssize_t htmm_mode_store(struct kobject *kobj,
 		return err;
 
 	switch (mode) {
-		case HTMM_NO_MIG:
-		case HTMM_BASELINE:
-		case HTMM_HUGEPAGE_OPT:
-		case HTMM_HUGEPAGE_OPT_V2:
-			WRITE_ONCE(htmm_mode, mode);
-			break;
-		default:
-			return -EINVAL;
+	case HTMM_NO_MIG:
+	case HTMM_BASELINE:
+	case HTMM_HUGEPAGE_OPT:
+	case HTMM_HUGEPAGE_OPT_V2:
+		WRITE_ONCE(htmm_mode, mode);
+		break;
+	default:
+		return -EINVAL;
 	}
 	return count;
 }
 
 static struct kobj_attribute htmm_mode_attr =
-	__ATTR(htmm_mode, 0644, htmm_mode_show,
-	       htmm_mode_store);
+	__ATTR(htmm_mode, 0644, htmm_mode_show, htmm_mode_store);
 /* sysfs related to newly allocated pages */
 static ssize_t htmm_skip_cooling_show(struct kobject *kobj,
-	struct kobj_attribute *attr, char *buf)
+				      struct kobj_attribute *attr, char *buf)
 {
 	if (htmm_skip_cooling)
-	    return sysfs_emit(buf, "[enabled] disabled\n");
+		return sysfs_emit(buf, "[enabled] disabled\n");
 	else
-	    return sysfs_emit(buf, "enabled [disabled]\n");
+		return sysfs_emit(buf, "enabled [disabled]\n");
 }
 
 static ssize_t htmm_skip_cooling_store(struct kobject *kobj,
-	struct kobj_attribute *attr,
-	const char *buf, size_t count)
+				       struct kobj_attribute *attr,
+				       const char *buf, size_t count)
 {
-    if (sysfs_streq(buf, "enabled"))
-	htmm_skip_cooling = true;
-    else if (sysfs_streq(buf, "disabled"))
-	htmm_skip_cooling= false;
-    else
-	return -EINVAL;
+	if (sysfs_streq(buf, "enabled"))
+		htmm_skip_cooling = true;
+	else if (sysfs_streq(buf, "disabled"))
+		htmm_skip_cooling = false;
+	else
+		return -EINVAL;
 
-    return count;
+	return count;
 }
 
 static struct kobj_attribute htmm_skip_cooling_attr =
@@ -3580,14 +3592,15 @@ static struct kobj_attribute htmm_skip_cooling_attr =
 	       htmm_skip_cooling_store);
 
 static ssize_t htmm_thres_cooling_alloc_show(struct kobject *kobj,
-	struct kobj_attribute *attr, char *buf)
+					     struct kobj_attribute *attr,
+					     char *buf)
 {
-        return sysfs_emit(buf, "%u\n", htmm_thres_cooling_alloc);
+	return sysfs_emit(buf, "%u\n", htmm_thres_cooling_alloc);
 }
 
 static ssize_t htmm_thres_cooling_alloc_store(struct kobject *kobj,
-	struct kobj_attribute *attr,
-	const char *buf, size_t count)
+					      struct kobj_attribute *attr,
+					      const char *buf, size_t count)
 {
 	int err;
 	unsigned int thres;
@@ -3603,8 +3616,6 @@ static ssize_t htmm_thres_cooling_alloc_store(struct kobject *kobj,
 static struct kobj_attribute htmm_thres_cooling_alloc_attr =
 	__ATTR(htmm_thres_cooling_alloc, 0644, htmm_thres_cooling_alloc_show,
 	       htmm_thres_cooling_alloc_store);
-
-
 
 static struct attribute *htmm_attrs[] = {
 	&htmm_sample_period_attr.attr,
@@ -3638,7 +3649,7 @@ static int __init htmm_init_sysfs(void)
 	int err;
 	struct kobject *htmm_kobj;
 
-    	htmm_kobj = kobject_create_and_add("htmm", mm_kobj);
+	htmm_kobj = kobject_create_and_add("htmm", mm_kobj);
 	if (!htmm_kobj) {
 		pr_err("failed to create htmm kobject\n");
 		return -ENOMEM;

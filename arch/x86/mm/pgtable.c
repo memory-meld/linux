@@ -31,24 +31,23 @@ gfp_t __userpte_alloc_gfp = GFP_PGTABLE_USER | PGTABLE_HIGHMEM;
 #ifdef CONFIG_HTMM
 static void __pte_alloc_pginfo(struct page *page)
 {
-    /* __userpte_alloc_gfp contains __GFP_ZERO */
-    page->pginfo = kmem_cache_alloc(pginfo_cache,
-				    __userpte_alloc_gfp);
-    if (page->pginfo)
-	SetPageHtmm(page);
+	/* __userpte_alloc_gfp contains __GFP_ZERO */
+	page->pginfo = kmem_cache_alloc(pginfo_cache, __userpte_alloc_gfp);
+	if (page->pginfo)
+		SetPageHtmm(page);
 }
 #endif
 pgtable_t pte_alloc_one(struct mm_struct *mm)
 {
-    struct page *pgtable;
+	struct page *pgtable;
 
-    pgtable = __pte_alloc_one(mm, __userpte_alloc_gfp);
+	pgtable = __pte_alloc_one(mm, __userpte_alloc_gfp);
 #ifdef CONFIG_HTMM
-    if (mm->htmm_enabled) {
-	__pte_alloc_pginfo(pgtable);
-    }
+	if (mm->htmm_enabled) {
+		__pte_alloc_pginfo(pgtable);
+	}
 #endif
-    return pgtable;
+	return pgtable;
 }
 
 static int __init setup_userpte(char *arg)

@@ -174,57 +174,59 @@ void putback_movable_pages(struct list_head *l)
 
 static bool try_to_unmap_clean(struct page_vma_mapped_walk *pvmw, struct page *page)
 {
-    void *addr;
-    bool dirty;
-    pte_t newpte;
-    pginfo_t *pginfo;
+	void *addr;
+	bool dirty;
+	pte_t newpte;
+	pginfo_t *pginfo;
 
-    VM_BUG_ON_PAGE(PageCompound(page), page);
-    VM_BUG_ON_PAGE(!PageAnon(page), page);
-    VM_BUG_ON_PAGE(!PageLocked(page), page);
-    VM_BUG_ON_PAGE(pte_present(*pvmw->pte), page);
+	VM_BUG_ON_PAGE(PageCompound(page), page);
+	VM_BUG_ON_PAGE(!PageAnon(page), page);
+	VM_BUG_ON_PAGE(!PageLocked(page), page);
+	VM_BUG_ON_PAGE(pte_present(*pvmw->pte), page);
 
-    if (PageMlocked(page) || (pvmw->vma->vm_flags & VM_LOCKED))
-	return false;
+	if (PageMlocked(page) || (pvmw->vma->vm_flags & VM_LOCKED))
+		return false;
 
-    /* accessed ptes --> no zeroed pages */
-    pginfo = get_pginfo_from_pte(pvmw->pte);
-    if (!pginfo)
-	return false;
-    if (pginfo->nr_accesses > 0)
-	return false;
+	/* accessed ptes --> no zeroed pages */
+	pginfo = get_pginfo_from_pte(pvmw->pte);
+	if (!pginfo)
+		return false;
+	if (pginfo->nr_accesses > 0)
+		return false;
 
-    /*
-     * The pmd entry mapping the old thp was flushed and the pte mapping
-     * this subpage has been non present. Therefore, this subpage is
-     * inaccessible. We don't need to remap it if it contains only zeros.
-     */
-    addr = kmap_local_page(page);
-    dirty = memchr_inv(addr, 0, PAGE_SIZE);
-    kunmap_local(addr);
+	/*
+* The pmd entry mapping the old thp was flushed and the pte mapping
+* this subpage has been non present. Therefore, this subpage is
+* inaccessible. We don't need to remap it if it contains only zeros.
+*/
+	addr = kmap_local_page(page);
+	dirty = memchr_inv(addr, 0, PAGE_SIZE);
+	kunmap_local(addr);
 
-    if (dirty)
-	return false;
+	if (dirty)
+		return false;
 
-    pte_clear_not_present_full(pvmw->vma->vm_mm, pvmw->address, pvmw->pte, false);
+	pte_clear_not_present_full(pvmw->vma->vm_mm, pvmw->address, pvmw->pte,
+				   false);
 
-    if (userfaultfd_armed(pvmw->vma)) {
-	newpte = pte_mkspecial(pfn_pte(page_to_pfn(ZERO_PAGE(pvmw->address)),
-		    pvmw->vma->vm_page_prot));
-	ptep_clear_flush(pvmw->vma, pvmw->address, pvmw->pte);
-	set_pte_at(pvmw->vma->vm_mm, pvmw->address, pvmw->pte, newpte);
-	dec_mm_counter(pvmw->vma->vm_mm, MM_ANONPAGES);
+	if (userfaultfd_armed(pvmw->vma)) {
+		newpte = pte_mkspecial(
+			pfn_pte(page_to_pfn(ZERO_PAGE(pvmw->address)),
+				pvmw->vma->vm_page_prot));
+		ptep_clear_flush(pvmw->vma, pvmw->address, pvmw->pte);
+		set_pte_at(pvmw->vma->vm_mm, pvmw->address, pvmw->pte, newpte);
+		dec_mm_counter(pvmw->vma->vm_mm, MM_ANONPAGES);
+		return true;
+	}
+
+	dec_mm_counter(pvmw->vma->vm_mm, mm_counter(page));
 	return true;
-    }
-
-    dec_mm_counter(pvmw->vma->vm_mm, mm_counter(page));
-    return true;
 }
 
 
 struct rmap_walk_arg {
-    void *arg;
-    bool unmap_clean;   
+	void *arg;
+	bool unmap_clean;
 };
 #endif
 
@@ -268,8 +270,9 @@ static bool remove_migration_pte(struct page *page, struct vm_area_struct *vma,
 		}
 #endif
 #ifdef CONFIG_HTMM
-		if (rmap_walk_arg->unmap_clean && try_to_unmap_clean(&pvmw, new))
-		    continue;
+		if (rmap_walk_arg->unmap_clean &&
+		    try_to_unmap_clean(&pvmw, new))
+			continue;
 #endif
 		get_page(new);
 		pte = pte_mkold(mk_pte(new, READ_ONCE(vma->vm_page_prot)));
@@ -322,21 +325,20 @@ static bool remove_migration_pte(struct page *page, struct vm_area_struct *vma,
 		}
 #ifdef CONFIG_HTMM /* remove_migration_pte() */
 		{
-
 			struct mem_cgroup *memcg = page_memcg(pvmw.page);
 			struct page *pte_page;
 			pginfo_t *pginfo;
 
 			if (!memcg || !memcg->htmm_enabled)
-			    goto out_cooling_check;
+				goto out_cooling_check;
 
 			pte_page = virt_to_page((unsigned long)pvmw.pte);
 			if (!PageHtmm(pte_page))
-			    goto out_cooling_check;
-			
+				goto out_cooling_check;
+
 			pginfo = get_pginfo_from_pte(pvmw.pte);
 			if (!pginfo)
-			    goto out_cooling_check;
+				goto out_cooling_check;
 
 			check_base_cooling(pginfo, new, true);
 		}
@@ -711,7 +713,7 @@ void migrate_page_states(struct page *newpage, struct page *page)
 	copy_page_owner(page, newpage);
 #ifdef CONFIG_HTMM
 	if (PageTransHuge(page))
-	    copy_transhuge_pginfo(page, newpage);
+		copy_transhuge_pginfo(page, newpage);
 #endif
 
 	if (!PageHuge(page))
@@ -1286,13 +1288,13 @@ int next_demotion_node(int node)
 /* can be used when CONFIG_HTMM is set */
 int next_promotion_node(int node)
 {
-    int target;
+	int target;
 
-    rcu_read_lock();
-    target = READ_ONCE(node_promotion[node]);
-    rcu_read_unlock();
+	rcu_read_lock();
+	target = READ_ONCE(node_promotion[node]);
+	rcu_read_unlock();
 
-    return target;
+	return target;
 }
 /*
  * Obtain the lock on page, remove all ptes and migrate the page
