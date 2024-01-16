@@ -14,11 +14,64 @@ MEMTIS currently supports two system configurations
 See linux/
 
 You have to enable CONFIG\_HTMM when compiling the linux source.
+```bash
+scripts/config --enable CONFIG_HTMM
 ```
-make menuconfig
-...
-CONFIG_HTMM=y
-...
+
+Changes made to the original [v5.15.19](https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-5.15.19.tar.xz)
+kernel is listed in `memtis.path`, which can be obtained via:
+```bash
+git diff 8ae72487 cb79fa4d -- ':linux' ':!linux/5'
+# summary
+git diff --stat=120 --compact-summary 8ae72487 cb79fa4d -- ':linux' ':!linux/5'
+ linux/Makefile                               |    2 +-
+ linux/arch/x86/entry/syscalls/syscall_64.tbl |    2 +
+ linux/arch/x86/include/asm/pgtable.h         |   11 +
+ linux/arch/x86/include/asm/pgtable_64.h      |    4 +
+ linux/arch/x86/include/asm/pgtable_types.h   |    4 +
+ linux/arch/x86/mm/init_64.c                  |   17 +
+ linux/arch/x86/mm/pgtable.c                  |   23 +-
+ linux/include/asm-generic/pgalloc.h          |    3 +
+ linux/include/linux/cgroup-defs.h            |    4 +
+ linux/include/linux/htmm.h (new)             |  212 ++++++++++
+ linux/include/linux/huge_mm.h                |    4 +
+ linux/include/linux/memcontrol.h             |   56 ++-
+ linux/include/linux/mempolicy.h              |   22 +-
+ linux/include/linux/migrate.h                |    7 +
+ linux/include/linux/mm.h                     |    4 +
+ linux/include/linux/mm_types.h               |   28 ++
+ linux/include/linux/mmzone.h                 |   11 +
+ linux/include/linux/node.h                   |    5 +
+ linux/include/linux/page-flags.h             |   11 +
+ linux/include/linux/perf_event.h             |    6 +
+ linux/include/linux/rmap.h                   |   25 +-
+ linux/include/linux/swap.h                   |    2 +
+ linux/include/linux/syscalls.h               |    4 +
+ linux/include/linux/vm_event_item.h          |   10 +
+ linux/include/trace/events/htmm.h (new)      |   57 +++
+ linux/include/trace/events/mmflags.h         |   12 +-
+ linux/kernel/cgroup/cgroup.c                 |    3 +-
+ linux/kernel/events/core.c                   |  521 ++++++++++++++++++++++++
+ linux/kernel/exit.c                          |    3 +
+ linux/kernel/fork.c                          |   10 +
+ linux/kernel/sched/sched.h                   |    2 +
+ linux/mm/Kconfig                             |   11 +
+ linux/mm/Makefile                            |    1 +
+ linux/mm/htmm_core.c (new)                   | 1439 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ linux/mm/htmm_migrater.c (new)               | 1128 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ linux/mm/htmm_sampler.c (new)                |  430 ++++++++++++++++++++
+ linux/mm/huge_memory.c                       |  222 ++++++++++-
+ linux/mm/khugepaged.c                        |   97 ++++-
+ linux/mm/memcontrol.c                        |  301 +++++++++++++-
+ linux/mm/memory.c                            |   24 +-
+ linux/mm/memory_hotplug.c                    |    9 +-
+ linux/mm/mempolicy.c                         |  622 +++++++++++++++++++++++++++++
+ linux/mm/migrate.c                           |  139 ++++++-
+ linux/mm/page_alloc.c                        |   13 +
+ linux/mm/rmap.c                              |  231 +++++++++++
+ linux/mm/vmscan.c                            |    6 +-
+ linux/mm/vmstat.c                            |   10 +
+ 47 files changed, 5721 insertions(+), 47 deletions(-)
 ```
 
 ### Dependencies

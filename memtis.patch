@@ -1,0 +1,6847 @@
+diff --git a/linux/Makefile b/linux/Makefile
+index 463d46a9e..4f6d984a4 100644
+--- a/linux/Makefile
++++ b/linux/Makefile
+@@ -2,7 +2,7 @@
+ VERSION = 5
+ PATCHLEVEL = 15
+ SUBLEVEL = 19
+-EXTRAVERSION =
++EXTRAVERSION = -htmm
+ NAME = Trick or Treat
+ 
+ # *DOCUMENTATION*
+diff --git a/linux/arch/x86/entry/syscalls/syscall_64.tbl b/linux/arch/x86/entry/syscalls/syscall_64.tbl
+index 18b5500ea..5ad0fe12e 100644
+--- a/linux/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/linux/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -370,6 +370,8 @@
+ 446	common	landlock_restrict_self	sys_landlock_restrict_self
+ 447	common	memfd_secret		sys_memfd_secret
+ 448	common	process_mrelease	sys_process_mrelease
++449	common	htmm_start		sys_htmm_start
++450	common	htmm_end		sys_htmm_end
+ 
+ #
+ # Due to a historical design error, certain syscalls are numbered differently
+diff --git a/linux/arch/x86/include/asm/pgtable.h b/linux/arch/x86/include/asm/pgtable.h
+index 448cd01eb..6a1807f6e 100644
+--- a/linux/arch/x86/include/asm/pgtable.h
++++ b/linux/arch/x86/include/asm/pgtable.h
+@@ -722,6 +722,17 @@ static inline pgd_t pti_set_user_pgtbl(pgd_t *pgdp, pgd_t pgd)
+ #include <linux/log2.h>
+ #include <asm/fixmap.h>
+ 
++#ifdef CONFIG_HTMM
++static inline pginfo_t *get_pginfo_from_pte(pte_t *pte)
++{
++    struct page *page = virt_to_page((unsigned long)pte);
++    unsigned long idx;
++
++    idx = ((unsigned long)(pte) & ~PAGE_MASK) / 8;
++    return &page->pginfo[idx];
++}
++#endif
++
+ static inline int pte_none(pte_t pte)
+ {
+ 	return !(pte.pte & ~(_PAGE_KNL_ERRATUM_MASK));
+diff --git a/linux/arch/x86/include/asm/pgtable_64.h b/linux/arch/x86/include/asm/pgtable_64.h
+index 56d0399a0..fac31346e 100644
+--- a/linux/arch/x86/include/asm/pgtable_64.h
++++ b/linux/arch/x86/include/asm/pgtable_64.h
+@@ -266,6 +266,10 @@ static inline bool gup_fast_permitted(unsigned long start, unsigned long end)
+ 	return true;
+ }
+ 
++#ifdef CONFIG_HTMM /* extern pginfo_cache */
++extern struct kmem_cache *pginfo_cache;
++#endif
++
+ #include <asm/pgtable-invert.h>
+ 
+ #endif /* !__ASSEMBLY__ */
+diff --git a/linux/arch/x86/include/asm/pgtable_types.h b/linux/arch/x86/include/asm/pgtable_types.h
+index 40497a902..829909e95 100644
+--- a/linux/arch/x86/include/asm/pgtable_types.h
++++ b/linux/arch/x86/include/asm/pgtable_types.h
+@@ -281,6 +281,10 @@ typedef struct pgprot { pgprotval_t pgprot; } pgprot_t;
+ 
+ typedef struct { pgdval_t pgd; } pgd_t;
+ 
++#ifdef CONFIG_HTMM /* pginfo_t */
++typedef struct { uint32_t total_accesses; uint16_t nr_accesses; uint8_t cooling_clock; bool may_hot; } pginfo_t;
++#endif
++
+ static inline pgprot_t pgprot_nx(pgprot_t prot)
+ {
+ 	return __pgprot(pgprot_val(prot) | _PAGE_NX);
+diff --git a/linux/arch/x86/mm/init_64.c b/linux/arch/x86/mm/init_64.c
+index 36098226a..e58e3bb3a 100644
+--- a/linux/arch/x86/mm/init_64.c
++++ b/linux/arch/x86/mm/init_64.c
+@@ -38,6 +38,7 @@
+ #include <asm/processor.h>
+ #include <asm/bios_ebda.h>
+ #include <linux/uaccess.h>
++#include <asm/pgtable.h>
+ #include <asm/pgalloc.h>
+ #include <asm/dma.h>
+ #include <asm/fixmap.h>
+@@ -1702,3 +1703,19 @@ void __meminit vmemmap_populate_print_last(void)
+ 	}
+ }
+ #endif
++
++#ifdef CONFIG_HTMM
++struct kmem_cache *pginfo_cache;
++
++static int __init pginfo_cache_init(void)
++{
++    pginfo_cache = kmem_cache_create("pginfo",
++				     sizeof(pginfo_t) * 512,
++				     sizeof(pginfo_t) * 512,
++				     SLAB_PANIC,
++				     NULL);
++    return 0;
++}
++core_initcall(pginfo_cache_init);
++
++#endif
+diff --git a/linux/arch/x86/mm/pgtable.c b/linux/arch/x86/mm/pgtable.c
+index 3481b35cb..53f076741 100644
+--- a/linux/arch/x86/mm/pgtable.c
++++ b/linux/arch/x86/mm/pgtable.c
+@@ -28,9 +28,27 @@ void paravirt_tlb_remove_table(struct mmu_gather *tlb, void *table)
+ 
+ gfp_t __userpte_alloc_gfp = GFP_PGTABLE_USER | PGTABLE_HIGHMEM;
+ 
++#ifdef CONFIG_HTMM
++static void __pte_alloc_pginfo(struct page *page)
++{
++    /* __userpte_alloc_gfp contains __GFP_ZERO */
++    page->pginfo = kmem_cache_alloc(pginfo_cache,
++				    __userpte_alloc_gfp);
++    if (page->pginfo)
++	SetPageHtmm(page);
++}
++#endif
+ pgtable_t pte_alloc_one(struct mm_struct *mm)
+ {
+-	return __pte_alloc_one(mm, __userpte_alloc_gfp);
++    struct page *pgtable;
++
++    pgtable = __pte_alloc_one(mm, __userpte_alloc_gfp);
++#ifdef CONFIG_HTMM
++    if (mm->htmm_enabled) {
++	__pte_alloc_pginfo(pgtable);
++    }
++#endif
++    return pgtable;
+ }
+ 
+ static int __init setup_userpte(char *arg)
+@@ -52,6 +70,9 @@ early_param("userpte", setup_userpte);
+ 
+ void ___pte_free_tlb(struct mmu_gather *tlb, struct page *pte)
+ {
++#ifdef CONFIG_HTMM
++	free_pginfo_pte(pte);
++#endif
+ 	pgtable_pte_page_dtor(pte);
+ 	paravirt_release_pte(page_to_pfn(pte));
+ 	paravirt_tlb_remove_table(tlb, pte);
+diff --git a/linux/include/asm-generic/pgalloc.h b/linux/include/asm-generic/pgalloc.h
+index 02932efad..57b47f9df 100644
+--- a/linux/include/asm-generic/pgalloc.h
++++ b/linux/include/asm-generic/pgalloc.h
+@@ -99,6 +99,9 @@ static inline pgtable_t pte_alloc_one(struct mm_struct *mm)
+ static inline void pte_free(struct mm_struct *mm, struct page *pte_page)
+ {
+ 	pgtable_pte_page_dtor(pte_page);
++#ifdef CONFIG_HTMM
++	free_pginfo_pte(pte_page);
++#endif
+ 	__free_page(pte_page);
+ }
+ 
+diff --git a/linux/include/linux/cgroup-defs.h b/linux/include/linux/cgroup-defs.h
+index db2e147e0..30c571574 100644
+--- a/linux/include/linux/cgroup-defs.h
++++ b/linux/include/linux/cgroup-defs.h
+@@ -616,6 +616,10 @@ struct cftype {
+ #ifdef CONFIG_DEBUG_LOCK_ALLOC
+ 	struct lock_class_key	lockdep_key;
+ #endif
++#ifdef CONFIG_HTMM /* struct cftype */
++	int numa_node_id;
++#endif
++
+ };
+ 
+ /*
+diff --git a/linux/include/linux/htmm.h b/linux/include/linux/htmm.h
+new file mode 100644
+index 000000000..e3ab4b695
+--- /dev/null
++++ b/linux/include/linux/htmm.h
+@@ -0,0 +1,212 @@
++#include <uapi/linux/perf_event.h>
++
++#define DEFERRED_SPLIT_ISOLATED 1
++
++#define BUFFER_SIZE	32 /* 128: 1MB */
++#define CPUS_PER_SOCKET 20
++#define MAX_MIGRATION_RATE_IN_MBPS  2048 /* 2048MB per sec */
++
++
++/* pebs events */
++#define DRAM_LLC_LOAD_MISS  0x1d3
++#define REMOTE_DRAM_LLC_LOAD_MISS   0x2d3
++#define NVM_LLC_LOAD_MISS   0x80d1
++#define ALL_STORES	    0x82d0
++#define ALL_LOADS	    0x81d0
++#define STLB_MISS_STORES    0x12d0
++#define STLB_MISS_LOADS	    0x11d0
++
++/* tmm option */
++#define HTMM_NO_MIG	    0x0	/* unused */
++#define	HTMM_BASELINE	    0x1 /* unused */
++#define HTMM_HUGEPAGE_OPT   0x2 /* only used */
++#define HTMM_HUGEPAGE_OPT_V2	0x3 /* unused */
++
++/**/
++#define DRAM_ACCESS_LATENCY 80
++#define NVM_ACCESS_LATENCY  270
++#define CXL_ACCESS_LATENCY  170
++#define DELTA_CYCLES	(NVM_ACCESS_LATENCY - DRAM_ACCESS_LATENCY)
++
++#define pcount 30
++/* only prime numbers */
++static const unsigned int pebs_period_list[pcount] = {
++    199,    // 200 - min
++    293,    // 300
++    401,    // 400
++    499,    // 500
++    599,    // 600
++    701,    // 700
++    797,    // 800
++    907,    // 900
++    997,    // 1000
++    1201,   // 1200
++    1399,   // 1400
++    1601,   // 1600
++    1801,   // 1800
++    1999,   // 2000
++    2503,   // 2500
++    3001,   // 3000
++    3499,   // 3500
++    4001,   // 4000
++    4507,   // 4507
++    4999,   // 5000
++    6007,   // 6000
++    7001,   // 7000
++    7993,   // 8000
++    9001,   // 9000
++    10007,  // 10000
++    12007,  // 12000
++    13999,  // 14000
++    16001,  // 16000
++    17989,  // 18000
++    19997,  // 20000 - max
++};
++
++#define pinstcount 5
++/* this is for store instructions */
++static const unsigned int pebs_inst_period_list[pinstcount] ={
++    100003, // 0.1M
++    300007, // 0.3M
++    600011, // 0.6M
++    1000003,// 1.0M
++    1500003,// 1.5M
++};
++
++struct htmm_event {
++    struct perf_event_header header;
++    __u64 ip;
++    __u32 pid, tid;
++    __u64 addr;
++};
++
++enum events {
++    DRAMREAD = 0,
++    NVMREAD = 1,
++    MEMWRITE = 2,
++    TLB_MISS_LOADS = 3,
++    TLB_MISS_STORES = 4,
++    CXLREAD = 5, // emulated by remote DRAM node
++    N_HTMMEVENTS
++};
++
++/* htmm_core.c */
++extern void htmm_mm_init(struct mm_struct *mm);
++extern void htmm_mm_exit(struct mm_struct *mm);
++extern void __prep_transhuge_page_for_htmm(struct mm_struct *mm, struct page *page);
++extern void prep_transhuge_page_for_htmm(struct vm_area_struct *vma,
++					 struct page *page);
++extern void clear_transhuge_pginfo(struct page *page);
++extern void copy_transhuge_pginfo(struct page *page,
++				  struct page *newpage);
++extern pginfo_t *get_compound_pginfo(struct page *page, unsigned long address);
++
++extern void check_transhuge_cooling(void *arg, struct page *page, bool locked);
++extern void check_base_cooling(pginfo_t *pginfo, struct page *page, bool locked);
++extern int set_page_coolstatus(struct page *page, pte_t *pte, struct mm_struct *mm);
++
++extern void set_lru_adjusting(struct mem_cgroup *memcg, bool inc_thres);
++
++extern void update_pginfo(pid_t pid, unsigned long address, enum events e);
++
++extern bool deferred_split_huge_page_for_htmm(struct page *page);
++extern unsigned long deferred_split_scan_for_htmm(struct mem_cgroup_per_node *pn,
++						  struct list_head *split_list);
++extern void putback_split_pages(struct list_head *split_list, struct lruvec *lruvec);
++
++extern bool check_split_huge_page(struct mem_cgroup *memcg, struct page *meta, bool hot);
++extern bool move_page_to_deferred_split_queue(struct mem_cgroup *memcg, struct page *page);
++
++extern void move_page_to_active_lru(struct page *page);
++extern void move_page_to_inactive_lru(struct page *page);
++
++
++extern struct page *get_meta_page(struct page *page);
++extern unsigned int get_accesses_from_idx(unsigned int idx);
++extern unsigned int get_idx(unsigned long num);
++extern int get_skew_idx(unsigned long num);
++extern void uncharge_htmm_pte(pte_t *pte, struct mem_cgroup *memcg);
++extern void uncharge_htmm_page(struct page *page, struct mem_cgroup *memcg);
++extern void charge_htmm_page(struct page *page, struct mem_cgroup *memcg);
++
++
++extern void set_lru_split_pid(pid_t pid);
++extern void adjust_active_threshold(pid_t pid);
++extern void set_lru_cooling_pid(pid_t pid);
++
++/* htmm_sampler.c */
++extern int ksamplingd_init(pid_t pid, int node);
++extern void ksamplingd_exit(void);
++
++static inline unsigned long get_sample_period(unsigned long cur) {
++    if (cur < 0)
++	return 0;
++    else if (cur < pcount)
++	return pebs_period_list[cur];
++    else
++	return pebs_period_list[pcount - 1];
++}
++
++static inline unsigned long get_sample_inst_period(unsigned long cur) {
++    if (cur < 0)
++	return 0;
++    else if (cur < pinstcount)
++	return pebs_inst_period_list[cur];
++    else
++	return pebs_inst_period_list[pinstcount - 1];
++}
++#if 1
++static inline void increase_sample_period(unsigned long *llc_period,
++					  unsigned long *inst_period) {
++    unsigned long p;
++    p = *llc_period;
++    if (++p < pcount)
++	*llc_period = p;
++    
++    p = *inst_period;
++    if (++p < pinstcount)
++	*inst_period = p;
++}
++
++static inline void decrease_sample_period(unsigned long *llc_period,
++					  unsigned long *inst_period) {
++    unsigned long p;
++    p = *llc_period;
++    if (p > 0)
++	*llc_period = p - 1;
++    
++    p = *inst_period;
++    if (p > 0)
++	*inst_period = p - 1;
++}
++#else
++static inline unsigned int increase_sample_period(unsigned int cur,
++						  unsigned int next) {
++    do {
++	cur++;
++    } while (pebs_period_list[cur] < next && cur < pcount);
++    
++    return cur < pcount ? cur : pcount - 1;
++}
++
++static inline unsigned int decrease_sample_period(unsigned int cur,
++						  unsigned int next) {
++    do {
++	cur--;
++    } while (pebs_period_list[cur] > next && cur > 0);
++    
++    return cur;
++}
++#endif
++
++
++/* htmm_migrater.c */
++#define HTMM_MIN_FREE_PAGES 256 * 10 // 10MB
++extern unsigned long get_nr_lru_pages_node(struct mem_cgroup *memcg, pg_data_t *pgdat);
++extern void add_memcg_to_kmigraterd(struct mem_cgroup *memcg, int nid);
++extern void del_memcg_from_kmigraterd(struct mem_cgroup *memcg, int nid);
++extern unsigned long get_memcg_demotion_watermark(unsigned long max_nr_pages);
++extern unsigned long get_memcg_promotion_watermark(unsigned long max_nr_pages);
++extern void kmigraterd_wakeup(int nid);
++extern int kmigraterd_init(void);
++extern void kmigraterd_stop(void);
+diff --git a/linux/include/linux/huge_mm.h b/linux/include/linux/huge_mm.h
+index f123e15d9..5b78b9d1a 100644
+--- a/linux/include/linux/huge_mm.h
++++ b/linux/include/linux/huge_mm.h
+@@ -327,6 +327,10 @@ static inline struct list_head *page_deferred_list(struct page *page)
+ 	return &page[2].deferred_list;
+ }
+ 
++#ifdef CONFIG_MEMCG
++extern struct deferred_split *get_deferred_split_queue(struct page *page);
++#endif
++
+ #else /* CONFIG_TRANSPARENT_HUGEPAGE */
+ #define HPAGE_PMD_SHIFT ({ BUILD_BUG(); 0; })
+ #define HPAGE_PMD_MASK ({ BUILD_BUG(); 0; })
+diff --git a/linux/include/linux/memcontrol.h b/linux/include/linux/memcontrol.h
+index 3096c9a0e..9f81ae00c 100644
+--- a/linux/include/linux/memcontrol.h
++++ b/linux/include/linux/memcontrol.h
+@@ -141,7 +141,16 @@ struct mem_cgroup_per_node {
+ 	struct lruvec_stats			lruvec_stats;
+ 
+ 	unsigned long		lru_zone_size[MAX_NR_ZONES][NR_LRU_LISTS];
+-
++#ifdef CONFIG_HTMM /* struct mem_cgroup_per_node */
++	unsigned long		max_nr_base_pages; /* Set by "max_at_node" param */
++	struct list_head	kmigraterd_list;
++	bool			need_cooling;
++	bool			need_adjusting;
++	bool			need_adjusting_all;
++	bool			need_demotion;
++	struct deferred_split	deferred_split_queue;
++	struct list_head	deferred_list;
++#endif
+ 	struct mem_cgroup_reclaim_iter	iter;
+ 
+ 	struct shrinker_info __rcu	*shrinker_info;
+@@ -347,6 +356,48 @@ struct mem_cgroup {
+ 	struct deferred_split deferred_split_queue;
+ #endif
+ 
++#ifdef CONFIG_HTMM /* struct mem_cgroup */
++	bool htmm_enabled;
++	unsigned long max_nr_dram_pages; /* the maximum number of pages */
++	unsigned long nr_active_pages; /* updated by need_lru_cooling() */
++	/* stat for sampled accesses */
++	unsigned long nr_sampled; /* the total number of sampled accesses */
++	unsigned long nr_sampled_for_split; /* nr_sampled for split decision */
++	unsigned long nr_dram_sampled; /* accesses to DRAM: n(i) */
++	unsigned long prev_dram_sampled; /* accesses to DRAM n(i-1) */
++	unsigned long max_dram_sampled; /* accesses to DRAM (estimated) */
++	unsigned long prev_max_dram_sampled; /* accesses to DRAM (estimated) */
++	unsigned long nr_max_sampled; /* the calibrated number of accesses to both DRAM and NVM */
++	/* thresholds */
++	unsigned int active_threshold; /* hot */
++	unsigned int warm_threshold;
++	unsigned int bp_active_threshold; /* expected threshold */
++	/* split */
++	unsigned int split_threshold;
++	unsigned int split_active_threshold;
++	unsigned int nr_split;
++	unsigned int nr_split_tail_idx;
++	/* used to calculated avg_samples_hp. see check_transhuge_cooling() */
++	unsigned int sum_util;
++	unsigned int num_util;
++	/*  */
++	unsigned long access_map[21];
++	/* histograms. exponential scale */
++	/* "hotness_map" is used to determine the hot page threshold.
++	 * "ebp_hotness_map" is used to accurately determine
++	 * the expected DRAM hit ratio when the system only uses 4KB (base) pages.
++	 */
++	unsigned long hotness_hg[16]; // page access histogram
++	unsigned long ebp_hotness_hg[16]; // expected bage page
++	/* lock for histogram */
++	spinlock_t access_lock;
++	/* etc */
++	bool cooled;
++	bool split_happen;
++	bool need_split;
++	unsigned int cooling_clock;
++	unsigned long nr_alloc;
++#endif /* CONFIG_HTMM */
+ 	struct mem_cgroup_per_node *nodeinfo[];
+ };
+ 
+@@ -1746,4 +1797,7 @@ static inline struct mem_cgroup *mem_cgroup_from_obj(void *p)
+ 
+ #endif /* CONFIG_MEMCG_KMEM */
+ 
++#ifdef CONFIG_HTMM
++extern int mem_cgroup_per_node_htmm_init(void);
++#endif
+ #endif /* _LINUX_MEMCONTROL_H */
+diff --git a/linux/include/linux/mempolicy.h b/linux/include/linux/mempolicy.h
+index 4091692be..cb7c85c59 100644
+--- a/linux/include/linux/mempolicy.h
++++ b/linux/include/linux/mempolicy.h
+@@ -185,7 +185,27 @@ extern int mpol_misplaced(struct page *, struct vm_area_struct *, unsigned long)
+ extern void mpol_put_task_policy(struct task_struct *);
+ 
+ extern bool numa_demotion_enabled;
+-
++#ifdef CONFIG_HTMM
++extern unsigned int htmm_sample_period;
++extern unsigned int htmm_inst_sample_period;
++extern unsigned int htmm_split_period;
++extern unsigned int htmm_thres_hot;
++extern unsigned int htmm_cooling_period;
++extern unsigned int htmm_adaptation_period;
++extern unsigned int ksampled_min_sample_ratio;
++extern unsigned int ksampled_max_sample_ratio;
++extern unsigned int htmm_demotion_period_in_ms;
++extern unsigned int htmm_promotion_period_in_ms;
++extern unsigned int htmm_thres_split;
++extern unsigned int htmm_nowarm;
++extern unsigned int htmm_util_weight;
++extern unsigned int htmm_gamma;
++extern unsigned int htmm_mode;
++extern bool htmm_cxl_mode;
++extern bool htmm_skip_cooling;
++extern unsigned int htmm_thres_cooling_alloc;
++extern unsigned int ksampled_soft_cpu_quota;
++#endif
+ static inline bool mpol_is_preferred_many(struct mempolicy *pol)
+ {
+ 	return  (pol->mode == MPOL_PREFERRED_MANY);
+diff --git a/linux/include/linux/migrate.h b/linux/include/linux/migrate.h
+index c8077e936..8d3242025 100644
+--- a/linux/include/linux/migrate.h
++++ b/linux/include/linux/migrate.h
+@@ -173,6 +173,7 @@ int migrate_vma_setup(struct migrate_vma *args);
+ void migrate_vma_pages(struct migrate_vma *migrate);
+ void migrate_vma_finalize(struct migrate_vma *migrate);
+ int next_demotion_node(int node);
++int next_promotion_node(int node);
+ 
+ #else /* CONFIG_MIGRATION disabled: */
+ 
+@@ -181,6 +182,12 @@ static inline int next_demotion_node(int node)
+ 	return NUMA_NO_NODE;
+ }
+ 
++static inline int next_promotion_node(int node)
++    
++{
++	return NUMA_NO_NODE;
++}
++
+ #endif /* CONFIG_MIGRATION */
+ 
+ #endif /* _LINUX_MIGRATE_H */
+diff --git a/linux/include/linux/mm.h b/linux/include/linux/mm.h
+index 90c2d7f3c..377e04958 100644
+--- a/linux/include/linux/mm.h
++++ b/linux/include/linux/mm.h
+@@ -3291,5 +3291,9 @@ static inline int seal_check_future_write(int seals, struct vm_area_struct *vma)
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_HTMM
++extern void free_pginfo_pte(struct page *pte);
++#endif
++
+ #endif /* __KERNEL__ */
+ #endif /* _LINUX_MM_H */
+diff --git a/linux/include/linux/mm_types.h b/linux/include/linux/mm_types.h
+index 7f8ee09c7..37599c3c9 100644
+--- a/linux/include/linux/mm_types.h
++++ b/linux/include/linux/mm_types.h
+@@ -159,10 +159,34 @@ struct page {
+ 			/* For both global and memcg */
+ 			struct list_head deferred_list;
+ 		};
++#ifdef CONFIG_HTMM
++		struct {	/* Third tail page of compound page */
++			unsigned long __compound_pad_1;	/* compound_head */
++			unsigned long total_accesses;
++			unsigned int hot_utils;
++			unsigned int skewness_idx;	/* current hotness val */
++			unsigned int idx;
++#if 0
++			unsigned long acc_accesses;	/* prev hotness val */
++#endif
++			uint32_t cooling_clock;
++		};
++		struct {	/* Fourth~ tail pages of compound page */
++			unsigned long ___compound_pad_1;/* compound_head */
++			pginfo_t compound_pginfo[4];	/* 32 bytes */
++		};
++#endif
+ 		struct {	/* Page table pages */
+ 			unsigned long _pt_pad_1;	/* compound_head */
+ 			pgtable_t pmd_huge_pte; /* protected by page->ptl */
++#ifdef CONFIG_HTMM
++			union {
++				pginfo_t *pginfo;
++				unsigned long _pt_pad_2;
++			};
++#else
+ 			unsigned long _pt_pad_2;	/* mapping */
++#endif
+ 			union {
+ 				struct mm_struct *pt_mm; /* x86 pgds only */
+ 				atomic_t pt_frag_refcount; /* powerpc */
+@@ -580,6 +604,10 @@ struct mm_struct {
+ #ifdef CONFIG_IOMMU_SUPPORT
+ 		u32 pasid;
+ #endif
++
++#ifdef CONFIG_HTMM
++		bool htmm_enabled;
++#endif
+ 	} __randomize_layout;
+ 
+ 	/*
+diff --git a/linux/include/linux/mmzone.h b/linux/include/linux/mmzone.h
+index fa1ef9861..570609ee3 100644
+--- a/linux/include/linux/mmzone.h
++++ b/linux/include/linux/mmzone.h
+@@ -276,6 +276,8 @@ enum lru_list {
+ 
+ #define for_each_evictable_lru(lru) for (lru = 0; lru <= LRU_ACTIVE_FILE; lru++)
+ 
++#define for_each_active_lru(lru) for (lru = 1; lru <= LRU_ACTIVE_FILE; lru += 2)
++
+ static inline bool is_file_lru(enum lru_list lru)
+ {
+ 	return (lru == LRU_INACTIVE_FILE || lru == LRU_ACTIVE_FILE);
+@@ -884,6 +886,13 @@ typedef struct pglist_data {
+ 	struct deferred_split deferred_split_queue;
+ #endif
+ 
++#ifdef CONFIG_HTMM /* struct pglist_data */
++	struct cftype *memcg_htmm_file; /* max, terminate. */
++	struct task_struct  *kmigraterd;
++	struct list_head    kmigraterd_head;
++	spinlock_t	    kmigraterd_lock;
++	wait_queue_head_t   kmigraterd_wait;
++#endif
+ 	/* Fields commonly accessed by the page reclaim scanner */
+ 
+ 	/*
+@@ -960,6 +969,8 @@ static inline struct pglist_data *lruvec_pgdat(struct lruvec *lruvec)
+ #endif
+ }
+ 
++extern unsigned long lruvec_lru_size(struct lruvec *lruvec, enum lru_list lru, int zone_idx);
++
+ #ifdef CONFIG_HAVE_MEMORYLESS_NODES
+ int local_memory_node(int node_id);
+ #else
+diff --git a/linux/include/linux/node.h b/linux/include/linux/node.h
+index 8e5a29897..a70574770 100644
+--- a/linux/include/linux/node.h
++++ b/linux/include/linux/node.h
+@@ -181,4 +181,9 @@ static inline void register_hugetlbfs_with_node(node_registration_func_t reg,
+ 
+ #define to_node(device) container_of(device, struct node, dev)
+ 
++static inline bool node_is_toptier(int node)
++{
++    return node_state(node, N_CPU);
++}
++
+ #endif /* _LINUX_NODE_H_ */
+diff --git a/linux/include/linux/page-flags.h b/linux/include/linux/page-flags.h
+index fbfd3fad4..e40ee758c 100644
+--- a/linux/include/linux/page-flags.h
++++ b/linux/include/linux/page-flags.h
+@@ -140,6 +140,10 @@ enum pageflags {
+ #endif
+ #ifdef CONFIG_KASAN_HW_TAGS
+ 	PG_skip_kasan_poison,
++#endif
++#ifdef CONFIG_HTMM
++	PG_htmm,
++	PG_needsplit,
+ #endif
+ 	__NR_PAGEFLAGS,
+ 
+@@ -463,6 +467,13 @@ PAGEFLAG(SkipKASanPoison, skip_kasan_poison, PF_HEAD)
+ PAGEFLAG_FALSE(SkipKASanPoison)
+ #endif
+ 
++#ifdef CONFIG_HTMM
++PAGEFLAG(Htmm, htmm, PF_ANY)
++
++PAGEFLAG(NeedSplit, needsplit, PF_HEAD)
++TESTCLEARFLAG(NeedSplit, needsplit, PF_HEAD)
++#endif
++
+ /*
+  * PageReported() is used to track reported free pages within the Buddy
+  * allocator. We can use the non-atomic version of the test and set
+diff --git a/linux/include/linux/perf_event.h b/linux/include/linux/perf_event.h
+index 6cce33e7e..af56cd895 100644
+--- a/linux/include/linux/perf_event.h
++++ b/linux/include/linux/perf_event.h
+@@ -1616,4 +1616,10 @@ extern void __weak arch_perf_update_userpage(struct perf_event *event,
+ extern __weak u64 arch_perf_get_page_size(struct mm_struct *mm, unsigned long addr);
+ #endif
+ 
++#ifdef CONFIG_HTMM
++extern int htmm__perf_event_init(struct perf_event *event, unsigned long nr_pages);
++extern int htmm__perf_event_open(struct perf_event_attr *attr_ptr, pid_t pid,
++	int cpu, int group_fd, unsigned long flags);
++#endif
++
+ #endif /* _LINUX_PERF_EVENT_H */
+diff --git a/linux/include/linux/rmap.h b/linux/include/linux/rmap.h
+index c976cc6de..1fda2afdc 100644
+--- a/linux/include/linux/rmap.h
++++ b/linux/include/linux/rmap.h
+@@ -190,7 +190,11 @@ static inline void page_dup_rmap(struct page *page, bool compound)
+  */
+ int page_referenced(struct page *, int is_locked,
+ 			struct mem_cgroup *memcg, unsigned long *vm_flags);
+-
++#ifdef CONFIG_HTMM
++int cooling_page(struct page *page, struct mem_cgroup *memcg);
++int page_check_hotness(struct page *page, struct mem_cgroup *memcg);
++int get_pginfo_idx(struct page *page);
++#endif
+ void try_to_migrate(struct page *page, enum ttu_flags flags);
+ void try_to_unmap(struct page *, enum ttu_flags flags);
+ 
+@@ -243,7 +247,8 @@ int page_mkclean(struct page *);
+  */
+ void page_mlock(struct page *page);
+ 
+-void remove_migration_ptes(struct page *old, struct page *new, bool locked);
++void remove_migration_ptes(struct page *old, struct page *new, bool locked,
++			    bool unmap_clean);
+ 
+ /*
+  * Called by memory-failure.c to kill processes.
+@@ -295,6 +300,22 @@ static inline void try_to_unmap(struct page *page, enum ttu_flags flags)
+ {
+ }
+ 
++#ifdef CONFIG_HTMM
++static inline int cooling_page(struct page *page, struct mem_cgroup *memcg)
++{
++    return false;
++}
++
++static inline int page_check_hotness(struct page *page, struct mem_cgroup *memcg)
++{
++    return false;
++}
++static int get_pginfo_idx(struct page *page)
++{
++    return -1;
++}
++#endif
++
+ static inline int page_mkclean(struct page *page)
+ {
+ 	return 0;
+diff --git a/linux/include/linux/swap.h b/linux/include/linux/swap.h
+index ba52f3a34..901117d39 100644
+--- a/linux/include/linux/swap.h
++++ b/linux/include/linux/swap.h
+@@ -391,6 +391,8 @@ extern unsigned long shrink_all_memory(unsigned long nr_pages);
+ extern int vm_swappiness;
+ extern int remove_mapping(struct address_space *mapping, struct page *page);
+ 
++extern unsigned int move_pages_to_lru(struct lruvec *lruvec, struct list_head *list);
++
+ extern unsigned long reclaim_pages(struct list_head *page_list);
+ #ifdef CONFIG_NUMA
+ extern int node_reclaim_mode;
+diff --git a/linux/include/linux/syscalls.h b/linux/include/linux/syscalls.h
+index 252243c77..f9ee373c9 100644
+--- a/linux/include/linux/syscalls.h
++++ b/linux/include/linux/syscalls.h
+@@ -944,6 +944,10 @@ asmlinkage long sys_rt_tgsigqueueinfo(pid_t tgid, pid_t  pid, int sig,
+ asmlinkage long sys_perf_event_open(
+ 		struct perf_event_attr __user *attr_uptr,
+ 		pid_t pid, int cpu, int group_fd, unsigned long flags);
++/* CONFIG_HTMM */
++asmlinkage long sys_htmm_start(pid_t pid, int node);
++asmlinkage long sys_htmm_end(pid_t pid);
++/***************/
+ asmlinkage long sys_accept4(int, struct sockaddr __user *, int __user *, int);
+ asmlinkage long sys_recvmmsg(int fd, struct mmsghdr __user *msg,
+ 			     unsigned int vlen, unsigned flags,
+diff --git a/linux/include/linux/vm_event_item.h b/linux/include/linux/vm_event_item.h
+index a185cc75f..944e13b63 100644
+--- a/linux/include/linux/vm_event_item.h
++++ b/linux/include/linux/vm_event_item.h
+@@ -113,6 +113,16 @@ enum vm_event_item { PGPGIN, PGPGOUT, PSWPIN, PSWPOUT,
+ 		BALLOON_MIGRATE,
+ #endif
+ #endif
++#ifdef CONFIG_HTMM
++		HTMM_NR_PROMOTED,
++		HTMM_NR_DEMOTED,
++		HTMM_NR_SAMPLED,
++		HTMM_MISSED_DRAMREAD,
++		HTMM_MISSED_NVMREAD,
++		HTMM_MISSED_WRITE,
++		HTMM_ALLOC_DRAM,
++		HTMM_ALLOC_NVM,
++#endif
+ #ifdef CONFIG_DEBUG_TLBFLUSH
+ 		NR_TLB_REMOTE_FLUSH,	/* cpu tried to flush others' tlbs */
+ 		NR_TLB_REMOTE_FLUSH_RECEIVED,/* cpu received ipi for flush */
+diff --git a/linux/include/trace/events/htmm.h b/linux/include/trace/events/htmm.h
+new file mode 100644
+index 000000000..75f8a31d5
+--- /dev/null
++++ b/linux/include/trace/events/htmm.h
+@@ -0,0 +1,57 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM htmm
++
++#if !defined(_TRACE_HTMM_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _TRACE_HTMM_H
++
++#include <linux/tracepoint.h>
++
++TRACE_EVENT(access_info,
++
++	TP_PROTO(unsigned int nr_access, unsigned int nr_util),
++
++	TP_ARGS(nr_access, nr_util),
++
++	TP_STRUCT__entry(
++		__field(unsigned int,	nr_access)
++		__field(unsigned int,	nr_util)
++	),
++
++	TP_fast_assign(
++		__entry->nr_access = nr_access;
++		__entry->nr_util = nr_util;
++	),
++
++	TP_printk("nr_access: %u nr_util: %u\n",
++		__entry->nr_access, __entry->nr_util)
++);
++
++TRACE_EVENT(base_access_info,
++
++	TP_PROTO(unsigned long addr, unsigned int clock, unsigned int nr_access, unsigned int nr_util),
++
++	TP_ARGS(addr, clock, nr_access, nr_util),
++
++	TP_STRUCT__entry(
++		__field(unsigned long,	addr)
++		__field(unsigned int,	clock)
++		__field(unsigned int,	nr_access)
++		__field(unsigned int,	nr_util)
++	),
++
++	TP_fast_assign(
++		__entry->addr = addr;
++		__entry->clock = clock;
++		__entry->nr_access = nr_access;
++		__entry->nr_util = nr_util;
++	),
++
++	TP_printk("addr: %lu clock: %u nr_access: %u nr_util: %u\n",
++		__entry->addr, __entry->clock, __entry->nr_access, __entry->nr_util)
++);
++
++#endif
++
++/* This part must be outside protection */
++#include <trace/define_trace.h>
+diff --git a/linux/include/trace/events/mmflags.h b/linux/include/trace/events/mmflags.h
+index 116ed4d5d..b46fce2ac 100644
+--- a/linux/include/trace/events/mmflags.h
++++ b/linux/include/trace/events/mmflags.h
+@@ -93,6 +93,14 @@
+ #define IF_HAVE_PG_SKIP_KASAN_POISON(flag,string)
+ #endif
+ 
++#ifdef CONFIG_HTMM
++#define IF_HAVE_PG_HTMM(flag,string) ,{1UL << flag, string}
++#define IF_HAVE_PG_NEEDSPLIT(flag,string) ,{1UL << flag, string}
++#else
++#define IF_HAVE_PG_HTMM(flag,string)
++#define IF_HAVE_PG_NEEDSPLIT(flag,string)
++#endif
++
+ #define __def_pageflag_names						\
+ 	{1UL << PG_locked,		"locked"	},		\
+ 	{1UL << PG_waiters,		"waiters"	},		\
+@@ -121,7 +129,9 @@ IF_HAVE_PG_HWPOISON(PG_hwpoison,	"hwpoison"	)		\
+ IF_HAVE_PG_IDLE(PG_young,		"young"		)		\
+ IF_HAVE_PG_IDLE(PG_idle,		"idle"		)		\
+ IF_HAVE_PG_ARCH_2(PG_arch_2,		"arch_2"	)		\
+-IF_HAVE_PG_SKIP_KASAN_POISON(PG_skip_kasan_poison, "skip_kasan_poison")
++IF_HAVE_PG_SKIP_KASAN_POISON(PG_skip_kasan_poison, "skip_kasan_poison")	\
++IF_HAVE_PG_HTMM(PG_htmm,		"htmm"		)		\
++IF_HAVE_PG_NEEDSPLIT(PG_needsplit,	"needsplit"	)
+ 
+ #define show_page_flags(flags)						\
+ 	(flags) ? __print_flags(flags, "|",				\
+diff --git a/linux/kernel/cgroup/cgroup.c b/linux/kernel/cgroup/cgroup.c
+index de8b4fa1e..7b555dfce 100644
+--- a/linux/kernel/cgroup/cgroup.c
++++ b/linux/kernel/cgroup/cgroup.c
+@@ -4000,7 +4000,8 @@ static int cgroup_add_file(struct cgroup_subsys_state *css, struct cgroup *cgrp,
+ 	int ret;
+ 
+ #ifdef CONFIG_DEBUG_LOCK_ALLOC
+-	key = &cft->lockdep_key;
++	printk("cft name: %s\n", cft->name);
++	key = &(cft->lockdep_key);
+ #endif
+ 	kn = __kernfs_create_file(cgrp->kn, cgroup_file_name(cgrp, cft, name),
+ 				  cgroup_file_mode(cft),
+diff --git a/linux/kernel/events/core.c b/linux/kernel/events/core.c
+index c7581e3fb..617eae0c9 100644
+--- a/linux/kernel/events/core.c
++++ b/linux/kernel/events/core.c
+@@ -55,6 +55,10 @@
+ #include <linux/pgtable.h>
+ #include <linux/buildid.h>
+ 
++#ifdef CONFIG_HTMM /* include header */
++#include <linux/htmm.h>
++#endif
++
+ #include "internal.h"
+ 
+ #include <asm/irq_regs.h>
+@@ -12494,6 +12498,523 @@ SYSCALL_DEFINE5(perf_event_open,
+ 	return err;
+ }
+ 
++#ifndef CONFIG_HTMM
++SYSCALL_DEFINE2(htmm_start,
++		pid_t, pid, int, node)
++{
++    return 0;
++}
++
++SYSCALL_DEFINE1(htmm_end,
++		pid_t, pid)
++{
++    return 0;
++}
++
++#else
++SYSCALL_DEFINE2(htmm_start,
++		pid_t, pid, int, node)
++{
++    ksamplingd_init(pid, node);
++    return 0;
++}
++
++SYSCALL_DEFINE1(htmm_end,
++		pid_t, pid)
++{
++    ksamplingd_exit();
++    return 0;
++}
++
++/* allocates perf_buffer instead of calling perf_mmap() */
++int htmm__perf_event_init(struct perf_event *event, unsigned long nr_pages)
++{
++    struct perf_buffer *rb = NULL;
++    int ret = 0, flags = 0;
++
++    if (event->cpu == -1 && event->attr.inherit)
++	return -EINVAL;
++
++    ret = security_perf_event_read(event);
++    if (ret)
++	return ret;
++
++    if (nr_pages != 0 && !is_power_of_2(nr_pages))
++	return -EINVAL;
++
++    WARN_ON_ONCE(event->ctx->parent_ctx);
++    mutex_lock(&event->mmap_mutex);
++
++    WARN_ON(event->rb);
++
++    rb = rb_alloc(nr_pages,
++	    event->attr.watermark ? event->attr.wakeup_watermark : 0,
++	    event->cpu, flags);
++    if (!rb) {
++	ret = -ENOMEM;
++	goto unlock;
++    }
++
++    ring_buffer_attach(event, rb);
++    perf_event_init_userpage(event);
++    perf_event_update_userpage(event);
++
++unlock:
++    if (!ret) {
++	atomic_inc(&event->mmap_count);
++    }
++    mutex_unlock(&event->mmap_mutex);
++    return ret;
++}
++
++/* sys_perf_event_open for memtis use */
++int htmm__perf_event_open(struct perf_event_attr *attr_ptr, pid_t pid,
++	int cpu, int group_fd, unsigned long flags)
++{
++ 	struct perf_event *group_leader = NULL, *output_event = NULL;
++	struct perf_event *event, *sibling;
++	struct perf_event_attr attr;
++	struct perf_event_context *ctx, *gctx;
++	struct file *event_file = NULL;
++	struct fd group = {NULL, 0};
++	struct task_struct *task = NULL;
++	struct pmu *pmu;
++	int event_fd;
++	int move_group = 0;
++	int err;
++	int f_flags = O_RDWR;
++	int cgroup_fd = -1;
++
++	/* for future expandability... */
++	if (flags & ~PERF_FLAG_ALL)
++		return -EINVAL;
++
++	/* Do we allow access to perf_event_open(2) ? */
++	err = security_perf_event_open(&attr, PERF_SECURITY_OPEN);
++	if (err)
++		return err;
++
++	/*err = perf_copy_attr(attr_ptr, &attr);
++	if (err)
++		return err;*/
++	attr = *attr_ptr;
++
++	if (!attr.exclude_kernel) {
++		err = perf_allow_kernel(&attr);
++		if (err)
++			return err;
++	}
++
++	if (attr.namespaces) {
++		if (!perfmon_capable())
++			return -EACCES;
++	}
++
++	if (attr.freq) {
++		if (attr.sample_freq > sysctl_perf_event_sample_rate)
++			return -EINVAL;
++	} else {
++		if (attr.sample_period & (1ULL << 63))
++			return -EINVAL;
++	}
++
++	/* Only privileged users can get physical addresses */
++	if ((attr.sample_type & PERF_SAMPLE_PHYS_ADDR)) {
++		err = perf_allow_kernel(&attr);
++		if (err)
++			return err;
++	}
++
++	/* REGS_INTR can leak data, lockdown must prevent this */
++	if (attr.sample_type & PERF_SAMPLE_REGS_INTR) {
++		err = security_locked_down(LOCKDOWN_PERF);
++		if (err)
++			return err;
++	}
++
++	/*
++	 * In cgroup mode, the pid argument is used to pass the fd
++	 * opened to the cgroup directory in cgroupfs. The cpu argument
++	 * designates the cpu on which to monitor threads from that
++	 * cgroup.
++	 */
++	if ((flags & PERF_FLAG_PID_CGROUP) && (pid == -1 || cpu == -1))
++		return -EINVAL;
++
++	if (flags & PERF_FLAG_FD_CLOEXEC)
++		f_flags |= O_CLOEXEC;
++
++	event_fd = get_unused_fd_flags(f_flags);
++	if (event_fd < 0)
++		return event_fd;
++
++	if (group_fd != -1) {
++		err = perf_fget_light(group_fd, &group);
++		if (err)
++			goto err_fd;
++		group_leader = group.file->private_data;
++		if (flags & PERF_FLAG_FD_OUTPUT)
++			output_event = group_leader;
++		if (flags & PERF_FLAG_FD_NO_GROUP)
++			group_leader = NULL;
++	}
++
++	if (pid != -1 && !(flags & PERF_FLAG_PID_CGROUP)) {
++		task = find_lively_task_by_vpid(pid);
++		if (IS_ERR(task)) {
++			err = PTR_ERR(task);
++			goto err_group_fd;
++		}
++	}
++
++	if (task && group_leader &&
++	    group_leader->attr.inherit != attr.inherit) {
++		err = -EINVAL;
++		goto err_task;
++	}
++
++	if (flags & PERF_FLAG_PID_CGROUP)
++		cgroup_fd = pid;
++
++	event = perf_event_alloc(&attr, cpu, task, group_leader, NULL,
++				 NULL, NULL, cgroup_fd);
++	if (IS_ERR(event)) {
++		err = PTR_ERR(event);
++		goto err_task;
++	}
++
++	if (is_sampling_event(event)) {
++		if (event->pmu->capabilities & PERF_PMU_CAP_NO_INTERRUPT) {
++			err = -EOPNOTSUPP;
++			goto err_alloc;
++		}
++	}
++
++	/*
++	 * Special case software events and allow them to be part of
++	 * any hardware group.
++	 */
++	pmu = event->pmu;
++
++	if (attr.use_clockid) {
++		err = perf_event_set_clock(event, attr.clockid);
++		if (err)
++			goto err_alloc;
++	}
++
++	if (pmu->task_ctx_nr == perf_sw_context)
++		event->event_caps |= PERF_EV_CAP_SOFTWARE;
++
++	if (group_leader) {
++		if (is_software_event(event) &&
++		    !in_software_context(group_leader)) {
++			/*
++			 * If the event is a sw event, but the group_leader
++			 * is on hw context.
++			 *
++			 * Allow the addition of software events to hw
++			 * groups, this is safe because software events
++			 * never fail to schedule.
++			 */
++			pmu = group_leader->ctx->pmu;
++		} else if (!is_software_event(event) &&
++			   is_software_event(group_leader) &&
++			   (group_leader->group_caps & PERF_EV_CAP_SOFTWARE)) {
++			/*
++			 * In case the group is a pure software group, and we
++			 * try to add a hardware event, move the whole group to
++			 * the hardware context.
++			 */
++			move_group = 1;
++		}
++	}
++
++	/*
++	 * Get the target context (task or percpu):
++	 */
++	ctx = find_get_context(pmu, task, event);
++	if (IS_ERR(ctx)) {
++		err = PTR_ERR(ctx);
++		goto err_alloc;
++	}
++
++	/*
++	 * Look up the group leader (we will attach this event to it):
++	 */
++	if (group_leader) {
++		err = -EINVAL;
++
++		/*
++		 * Do not allow a recursive hierarchy (this new sibling
++		 * becoming part of another group-sibling):
++		 */
++		if (group_leader->group_leader != group_leader)
++			goto err_context;
++
++		/* All events in a group should have the same clock */
++		if (group_leader->clock != event->clock)
++			goto err_context;
++
++		/*
++		 * Make sure we're both events for the same CPU;
++		 * grouping events for different CPUs is broken; since
++		 * you can never concurrently schedule them anyhow.
++		 */
++		if (group_leader->cpu != event->cpu)
++			goto err_context;
++
++		/*
++		 * Make sure we're both on the same task, or both
++		 * per-CPU events.
++		 */
++		if (group_leader->ctx->task != ctx->task)
++			goto err_context;
++
++		/*
++		 * Do not allow to attach to a group in a different task
++		 * or CPU context. If we're moving SW events, we'll fix
++		 * this up later, so allow that.
++		 */
++		if (!move_group && group_leader->ctx != ctx)
++			goto err_context;
++
++		/*
++		 * Only a group leader can be exclusive or pinned
++		 */
++		if (attr.exclusive || attr.pinned)
++			goto err_context;
++	}
++
++	if (output_event) {
++		err = perf_event_set_output(event, output_event);
++		if (err)
++			goto err_context;
++	}
++
++	event_file = anon_inode_getfile("[perf_event]", &perf_fops, event,
++					f_flags);
++	if (IS_ERR(event_file)) {
++		err = PTR_ERR(event_file);
++		event_file = NULL;
++		goto err_context;
++	}
++
++	if (task) {
++		err = down_read_interruptible(&task->signal->exec_update_lock);
++		if (err)
++			goto err_file;
++
++		/*
++		 * We must hold exec_update_lock across this and any potential
++		 * perf_install_in_context() call for this new event to
++		 * serialize against exec() altering our credentials (and the
++		 * perf_event_exit_task() that could imply).
++		 */
++		err = -EACCES;
++		if (!perf_check_permission(&attr, task))
++			goto err_cred;
++	}
++
++	if (move_group) {
++		gctx = __perf_event_ctx_lock_double(group_leader, ctx);
++
++		if (gctx->task == TASK_TOMBSTONE) {
++			err = -ESRCH;
++			goto err_locked;
++		}
++
++		/*
++		 * Check if we raced against another sys_perf_event_open() call
++		 * moving the software group underneath us.
++		 */
++		if (!(group_leader->group_caps & PERF_EV_CAP_SOFTWARE)) {
++			/*
++			 * If someone moved the group out from under us, check
++			 * if this new event wound up on the same ctx, if so
++			 * its the regular !move_group case, otherwise fail.
++			 */
++			if (gctx != ctx) {
++				err = -EINVAL;
++				goto err_locked;
++			} else {
++				perf_event_ctx_unlock(group_leader, gctx);
++				move_group = 0;
++			}
++		}
++
++		/*
++		 * Failure to create exclusive events returns -EBUSY.
++		 */
++		err = -EBUSY;
++		if (!exclusive_event_installable(group_leader, ctx))
++			goto err_locked;
++
++		for_each_sibling_event(sibling, group_leader) {
++			if (!exclusive_event_installable(sibling, ctx))
++				goto err_locked;
++		}
++	} else {
++		mutex_lock(&ctx->mutex);
++	}
++
++	if (ctx->task == TASK_TOMBSTONE) {
++		err = -ESRCH;
++		goto err_locked;
++	}
++
++	if (!perf_event_validate_size(event)) {
++		err = -E2BIG;
++		goto err_locked;
++	}
++
++	if (!task) {
++		/*
++		 * Check if the @cpu we're creating an event for is online.
++		 *
++		 * We use the perf_cpu_context::ctx::mutex to serialize against
++		 * the hotplug notifiers. See perf_event_{init,exit}_cpu().
++		 */
++		struct perf_cpu_context *cpuctx =
++			container_of(ctx, struct perf_cpu_context, ctx);
++
++		if (!cpuctx->online) {
++			err = -ENODEV;
++			goto err_locked;
++		}
++	}
++
++	if (perf_need_aux_event(event) && !perf_get_aux_event(event, group_leader)) {
++		err = -EINVAL;
++		goto err_locked;
++	}
++
++	/*
++	 * Must be under the same ctx::mutex as perf_install_in_context(),
++	 * because we need to serialize with concurrent event creation.
++	 */
++	if (!exclusive_event_installable(event, ctx)) {
++		err = -EBUSY;
++		goto err_locked;
++	}
++
++	WARN_ON_ONCE(ctx->parent_ctx);
++
++	/*
++	 * This is the point on no return; we cannot fail hereafter. This is
++	 * where we start modifying current state.
++	 */
++
++	if (move_group) {
++		/*
++		 * See perf_event_ctx_lock() for comments on the details
++		 * of swizzling perf_event::ctx.
++		 */
++		perf_remove_from_context(group_leader, 0);
++		put_ctx(gctx);
++
++		for_each_sibling_event(sibling, group_leader) {
++			perf_remove_from_context(sibling, 0);
++			put_ctx(gctx);
++		}
++
++		/*
++		 * Wait for everybody to stop referencing the events through
++		 * the old lists, before installing it on new lists.
++		 */
++		synchronize_rcu();
++
++		/*
++		 * Install the group siblings before the group leader.
++		 *
++		 * Because a group leader will try and install the entire group
++		 * (through the sibling list, which is still in-tact), we can
++		 * end up with siblings installed in the wrong context.
++		 *
++		 * By installing siblings first we NO-OP because they're not
++		 * reachable through the group lists.
++		 */
++		for_each_sibling_event(sibling, group_leader) {
++			perf_event__state_init(sibling);
++			perf_install_in_context(ctx, sibling, sibling->cpu);
++			get_ctx(ctx);
++		}
++
++		/*
++		 * Removing from the context ends up with disabled
++		 * event. What we want here is event in the initial
++		 * startup state, ready to be add into new context.
++		 */
++		perf_event__state_init(group_leader);
++		perf_install_in_context(ctx, group_leader, group_leader->cpu);
++		get_ctx(ctx);
++	}
++
++	/*
++	 * Precalculate sample_data sizes; do while holding ctx::mutex such
++	 * that we're serialized against further additions and before
++	 * perf_install_in_context() which is the point the event is active and
++	 * can use these values.
++	 */
++	perf_event__header_size(event);
++	perf_event__id_header_size(event);
++
++	event->owner = current;
++
++	perf_install_in_context(ctx, event, event->cpu);
++	perf_unpin_context(ctx);
++
++	if (move_group)
++		perf_event_ctx_unlock(group_leader, gctx);
++	mutex_unlock(&ctx->mutex);
++
++	if (task) {
++		up_read(&task->signal->exec_update_lock);
++		put_task_struct(task);
++	}
++
++	mutex_lock(&current->perf_event_mutex);
++	list_add_tail(&event->owner_entry, &current->perf_event_list);
++	mutex_unlock(&current->perf_event_mutex);
++
++	/*
++	 * Drop the reference on the group_event after placing the
++	 * new event on the sibling_list. This ensures destruction
++	 * of the group leader will find the pointer to itself in
++	 * perf_group_detach().
++	 */
++	fdput(group);
++	fd_install(event_fd, event_file);
++	return event_fd;
++
++err_locked:
++	if (move_group)
++		perf_event_ctx_unlock(group_leader, gctx);
++	mutex_unlock(&ctx->mutex);
++err_cred:
++	if (task)
++		up_read(&task->signal->exec_update_lock);
++err_file:
++	fput(event_file);
++err_context:
++	perf_unpin_context(ctx);
++	put_ctx(ctx);
++err_alloc:
++	/*
++	 * If event_file is set, the fput() above will have called ->release()
++	 * and that will take care of freeing the event.
++	 */
++	if (!event_file)
++		free_event(event);
++err_task:
++	if (task)
++		put_task_struct(task);
++err_group_fd:
++	fdput(group);
++err_fd:
++	put_unused_fd(event_fd);
++	return err;
++}
++#endif
+ /**
+  * perf_event_create_kernel_counter
+  *
+diff --git a/linux/kernel/exit.c b/linux/kernel/exit.c
+index 91a43e57a..71d89e018 100644
+--- a/linux/kernel/exit.c
++++ b/linux/kernel/exit.c
+@@ -64,6 +64,9 @@
+ #include <linux/rcuwait.h>
+ #include <linux/compat.h>
+ #include <linux/io_uring.h>
++#ifdef CONFIG_HTMM
++#include <linux/htmm.h>
++#endif
+ 
+ #include <linux/uaccess.h>
+ #include <asm/unistd.h>
+diff --git a/linux/kernel/fork.c b/linux/kernel/fork.c
+index 10885c649..f9a42a653 100644
+--- a/linux/kernel/fork.c
++++ b/linux/kernel/fork.c
+@@ -97,6 +97,7 @@
+ #include <linux/scs.h>
+ #include <linux/io_uring.h>
+ #include <linux/bpf.h>
++#include <linux/htmm.h>
+ 
+ #include <asm/pgalloc.h>
+ #include <linux/uaccess.h>
+@@ -1061,6 +1062,9 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
+ 	init_tlb_flush_pending(mm);
+ #if defined(CONFIG_TRANSPARENT_HUGEPAGE) && !USE_SPLIT_PMD_PTLOCKS
+ 	mm->pmd_huge_pte = NULL;
++#endif
++#ifdef CONFIG_HTMM
++	htmm_mm_init(mm);
+ #endif
+ 	mm_init_uprobes_state(mm);
+ 	hugetlb_count_init(mm);
+@@ -1085,6 +1089,9 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
+ fail_nocontext:
+ 	mm_free_pgd(mm);
+ fail_nopgd:
++#ifdef CONFIG_HTMM
++	htmm_mm_exit(mm);
++#endif
+ 	free_mm(mm);
+ 	return NULL;
+ }
+@@ -1111,6 +1118,9 @@ static inline void __mmput(struct mm_struct *mm)
+ 	uprobe_clear_state(mm);
+ 	exit_aio(mm);
+ 	ksm_exit(mm);
++#ifdef CONFIG_HTMM
++	htmm_mm_exit(mm);
++#endif
+ 	khugepaged_exit(mm); /* must run before exit_mmap */
+ 	exit_mmap(mm);
+ 	mm_put_huge_zero_page(mm);
+diff --git a/linux/kernel/sched/sched.h b/linux/kernel/sched/sched.h
+index 4f4328269..d4b69f295 100644
+--- a/linux/kernel/sched/sched.h
++++ b/linux/kernel/sched/sched.h
+@@ -1461,7 +1461,9 @@ static inline void assert_clock_updated(struct rq *rq)
+ 	 * The only reason for not seeing a clock update since the
+ 	 * last rq_pin_lock() is if we're currently skipping updates.
+ 	 */
++#ifndef CONFIG_HTMM /* for lock stat analysis */
+ 	SCHED_WARN_ON(rq->clock_update_flags < RQCF_ACT_SKIP);
++#endif
+ }
+ 
+ static inline u64 rq_clock(struct rq *rq)
+diff --git a/linux/mm/Kconfig b/linux/mm/Kconfig
+index c048dea7e..164fa7128 100644
+--- a/linux/mm/Kconfig
++++ b/linux/mm/Kconfig
+@@ -897,6 +897,17 @@ config IO_MAPPING
+ config SECRETMEM
+ 	def_bool ARCH_HAS_SET_DIRECT_MAP && !EMBEDDED
+ 
++config HTMM
++	bool "Enable hugepage-aware tiered memory management"
++	depends on MIGRATION && TRANSPARENT_HUGEPAGE
++	help
++	  Enable memory access sampling and dynamic placement for
++	  tiered memory systems (DRAM + NVM). This optimizes the system
++	  performance in tiered memory systems by coordinating transparent
++	  hugepage support with tiered memory management.
++
++	  If in doubt, say N.
++
+ source "mm/damon/Kconfig"
+ 
+ endmenu
+diff --git a/linux/mm/Makefile b/linux/mm/Makefile
+index fc60a40ce..994f8d3a2 100644
+--- a/linux/mm/Makefile
++++ b/linux/mm/Makefile
+@@ -130,3 +130,4 @@ obj-$(CONFIG_PAGE_REPORTING) += page_reporting.o
+ obj-$(CONFIG_IO_MAPPING) += io-mapping.o
+ obj-$(CONFIG_HAVE_BOOTMEM_INFO_NODE) += bootmem_info.o
+ obj-$(CONFIG_GENERIC_IOREMAP) += ioremap.o
++obj-$(CONFIG_HTMM) += htmm_sampler.o htmm_core.o htmm_migrater.o
+diff --git a/linux/mm/htmm_core.c b/linux/mm/htmm_core.c
+new file mode 100644
+index 000000000..c4ecbc0e8
+--- /dev/null
++++ b/linux/mm/htmm_core.c
+@@ -0,0 +1,1439 @@
++/* memtis core functions
++ * author: Taehyung Lee (Sungkyunkwan Univ.)
++ * mail: taehyunggg@skku.edu
++ */
++#include <linux/mm.h>
++#include <linux/kernel.h>
++#include <linux/huge_mm.h>
++#include <linux/mm_inline.h>
++#include <linux/pid.h>
++#include <linux/htmm.h>
++#include <linux/mempolicy.h>
++#include <linux/migrate.h>
++#include <linux/swap.h>
++#include <linux/sched/task.h>
++#include <linux/xarray.h>
++#include <linux/math.h>
++#include <linux/random.h>
++#include <trace/events/htmm.h>
++
++#include "internal.h"
++#include <asm/pgtable.h>
++
++void htmm_mm_init(struct mm_struct *mm)
++{
++    struct mem_cgroup *memcg = get_mem_cgroup_from_mm(mm);
++
++    if (!memcg || !memcg->htmm_enabled) {
++	mm->htmm_enabled = false;
++	return;
++    }
++    mm->htmm_enabled = true;
++}
++
++void htmm_mm_exit(struct mm_struct *mm)
++{
++    struct mem_cgroup *memcg = get_mem_cgroup_from_mm(mm);
++    if (!memcg)
++	return;
++    /* do nothing */
++}
++
++/* Hugepage uses tail pages to store access information.
++ * See struct page declaration in linux/mm_types.h */
++void __prep_transhuge_page_for_htmm(struct mm_struct *mm, struct page *page)
++{
++    int i, idx, offset;
++    struct mem_cgroup *memcg = mm ? get_mem_cgroup_from_mm(mm) : NULL;
++    pginfo_t pginfo = { 0, 0, 0, false, };
++    int hotness_factor = memcg ? get_accesses_from_idx(memcg->active_threshold + 1) : 0;
++    /* third tail page */
++    page[3].hot_utils = 0;
++    page[3].total_accesses = hotness_factor;
++    page[3].skewness_idx = 0;
++    page[3].idx = 0;
++    SetPageHtmm(&page[3]);
++
++    if (hotness_factor < 0)
++	hotness_factor = 0;
++    pginfo.total_accesses = hotness_factor;
++    pginfo.nr_accesses = hotness_factor;
++    /* fourth~ tail pages */
++    for (i = 0; i < HPAGE_PMD_NR; i++) {
++	idx = 4 + i / 4;
++	offset = i % 4;
++	
++	page[idx].compound_pginfo[offset] = pginfo;
++	SetPageHtmm(&page[idx]);
++    }
++
++    if (!memcg)
++	return;
++
++    if (htmm_skip_cooling)
++	page[3].cooling_clock = memcg->cooling_clock + 1;
++    else
++	page[3].cooling_clock = memcg->cooling_clock;
++
++    ClearPageActive(page);
++}
++
++void prep_transhuge_page_for_htmm(struct vm_area_struct *vma,
++				  struct page *page)
++{
++    prep_transhuge_page(page);
++
++    if (vma->vm_mm->htmm_enabled)
++	__prep_transhuge_page_for_htmm(vma->vm_mm, page);
++    else
++	return;
++}
++
++void clear_transhuge_pginfo(struct page *page)
++{
++    INIT_LIST_HEAD(&page->lru);
++    set_page_private(page, 0);
++}
++
++void copy_transhuge_pginfo(struct page *page,
++			   struct page *newpage)
++{
++    int i, idx, offset;
++    pginfo_t zero_pginfo = { 0 };
++
++    VM_BUG_ON_PAGE(!PageCompound(page), page);
++    VM_BUG_ON_PAGE(!PageCompound(newpage), newpage);
++
++    page = compound_head(page);
++    newpage = compound_head(newpage);
++
++    if (!PageHtmm(&page[3]))
++	return;
++
++    newpage[3].hot_utils = page[3].hot_utils;
++    newpage[3].total_accesses = page[3].total_accesses;
++    newpage[3].skewness_idx = page[3].skewness_idx;
++    newpage[3].cooling_clock = page[3].cooling_clock;
++    newpage[3].idx = page[3].idx;
++
++    SetPageHtmm(&newpage[3]);
++
++    for (i = 0; i < HPAGE_PMD_NR; i++) {
++	idx = 4 + i / 4;
++	offset = i % 4;
++
++	newpage[idx].compound_pginfo[offset].nr_accesses =
++			page[idx].compound_pginfo[offset].nr_accesses;
++	newpage[idx].compound_pginfo[offset].total_accesses =
++			page[idx].compound_pginfo[offset].total_accesses;
++	
++	page[idx].compound_pginfo[offset] = zero_pginfo;
++	page[idx].mapping = TAIL_MAPPING;
++	SetPageHtmm(&newpage[idx]);
++    }
++}
++
++pginfo_t *get_compound_pginfo(struct page *page, unsigned long address)
++{
++    int idx, offset;
++    VM_BUG_ON_PAGE(!PageCompound(page), page);
++    
++    idx = 4 + ((address & ~HPAGE_PMD_MASK) >> PAGE_SHIFT) / 4;
++    offset = ((address & ~HPAGE_PMD_MASK) >> PAGE_SHIFT) % 4;
++
++    return &(page[idx].compound_pginfo[offset]);
++}
++
++void check_transhuge_cooling(void *arg, struct page *page, bool locked)
++{
++    struct mem_cgroup *memcg = arg ? (struct mem_cgroup *)arg : page_memcg(page);
++    struct page *meta_page;
++    pginfo_t *pginfo;
++    int i, idx, offset;
++    unsigned int memcg_cclock;
++
++    if (!memcg || !memcg->htmm_enabled)
++	return;
++
++    meta_page = get_meta_page(page);
++
++    spin_lock(&memcg->access_lock);
++    /* check cooling */
++    memcg_cclock = READ_ONCE(memcg->cooling_clock);
++    if (memcg_cclock > meta_page->cooling_clock) {
++	    unsigned int diff = memcg_cclock - meta_page->cooling_clock;
++	    unsigned long prev_idx, cur_idx, skewness = 0;
++	    unsigned int refs = 0;
++	    unsigned int bp_hot_thres = min(memcg->active_threshold,
++					 memcg->bp_active_threshold);
++
++	    /* perform cooling */
++	    meta_page->hot_utils = 0;
++	    for (i = 0; i < HPAGE_PMD_NR; i++) { // subpages
++		int j;
++
++		idx = 4 + i / 4;
++		offset = i % 4;
++		pginfo =&(page[idx].compound_pginfo[offset]);
++		prev_idx = get_idx(pginfo->total_accesses);
++		if (prev_idx >= bp_hot_thres) {
++		    meta_page->hot_utils++;
++		    refs += pginfo->total_accesses;
++		}
++
++		/* get the sum of the square of H_ij*/
++		skewness += (pginfo->total_accesses * pginfo->total_accesses);
++		if (prev_idx >= (memcg->bp_active_threshold))
++		    pginfo->may_hot = true;
++		else
++		    pginfo->may_hot = false;
++
++		/* halves access counts of subpages */
++		for (j = 0; j < diff; j++)
++		    pginfo->total_accesses >>= 1;
++
++		/* updates estimated base page histogram */
++		cur_idx = get_idx(pginfo->total_accesses);
++		memcg->ebp_hotness_hg[cur_idx]++;
++	    }
++
++	    /* halves access count for a huge page */
++	    for (i = 0; i < diff; i++)		
++		meta_page->total_accesses >>= 1;
++
++	    cur_idx = meta_page->total_accesses;
++	    cur_idx = get_idx(cur_idx);
++	    memcg->hotness_hg[cur_idx] += HPAGE_PMD_NR;
++	    meta_page->idx = cur_idx;
++
++	    /* updates skewness */
++	    if (meta_page->hot_utils == 0)
++		skewness = 0;
++	    else if (meta_page->idx >= 13) // very hot pages 
++		skewness = 0;
++	    else {
++		skewness /= 11; /* scale down */
++		skewness = skewness / (meta_page->hot_utils);
++		skewness = skewness / (meta_page->hot_utils);
++		skewness = get_skew_idx(skewness);
++	    }
++	    meta_page->skewness_idx = skewness;
++	    memcg->access_map[skewness] += 1;
++
++	    if (meta_page->hot_utils) {
++		refs /= HPAGE_PMD_NR; /* actual access counts */
++		memcg->sum_util += refs; /* total accesses to huge pages */
++		memcg->num_util += 1; /* the number of huge pages */
++	    }
++
++	    meta_page->cooling_clock = memcg_cclock;
++    } else
++	meta_page->cooling_clock = memcg_cclock;
++
++    spin_unlock(&memcg->access_lock);
++}
++
++void check_base_cooling(pginfo_t *pginfo, struct page *page, bool locked)
++{
++    struct mem_cgroup *memcg = page_memcg(page);
++    unsigned long prev_accessed, cur_idx;
++    unsigned int memcg_cclock;
++
++    if (!memcg || !memcg->htmm_enabled)
++	return;
++
++    spin_lock(&memcg->access_lock);
++    memcg_cclock = READ_ONCE(memcg->cooling_clock);
++    if (memcg_cclock > pginfo->cooling_clock) {
++	unsigned int diff = memcg_cclock - pginfo->cooling_clock;    
++	int j;
++	    
++	prev_accessed = pginfo->total_accesses;
++	cur_idx = get_idx(prev_accessed);
++	if (cur_idx >= (memcg->bp_active_threshold))
++	    pginfo->may_hot = true;
++	else
++	    pginfo->may_hot = false;
++
++	/* halves access count */
++	for (j = 0; j < diff; j++)
++	    pginfo->total_accesses >>= 1;
++	//if (pginfo->total_accesses == 0)
++	  //  pginfo->total_accesses = 1;
++
++	cur_idx = get_idx(pginfo->total_accesses);
++	memcg->hotness_hg[cur_idx]++;
++	memcg->ebp_hotness_hg[cur_idx]++;
++
++	pginfo->cooling_clock = memcg_cclock;
++    } else
++	pginfo->cooling_clock = memcg_cclock;
++    spin_unlock(&memcg->access_lock);
++}
++
++int set_page_coolstatus(struct page *page, pte_t *pte, struct mm_struct *mm)
++{
++    struct mem_cgroup *memcg = get_mem_cgroup_from_mm(mm);
++    struct page *pte_page;
++    pginfo_t *pginfo;
++    int hotness_factor;
++
++    if (!memcg || !memcg->htmm_enabled)
++	return 0;
++
++    pte_page = virt_to_page((unsigned long)pte);
++    if (!PageHtmm(pte_page))
++	return 0;
++
++    pginfo = get_pginfo_from_pte(pte);
++    if (!pginfo)
++	return 0;
++    
++    hotness_factor = get_accesses_from_idx(memcg->active_threshold + 1);
++    
++    pginfo->total_accesses = hotness_factor;
++    pginfo->nr_accesses = hotness_factor;
++    if (htmm_skip_cooling)
++	pginfo->cooling_clock = READ_ONCE(memcg->cooling_clock) + 1;
++    else
++	pginfo->cooling_clock = READ_ONCE(memcg->cooling_clock);
++    pginfo->may_hot = false;
++
++    return 0;
++}
++
++struct deferred_split *get_deferred_split_queue_for_htmm(struct page *page)
++{
++    struct mem_cgroup *memcg = page_memcg(compound_head(page));
++    struct mem_cgroup_per_node *pn = memcg->nodeinfo[page_to_nid(page)];
++
++    if (!memcg || !memcg->htmm_enabled)
++	return NULL;
++    else
++	return &pn->deferred_split_queue;
++}
++
++struct list_head *get_deferred_list(struct page *page)
++{
++    struct mem_cgroup *memcg = page_memcg(compound_head(page));
++    struct mem_cgroup_per_node *pn = memcg->nodeinfo[page_to_nid(page)];
++
++    if (!memcg || !memcg->htmm_enabled)
++	return NULL;
++    else
++	return &pn->deferred_list; 
++}
++
++bool deferred_split_huge_page_for_htmm(struct page *page)
++{
++    struct deferred_split *ds_queue = get_deferred_split_queue(page);
++    unsigned long flags;
++
++    VM_BUG_ON_PAGE(!PageTransHuge(page), page);
++
++    if (PageSwapCache(page))
++	return false;
++
++    if (!ds_queue)
++	return false;
++    
++    spin_lock_irqsave(&ds_queue->split_queue_lock, flags);
++    if (list_empty(page_deferred_list(page))) {
++	count_vm_event(THP_DEFERRED_SPLIT_PAGE);
++	list_add_tail(page_deferred_list(page), &ds_queue->split_queue);
++	ds_queue->split_queue_len++;
++
++	if (node_is_toptier(page_to_nid(page)))
++	    count_vm_event(HTMM_MISSED_DRAMREAD);
++	else
++	    count_vm_event(HTMM_MISSED_NVMREAD);
++    }
++    spin_unlock_irqrestore(&ds_queue->split_queue_lock, flags);
++    return true;
++}
++
++void check_failed_list(struct mem_cgroup_per_node *pn,
++	struct list_head *tmp, struct list_head *failed_list)
++{
++    struct mem_cgroup *memcg = pn->memcg;
++
++    while (!list_empty(tmp)) {
++	struct page *page = lru_to_page(tmp);
++	struct page *meta;
++	unsigned int idx;
++
++	list_move(&page->lru, failed_list);
++	
++	if (!PageTransHuge(page))
++	    VM_WARN_ON(1);
++
++	if (PageLRU(page)) {
++	    if (!TestClearPageLRU(page)) {
++		VM_WARN_ON(1);
++	    }
++	}
++
++	meta = get_meta_page(page);
++	idx = meta->idx;
++
++	spin_lock(&memcg->access_lock);
++	memcg->hotness_hg[idx] += HPAGE_PMD_NR;
++	spin_unlock(&memcg->access_lock);
++    }
++}
++
++unsigned long deferred_split_scan_for_htmm(struct mem_cgroup_per_node *pn,
++	struct list_head *split_list)
++{
++    struct deferred_split *ds_queue = &pn->deferred_split_queue;
++    //struct list_head *deferred_list = &pn->deferred_list;
++    unsigned long flags;
++    LIST_HEAD(list), *pos, *next;
++    LIST_HEAD(failed_list);
++    struct page *page;
++    unsigned int nr_max = 50; // max: 100MB
++    int split = 0;
++
++    spin_lock_irqsave(&ds_queue->split_queue_lock, flags);
++    list_for_each_safe(pos, next, &ds_queue->split_queue) {
++	page = list_entry((void *)pos, struct page, deferred_list);
++	page = compound_head(page);
++    
++	if (page_count(page) < 1) {
++	    list_del_init(page_deferred_list(page));
++	    ds_queue->split_queue_len--;
++	}
++	else { 
++	    list_move(page_deferred_list(page), &list);
++	}
++    }
++    spin_unlock_irqrestore(&ds_queue->split_queue_lock, flags);
++
++    list_for_each_safe(pos, next, &list) {
++	LIST_HEAD(tmp);
++	struct lruvec *lruvec = mem_cgroup_page_lruvec(page);
++	bool skip_iso = false;
++
++	if (split >= nr_max)
++	    break;
++
++	page = list_entry((void *)pos, struct page, deferred_list);
++	page = compound_head(page);
++
++	if (!PageLRU(page)) {
++	    skip_iso = true;
++	    goto skip_isolation;
++	}
++
++	if (lruvec != &pn->lruvec) {
++	    continue;
++	}
++
++	spin_lock_irq(&lruvec->lru_lock);
++	if (!__isolate_lru_page_prepare(page, 0)) {
++	    spin_unlock_irq(&lruvec->lru_lock);
++	    continue;
++	}
++
++	if (unlikely(!get_page_unless_zero(page))) {
++	    spin_unlock_irq(&lruvec->lru_lock);
++	    continue;
++	}
++
++	if (!TestClearPageLRU(page)) {
++	    put_page(page);
++	    spin_unlock_irq(&lruvec->lru_lock); 
++	    continue;
++	}
++    
++	list_move(&page->lru, &tmp);
++	update_lru_size(lruvec, page_lru(page), page_zonenum(page),
++		    -thp_nr_pages(page));
++	spin_unlock_irq(&lruvec->lru_lock);
++skip_isolation:
++	if (skip_iso) {
++	    if (page->lru.next != LIST_POISON1 || page->lru.prev != LIST_POISON2)
++		continue;
++	    list_add(&page->lru, &tmp);
++	}
++	
++	if (!trylock_page(page)) {
++	    list_splice_tail(&tmp, split_list);
++	    continue;
++	}
++
++	if (!split_huge_page_to_list(page, &tmp)) {
++	    split++;
++	    list_splice(&tmp, split_list);
++	} else {
++	    check_failed_list(pn, &tmp, &failed_list);
++	}
++
++	unlock_page(page);
++    }
++    putback_movable_pages(&failed_list);
++
++    /* handle list and failed_list */
++    spin_lock_irqsave(&ds_queue->split_queue_lock, flags); 
++    list_splice_tail(&list, &ds_queue->split_queue);
++    spin_unlock_irqrestore(&ds_queue->split_queue_lock, flags);
++    
++    putback_movable_pages(&failed_list); 
++    if (split)
++	pn->memcg->split_happen = true;
++    return split;
++}
++
++void putback_split_pages(struct list_head *split_list, struct lruvec *lruvec)
++{
++    LIST_HEAD(l_active);
++    LIST_HEAD(l_inactive);
++
++    while (!list_empty(split_list)) {
++	struct page *page;
++
++	page = lru_to_page(split_list);
++	list_del(&page->lru);
++
++	if (unlikely(!page_evictable(page))) {
++	    putback_lru_page(page);
++	    continue;
++	}
++
++	VM_WARN_ON(PageLRU(page));
++
++	if (PageActive(page))
++	    list_add(&page->lru, &l_active);
++	else
++	    list_add(&page->lru, &l_inactive);
++    }
++
++    spin_lock_irq(&lruvec->lru_lock);
++    move_pages_to_lru(lruvec, &l_active);
++    move_pages_to_lru(lruvec, &l_inactive);
++    list_splice(&l_inactive, &l_active);
++    spin_unlock_irq(&lruvec->lru_lock);
++
++    mem_cgroup_uncharge_list(&l_active);
++    free_unref_page_list(&l_active);
++}
++
++struct page *get_meta_page(struct page *page)
++{
++    page = compound_head(page);
++    return &page[3];
++}
++
++unsigned int get_accesses_from_idx(unsigned int idx)
++{
++    unsigned int accesses = 1;
++    
++    if (idx == 0)
++	return 0;
++
++    while (idx--) {
++	accesses <<= 1;
++    }
++
++    return accesses;
++}
++
++unsigned int get_idx(unsigned long num)
++{
++    unsigned int cnt = 0;
++   
++    num++;
++    while (1) {
++	num = num >> 1;
++	if (num)
++	    cnt++;
++	else	
++	    return cnt;
++	
++	if (cnt == 15)
++	    break;
++    }
++
++    return cnt;
++}
++
++int get_skew_idx(unsigned long num)
++{
++    int cnt = 0;
++    unsigned long tmp;
++    
++    /* 0, 1-3, 4-15, 16-63, 64-255, 256-1023, 1024-2047, 2048-3071, ... */
++    tmp = num;
++    if (tmp >= 1024) {
++	while (tmp > 1024 && cnt < 9) { // <16
++	    tmp -= 1024;
++	    cnt++;
++	}
++	cnt += 11;
++    }
++    else {
++	while (tmp) {
++	    tmp >>= 1; // >>2
++	    cnt++;
++	}
++    }
++
++    return cnt;
++}
++
++/* linux/mm.h */
++void free_pginfo_pte(struct page *pte)
++{
++    if (!PageHtmm(pte))
++	return;
++
++    BUG_ON(pte->pginfo == NULL);
++    kmem_cache_free(pginfo_cache, pte->pginfo);
++    pte->pginfo = NULL;
++    ClearPageHtmm(pte);
++}
++
++void uncharge_htmm_pte(pte_t *pte, struct mem_cgroup *memcg)
++{
++    struct page *pte_page;
++    unsigned int idx;
++    pginfo_t *pginfo;
++
++    if (!memcg || !memcg->htmm_enabled)
++	return;
++    
++    pte_page = virt_to_page((unsigned long)pte);
++    if (!PageHtmm(pte_page))
++	return;
++
++    pginfo = get_pginfo_from_pte(pte);
++    if (!pginfo)
++	return;
++
++    idx = get_idx(pginfo->total_accesses);
++    spin_lock(&memcg->access_lock);
++    if (memcg->hotness_hg[idx] > 0)
++	memcg->hotness_hg[idx]--;
++    if (memcg->ebp_hotness_hg[idx] > 0)
++	memcg->ebp_hotness_hg[idx]--;
++    spin_unlock(&memcg->access_lock);
++}
++
++void uncharge_htmm_page(struct page *page, struct mem_cgroup *memcg)
++{
++    unsigned int nr_pages = thp_nr_pages(page);
++    unsigned int idx;
++    int i;
++
++    if (!memcg || !memcg->htmm_enabled)
++	return;
++    
++    page = compound_head(page);
++    if (nr_pages != 1) { // hugepage
++	struct page *meta = get_meta_page(page);
++
++	idx = meta->idx;
++
++	spin_lock(&memcg->access_lock);
++	if (memcg->hotness_hg[idx] >= nr_pages)
++	    memcg->hotness_hg[idx] -= nr_pages;
++	else
++	    memcg->hotness_hg[idx] = 0;
++	
++	for (i = 0; i < HPAGE_PMD_NR; i++) {
++	    int base_idx = 4 + i / 4;
++	    int offset = i % 4;
++	    pginfo_t *pginfo;
++
++	    pginfo = &(page[base_idx].compound_pginfo[offset]);
++	    idx = get_idx(pginfo->total_accesses);
++	    if (memcg->ebp_hotness_hg[idx] > 0)
++		memcg->ebp_hotness_hg[idx]--;
++	}
++	spin_unlock(&memcg->access_lock);
++    }
++}
++
++static bool need_cooling(struct mem_cgroup *memcg)
++{
++    struct mem_cgroup_per_node *pn;
++    int nid;
++
++    for_each_node_state(nid, N_MEMORY) {
++	pn = memcg->nodeinfo[nid];
++	if (!pn)
++	    continue;
++    
++	if (READ_ONCE(pn->need_cooling))
++	    return true;
++    }
++    return false;
++}
++
++static void set_lru_cooling(struct mm_struct *mm)
++{
++    struct mem_cgroup *memcg = get_mem_cgroup_from_mm(mm);
++    struct mem_cgroup_per_node *pn;
++    int nid;
++
++    if (!memcg || !memcg->htmm_enabled)
++	return;
++    
++    for_each_node_state(nid, N_MEMORY) {
++	pn = memcg->nodeinfo[nid];
++	if (!pn)
++	    continue;
++    
++	WRITE_ONCE(pn->need_cooling, true);
++    }
++}
++
++void set_lru_adjusting(struct mem_cgroup *memcg, bool inc_thres)
++{
++    struct mem_cgroup_per_node *pn;
++    int nid;
++
++    for_each_node_state(nid, N_MEMORY) {
++    
++	pn = memcg->nodeinfo[nid];
++	if (!pn)
++	    continue;
++
++	WRITE_ONCE(pn->need_adjusting, true);
++	if (inc_thres)
++	    WRITE_ONCE(pn->need_adjusting_all, true);
++    }
++}
++
++bool check_split_huge_page(struct mem_cgroup *memcg,
++	struct page *meta, bool hot)
++{
++    unsigned long split_thres = memcg->split_threshold;
++    unsigned long split_thres_tail = split_thres - 1;
++    bool tail_idx = false;
++   
++    /* check split enable/disable status */
++    if (htmm_thres_split == 0)
++	return false;
++
++    /* no need to split */
++    if (split_thres == 0)
++	return false;
++    
++    /* already in the split queue */
++    if (!list_empty(page_deferred_list(compound_head(meta)))) {
++	return false;
++    }
++
++    /* check split thres */
++    if (meta->skewness_idx < split_thres_tail)
++	return false;
++    else if (meta->skewness_idx == split_thres_tail)
++	tail_idx = true;
++    if (memcg->nr_split == 0)
++	tail_idx = true;
++
++    if (tail_idx && memcg->nr_split_tail_idx == 0)
++	return false;
++    
++    spin_lock(&memcg->access_lock);
++    if (tail_idx) {
++	if (memcg->nr_split_tail_idx >= HPAGE_PMD_NR)
++	    memcg->nr_split_tail_idx -= HPAGE_PMD_NR;
++	else
++	    memcg->nr_split_tail_idx = 0;
++    } else {
++	if (memcg->nr_split >= HPAGE_PMD_NR)
++	    memcg->nr_split -= HPAGE_PMD_NR;
++	else
++	    memcg->nr_split = 0;
++    }
++    if (memcg->access_map[meta->skewness_idx] != 0)
++	memcg->access_map[meta->skewness_idx]--;
++    spin_unlock(&memcg->access_lock);
++    return true;
++}
++
++bool move_page_to_deferred_split_queue(struct mem_cgroup *memcg, struct page *page)
++{
++    struct lruvec *lruvec;
++    bool ret = false;
++
++    page = compound_head(page);
++
++    lruvec = mem_cgroup_page_lruvec(page);
++    spin_lock_irq(&lruvec->lru_lock);
++    
++    if (!PageLRU(page))
++	goto lru_unlock;
++
++    if (deferred_split_huge_page_for_htmm(compound_head(page))) {
++	ret = true;
++	goto lru_unlock;
++    }
++    
++lru_unlock:
++    spin_unlock_irq(&lruvec->lru_lock);
++
++    return ret;
++}
++
++void move_page_to_active_lru(struct page *page)
++{
++    struct lruvec *lruvec;
++    LIST_HEAD(l_active);
++
++    lruvec = mem_cgroup_page_lruvec(page);
++    
++    spin_lock_irq(&lruvec->lru_lock);
++    if (PageActive(page))
++	goto lru_unlock;
++
++    if (!__isolate_lru_page_prepare(page, 0))
++	goto lru_unlock;
++
++    if (unlikely(!get_page_unless_zero(page)))
++	goto lru_unlock;
++
++    if (!TestClearPageLRU(page)) {
++	put_page(page);
++	goto lru_unlock;
++    }
++    
++    list_move(&page->lru, &l_active);
++    update_lru_size(lruvec, page_lru(page), page_zonenum(page),
++		    -thp_nr_pages(page));
++    SetPageActive(page);
++
++    if (!list_empty(&l_active))
++	move_pages_to_lru(lruvec, &l_active);
++lru_unlock:
++    spin_unlock_irq(&lruvec->lru_lock);
++
++    if (!list_empty(&l_active))
++	BUG();
++}
++
++void move_page_to_inactive_lru(struct page *page)
++{
++    struct lruvec *lruvec;
++    LIST_HEAD(l_inactive);
++
++    lruvec = mem_cgroup_page_lruvec(page);
++    
++    spin_lock_irq(&lruvec->lru_lock);
++    if (!PageActive(page))
++	goto lru_unlock;
++
++    if (!__isolate_lru_page_prepare(page, 0))
++	goto lru_unlock;
++
++    if (unlikely(!get_page_unless_zero(page)))
++	goto lru_unlock;
++
++    if (!TestClearPageLRU(page)) {
++	put_page(page);
++	goto lru_unlock;
++    }
++    
++    list_move(&page->lru, &l_inactive);
++    update_lru_size(lruvec, page_lru(page), page_zonenum(page),
++		    -thp_nr_pages(page));
++    ClearPageActive(page);
++
++    if (!list_empty(&l_inactive))
++	move_pages_to_lru(lruvec, &l_inactive);
++lru_unlock:
++    spin_unlock_irq(&lruvec->lru_lock);
++
++    if (!list_empty(&l_inactive))
++	BUG();
++}
++
++static void update_base_page(struct vm_area_struct *vma,
++	struct page *page, pginfo_t *pginfo)
++{
++    struct mem_cgroup *memcg = get_mem_cgroup_from_mm(vma->vm_mm);
++    unsigned long prev_accessed, prev_idx, cur_idx;
++    bool hot;
++
++    /* check cooling status and perform cooling if the page needs to be cooled */
++    check_base_cooling(pginfo, page, false);
++
++    prev_accessed = pginfo->total_accesses;
++    pginfo->nr_accesses++;
++    pginfo->total_accesses += HPAGE_PMD_NR;
++    
++    prev_idx = get_idx(prev_accessed);
++    cur_idx = get_idx(pginfo->total_accesses);
++
++    spin_lock(&memcg->access_lock);
++
++    if (prev_idx != cur_idx) {
++	if (memcg->hotness_hg[prev_idx] > 0)
++	    memcg->hotness_hg[prev_idx]--;
++	memcg->hotness_hg[cur_idx]++;
++
++	if (memcg->ebp_hotness_hg[prev_idx] > 0)
++	    memcg->ebp_hotness_hg[prev_idx]--;
++	memcg->ebp_hotness_hg[cur_idx]++;
++    }
++
++    if (pginfo->may_hot == true)
++	memcg->max_dram_sampled++;
++    if (cur_idx >= (memcg->bp_active_threshold))
++	pginfo->may_hot = true;
++    else
++	pginfo->may_hot = false;
++
++    spin_unlock(&memcg->access_lock);
++
++    hot = cur_idx >= memcg->active_threshold;
++    
++    if (PageActive(page) && !hot)
++	move_page_to_inactive_lru(page);
++    else if (!PageActive(page) && hot)
++	move_page_to_active_lru(page);
++    
++    if (hot)
++	move_page_to_active_lru(page);
++    else if (PageActive(page))
++	move_page_to_inactive_lru(page);
++}
++
++static void update_huge_page(struct vm_area_struct *vma, pmd_t *pmd,
++	struct page *page, unsigned long address)
++{
++    struct mem_cgroup *memcg = get_mem_cgroup_from_mm(vma->vm_mm);
++    struct page *meta_page;
++    pginfo_t *pginfo;
++    unsigned long prev_idx, cur_idx;
++    bool hot, pg_split = false;
++    unsigned long pginfo_prev;
++
++    meta_page = get_meta_page(page);
++    pginfo = get_compound_pginfo(page, address);
++
++    /* check cooling status */
++    check_transhuge_cooling((void *)memcg, page, false);
++
++    pginfo_prev = pginfo->total_accesses;
++    pginfo->nr_accesses++;
++    pginfo->total_accesses += HPAGE_PMD_NR;
++    
++    meta_page->total_accesses++;
++
++#ifndef DEFERRED_SPLIT_ISOLATED
++    if (check_split_huge_page(memcg, meta_page, false)) {
++	pg_split = move_page_to_deferred_split_queue(memcg, page);
++    }
++#endif
++
++    /*subpage */
++    prev_idx = get_idx(pginfo_prev);
++    cur_idx = get_idx(pginfo->total_accesses);
++    spin_lock(&memcg->access_lock);
++    if (prev_idx != cur_idx) {
++	if (memcg->ebp_hotness_hg[prev_idx] > 0)
++	    memcg->ebp_hotness_hg[prev_idx]--;
++	memcg->ebp_hotness_hg[cur_idx]++;
++    }
++    if (pginfo->may_hot == true)
++	memcg->max_dram_sampled++;
++    if (cur_idx >= (memcg->bp_active_threshold))
++	pginfo->may_hot = true;
++    else
++	pginfo->may_hot = false;
++    spin_unlock(&memcg->access_lock);
++
++    /* hugepage */
++    prev_idx = meta_page->idx;
++    cur_idx = meta_page->total_accesses;
++    cur_idx = get_idx(cur_idx);
++    if (prev_idx != cur_idx) {
++	spin_lock(&memcg->access_lock);
++	if (memcg->hotness_hg[prev_idx] >= HPAGE_PMD_NR)
++	    memcg->hotness_hg[prev_idx] -= HPAGE_PMD_NR;
++	else
++	    memcg->hotness_hg[prev_idx] = 0;
++
++	memcg->hotness_hg[cur_idx] += HPAGE_PMD_NR;
++	spin_unlock(&memcg->access_lock);
++    }
++    meta_page->idx = cur_idx;
++
++    if (pg_split)
++	return;
++
++    hot = cur_idx >= memcg->active_threshold;
++    if (PageActive(page) && !hot) {
++	move_page_to_inactive_lru(page);
++    } else if (!PageActive(page) && hot) {
++	move_page_to_active_lru(page);
++    }
++    
++    if (hot)
++	move_page_to_active_lru(page);
++    else if (PageActive(page))
++	move_page_to_inactive_lru(page);
++}
++
++static int __update_pte_pginfo(struct vm_area_struct *vma, pmd_t *pmd,
++				unsigned long address)
++{
++    pte_t *pte, ptent;
++    spinlock_t *ptl;
++    pginfo_t *pginfo;
++    struct page *page, *pte_page;
++    int ret = 0;
++
++    pte = pte_offset_map_lock(vma->vm_mm, pmd, address, &ptl);
++    ptent = *pte;
++    if (!pte_present(ptent))
++	goto pte_unlock;
++
++    page = vm_normal_page(vma, address, ptent);
++    if (!page || PageKsm(page))
++	goto pte_unlock;
++
++    if (page != compound_head(page))
++	goto pte_unlock;
++
++    pte_page = virt_to_page((unsigned long)pte);
++    if (!PageHtmm(pte_page))
++	goto pte_unlock;
++
++    pginfo = get_pginfo_from_pte(pte);
++    if (!pginfo)
++	goto pte_unlock;
++
++    update_base_page(vma, page, pginfo);
++    pte_unmap_unlock(pte, ptl);
++    if (htmm_cxl_mode) {
++	if (page_to_nid(page) == 0)
++	    return 1;
++	else
++	    return 2;
++    }
++    else {
++	if (node_is_toptier(page_to_nid(page)))
++	    return 1;
++	else
++	    return 2;
++    }
++
++pte_unlock:
++    pte_unmap_unlock(pte, ptl);
++    return ret;
++}
++
++static int __update_pmd_pginfo(struct vm_area_struct *vma, pud_t *pud,
++				unsigned long address)
++{
++    pmd_t *pmd, pmdval;
++    bool ret = 0;
++
++    pmd = pmd_offset(pud, address);
++    if (!pmd || pmd_none(*pmd))
++	return ret;
++    
++    if (is_swap_pmd(*pmd))
++	return ret;
++
++    if (!pmd_trans_huge(*pmd) && !pmd_devmap(*pmd) && unlikely(pmd_bad(*pmd))) {
++	pmd_clear_bad(pmd);
++	return ret;
++    }
++
++    pmdval = *pmd;
++    if (pmd_trans_huge(pmdval) || pmd_devmap(pmdval)) {
++	struct page *page;
++
++	if (is_huge_zero_pmd(pmdval))
++	    return ret;
++	
++	page = pmd_page(pmdval);
++	if (!page)
++	    goto pmd_unlock;
++	
++	if (!PageCompound(page)) {
++	    goto pmd_unlock;
++	}
++
++	update_huge_page(vma, pmd, page, address);
++	if (htmm_cxl_mode) {
++	    if (page_to_nid(page) == 0)
++		return 1;
++	    else
++		return 2;
++	}
++	else {
++	    if (node_is_toptier(page_to_nid(page)))
++		return 1;
++	    else
++		return 2;
++	}
++pmd_unlock:
++	return 0;
++    }
++
++    /* base page */
++    return __update_pte_pginfo(vma, pmd, address);
++}
++
++static int __update_pginfo(struct vm_area_struct *vma, unsigned long address)
++{
++    pgd_t *pgd;
++    p4d_t *p4d;
++    pud_t *pud;
++
++    pgd = pgd_offset(vma->vm_mm, address);
++    if (pgd_none_or_clear_bad(pgd))
++	return 0;
++    
++    p4d = p4d_offset(pgd, address);
++    if (p4d_none_or_clear_bad(p4d))
++	return 0;
++    
++    pud = pud_offset(p4d, address);
++    if (pud_none_or_clear_bad(pud))
++	return 0;
++    
++    return __update_pmd_pginfo(vma, pud, address);
++}
++
++static void set_memcg_split_thres(struct mem_cgroup *memcg)
++{
++    long nr_split = memcg->nr_split;
++    int i;
++
++    if (memcg->nr_split == 0) { // no split
++	memcg->split_threshold = 21;
++	return;
++    }
++
++    spin_lock(&memcg->access_lock);
++    for (i = 20; i > 0; i--) {
++	long nr_pages = memcg->access_map[i] * HPAGE_PMD_NR;
++
++	if (nr_split < nr_pages) {
++	    memcg->nr_split_tail_idx = nr_split;
++	    memcg->nr_split -= nr_split;
++	    break;
++	}
++	else
++	    nr_split -= nr_pages;
++    }
++    
++    if (i != 20)
++	memcg->split_threshold = i + 1;
++    spin_unlock(&memcg->access_lock);
++}
++
++static void set_memcg_nr_split(struct mem_cgroup *memcg)
++{
++    unsigned long ehr, rhr;
++    unsigned long captier_lat = htmm_cxl_mode ?
++		    CXL_ACCESS_LATENCY : NVM_ACCESS_LATENCY;
++    unsigned long nr_records;
++    unsigned int avg_accesses_hp;
++
++    memcg->nr_split = 0;
++    memcg->nr_split_tail_idx = 0;
++    
++    ehr = memcg->prev_max_dram_sampled * 95 / 100;
++    rhr = memcg->prev_dram_sampled;
++    if (ehr <= rhr)
++	return;
++    if (memcg->num_util == 0)
++	return;
++    
++    /* cooling halves the access counts so that
++     * NR_SAMPLE(n) = cooling_period + NR_SAMPLE(n-1) / 2
++     * --> n = htmm_cooling_period * 2 - (htmm_cooling_period >> cooling_counts)
++     */
++    avg_accesses_hp = memcg->sum_util / memcg->num_util;
++    if (avg_accesses_hp == 0)
++	return;
++
++    nr_records = (htmm_cooling_period << 1) -
++	    (htmm_cooling_period >> (memcg->cooling_clock - 1));
++
++    /* N = (eHR - rHR) * (nr_samples / avg_accesses_hp) * (delta lat / fast lat);
++     * >> (eHR - rHR) == ('ehr' - 'rhr') / 'nr_records';
++     * >> 'ehr' - 'rhr' == (eHR - rHR) * nr_records
++     * To reflect actual accesses to huge pages, calibrates nr_records to
++     * memcg->sum_util;
++     */
++    memcg->nr_split = (ehr - rhr) * memcg->sum_util / nr_records;
++    memcg->nr_split /= avg_accesses_hp;
++    /* reflects latency gap */
++    memcg->nr_split *= (captier_lat - DRAM_ACCESS_LATENCY);
++    memcg->nr_split /= DRAM_ACCESS_LATENCY;
++    /* multiply hugepage size (counting granularity) */
++    memcg->nr_split *= HPAGE_PMD_NR;
++    /* scale down */
++    memcg->nr_split *= htmm_gamma;
++    memcg->nr_split /= 10;
++}
++
++/* protected by memcg->access_lock */
++static void reset_memcg_stat(struct mem_cgroup *memcg)
++{
++    int i;
++
++    for (i = 0; i < 16; i++) {
++	memcg->hotness_hg[i] = 0;
++	memcg->ebp_hotness_hg[i] = 0;
++    }
++
++    for (i = 0; i < 21; i++)
++	memcg->access_map[i] = 0;
++
++    memcg->sum_util = 0;
++    memcg->num_util = 0;
++}
++
++static bool __cooling(struct mm_struct *mm,
++	struct mem_cgroup *memcg)
++{
++    int nid;
++
++    /* check whether the previous cooling is done or not. */
++    for_each_node_state(nid, N_MEMORY) {
++	struct mem_cgroup_per_node *pn = memcg->nodeinfo[nid];
++	if (pn && READ_ONCE(pn->need_cooling)) {
++	    spin_lock(&memcg->access_lock);
++	    memcg->cooling_clock++;
++	    spin_unlock(&memcg->access_lock);
++	    return false;
++	}
++    }
++
++    spin_lock(&memcg->access_lock);
++
++    reset_memcg_stat(memcg); 
++    memcg->cooling_clock++;
++    memcg->bp_active_threshold--;
++    memcg->cooled = true;
++    smp_mb();
++    spin_unlock(&memcg->access_lock);
++    set_lru_cooling(mm);
++    return true;
++}
++
++static void __adjust_active_threshold(struct mm_struct *mm,
++	struct mem_cgroup *memcg)
++{
++    unsigned long nr_active = 0;
++    unsigned long max_nr_pages = memcg->max_nr_dram_pages -
++	    get_memcg_promotion_watermark(memcg->max_nr_dram_pages);
++    bool need_warm = false;
++    int idx_hot, idx_bp;
++
++    //if (need_cooling(memcg))
++//	return;
++
++    spin_lock(&memcg->access_lock);
++
++    for (idx_hot = 15; idx_hot >= 0; idx_hot--) {
++	unsigned long nr_pages = memcg->hotness_hg[idx_hot];
++	if (nr_active + nr_pages > max_nr_pages)
++	    break;
++	nr_active += nr_pages;
++    }
++    if (idx_hot != 15)
++	idx_hot++;
++
++    if (nr_active < (max_nr_pages * 75 / 100))
++	need_warm = true;
++
++    /* for the estimated base page histogram */
++    nr_active = 0;
++    for (idx_bp = 15; idx_bp >= 0; idx_bp--) {
++	unsigned long nr_pages = memcg->ebp_hotness_hg[idx_bp];
++	if (nr_active + nr_pages > max_nr_pages)
++	    break;
++	nr_active += nr_pages;
++    }
++    if (idx_bp != 15)
++	idx_bp++;
++
++    spin_unlock(&memcg->access_lock);
++
++    // minimum hot threshold
++    if (idx_hot < htmm_thres_hot)
++	idx_hot = htmm_thres_hot;
++    if (idx_bp < htmm_thres_hot)
++	idx_bp = htmm_thres_hot;
++
++    /* some pages may not be reflected in the histogram when cooling happens */
++    if (memcg->cooled) {
++	/* when cooling happens, thres will be current - 1 */
++	if (idx_hot < memcg->active_threshold)
++	    if (memcg->active_threshold > 1)
++		memcg->active_threshold--;
++	if (idx_bp < memcg->bp_active_threshold)
++	    memcg->bp_active_threshold = idx_bp;
++	
++	memcg->cooled = false;
++	set_lru_adjusting(memcg, true);
++
++	if (memcg->need_split) {
++	    /* set the target number of pages to be split */
++	    set_memcg_nr_split(memcg);
++	    /* set the split factor thres */
++	    set_memcg_split_thres(memcg);
++	    /* reset stat for split */
++	    memcg->nr_sampled_for_split = 0;
++	    memcg->need_split = false;
++	    //trace_printk("memcg->nr_split: %lu, memcg->split_thres: %lu\n", memcg->nr_split, memcg->split_threshold);
++	}
++    }
++    else { /* normal case */
++	if (idx_hot > memcg->active_threshold) {
++	    //printk("thres: %d -> %d\n", memcg->active_threshold, idx_hot);
++	    memcg->active_threshold = idx_hot;
++	    set_lru_adjusting(memcg, true);
++	}
++	else if (memcg->split_happen && htmm_thres_split &&
++		idx_hot < memcg->active_threshold) {
++	    /* if split happens, histogram may be changed.
++	     * Thus, hot-thres could be decreased */
++	    memcg->active_threshold = idx_hot;
++	    set_lru_adjusting(memcg, true);
++	    //memcg->split_happen = false;
++	}
++	/* estimated base page histogram */
++	memcg->bp_active_threshold = idx_bp;
++    }
++
++    /* set warm threshold */
++    if (!htmm_nowarm) { // warm enabled
++	if (need_warm)
++	    memcg->warm_threshold = memcg->active_threshold - 1;
++	else
++	    memcg->warm_threshold = memcg->active_threshold;
++    } else { // disable warm
++	memcg->warm_threshold = memcg->active_threshold;
++    }
++}
++
++static bool need_memcg_cooling (struct mem_cgroup *memcg)
++{
++    unsigned long usage = page_counter_read(&memcg->memory);
++    if (memcg->nr_alloc + htmm_thres_cooling_alloc <= usage) {
++	memcg->nr_alloc = usage;
++	return true;	
++    }
++    return false;
++}
++
++void update_pginfo(pid_t pid, unsigned long address, enum events e)
++{
++    struct pid *pid_struct = find_get_pid(pid);
++    struct task_struct *p = pid_struct ? pid_task(pid_struct, PIDTYPE_PID) : NULL;
++    struct mm_struct *mm = p ? p->mm : NULL;
++    struct vm_area_struct *vma; 
++    struct mem_cgroup *memcg;
++    int ret;
++    static unsigned long last_thres_adaptation;
++    last_thres_adaptation= jiffies;
++
++    if (htmm_mode == HTMM_NO_MIG)
++	goto put_task;
++
++    if (!mm) {
++	goto put_task;
++    }
++
++    if (!mmap_read_trylock(mm))
++	goto put_task;
++
++    vma = find_vma(mm, address);
++    if (unlikely(!vma))
++	goto mmap_unlock;
++    
++    if (!vma->vm_mm || !vma_migratable(vma) ||
++	(vma->vm_file && (vma->vm_flags & (VM_READ | VM_WRITE)) == (VM_READ)))
++	goto mmap_unlock;
++    
++    memcg = get_mem_cgroup_from_mm(mm);
++    if (!memcg || !memcg->htmm_enabled)
++	goto mmap_unlock;
++    
++    /* increase sample counts only for valid records */
++    ret = __update_pginfo(vma, address);
++    if (ret == 1) { /* memory accesses to DRAM */
++	memcg->nr_sampled++;
++	memcg->nr_sampled_for_split++;
++	memcg->nr_dram_sampled++;
++	memcg->nr_max_sampled++;
++    }
++    else if (ret == 2) {
++	memcg->nr_sampled++;
++	memcg->nr_sampled_for_split++;
++	memcg->nr_max_sampled++;
++    } else
++	goto mmap_unlock;
++    
++    /* cooling and split decision */
++    if (memcg->nr_sampled % htmm_cooling_period == 0 ||
++	    need_memcg_cooling(memcg)) {
++	/* cooling -- updates thresholds and sets need_cooling flags */
++	if (__cooling(mm, memcg)) {
++	    unsigned long temp_rhr = memcg->prev_dram_sampled;
++	    /* updates actual access stat */
++	    memcg->prev_dram_sampled >>= 1;
++	    memcg->prev_dram_sampled += memcg->nr_dram_sampled;
++	    memcg->nr_dram_sampled = 0;
++	    /* updates estimated access stat */
++	    memcg->prev_max_dram_sampled >>= 1;
++	    memcg->prev_max_dram_sampled += memcg->max_dram_sampled;
++	    memcg->max_dram_sampled = 0;
++
++	    /* split decision period */
++	    /* split should be performed after cooling due to skewness factor */
++	    if (!memcg->need_split && htmm_thres_split) {
++		unsigned long usage = page_counter_read(&memcg->memory);
++		/* htmm_split_period: 2 by default
++		 * This means that the number of sampled records should 
++		 * exceed a quarter of the WSS
++		 */
++		usage >>= htmm_split_period;
++		// the num. of samples must be larger than the fast tier size.
++		usage = max(usage, memcg->max_nr_dram_pages);
++	    
++		if (memcg->nr_sampled_for_split > usage) {
++		    /* if split is already performed in the previous
++		     * and rhr is not improved, stop split huge pages */
++		    if (memcg->split_happen) {
++			if (memcg->prev_dram_sampled < (temp_rhr * 103 / 100)) { // 3%
++			    htmm_thres_split = 0;
++			    goto mmap_unlock;
++			}
++		    }
++		    memcg->split_happen = false;
++		    memcg->need_split = true;
++		} else {
++		    /* re-calculate split threshold due to cooling */
++		    memcg->nr_split = memcg->nr_split + memcg->nr_split_tail_idx;
++		    memcg->nr_split_tail_idx = 0;
++		    set_memcg_split_thres(memcg);
++		}
++	    }
++	    printk("total_accesses: %lu max_dram_hits: %lu cur_hits: %lu \n",
++		    memcg->nr_max_sampled, memcg->prev_max_dram_sampled, memcg->prev_dram_sampled);
++	    memcg->nr_max_sampled >>= 1;
++	}
++    }
++    /* threshold adaptation */
++    else if (memcg->nr_sampled % htmm_adaptation_period == 0) {
++	__adjust_active_threshold(mm, memcg);
++    }
++
++mmap_unlock:
++    mmap_read_unlock(mm);
++put_task:
++    put_pid(pid_struct);
++}
+diff --git a/linux/mm/htmm_migrater.c b/linux/mm/htmm_migrater.c
+new file mode 100644
+index 000000000..a37dae0b7
+--- /dev/null
++++ b/linux/mm/htmm_migrater.c
+@@ -0,0 +1,1128 @@
++/*
++ * Taehyung Lee (SKKU, taehyunggg@skku.edu, taehyung.tlee@gmail.com)
++ * -- kmigrated 
++ */
++#include <linux/kthread.h>
++#include <linux/list.h>
++#include <linux/memcontrol.h>
++#include <linux/mempolicy.h>
++#include <linux/mmzone.h>
++#include <linux/mm_inline.h>
++#include <linux/migrate.h>
++#include <linux/swap.h>
++#include <linux/rmap.h>
++#include <linux/delay.h>
++#include <linux/node.h>
++#include <linux/htmm.h>
++#include <linux/wait.h>
++#include <linux/sched.h>
++
++#include "internal.h"
++
++#define MIN_WATERMARK_LOWER_LIMIT   128 * 100 // 50MB
++#define MIN_WATERMARK_UPPER_LIMIT   2560 * 100 // 1000MB
++#define MAX_WATERMARK_LOWER_LIMIT   256 * 100 // 100MB
++#define MAX_WATERMARK_UPPER_LIMIT   3840 * 100 // 1500MB
++
++#ifdef ARCH_HAS_PREFETCHW
++#define prefetchw_prev_lru_page(_page, _base, _field)                   \
++	do {                                                            \
++		if ((_page)->lru.prev != _base) {                       \
++			struct page *prev;				\
++			prev = lru_to_page(&(_page->lru));		\
++			prefetchw(&prev->_field);			\
++		}                                                       \
++	} while (0)
++#else
++#define prefetchw_prev_lru_page(_page, _base, _field) do { } while (0)
++#endif
++
++void add_memcg_to_kmigraterd(struct mem_cgroup *memcg, int nid)
++{
++    struct mem_cgroup_per_node *mz, *pn = memcg->nodeinfo[nid];
++    pg_data_t *pgdat = NODE_DATA(nid);
++
++    if (!pgdat)
++	return;
++    
++    if (pn->memcg != memcg)
++	printk("memcg mismatch!\n");
++
++    spin_lock(&pgdat->kmigraterd_lock);
++    list_for_each_entry(mz, &pgdat->kmigraterd_head, kmigraterd_list) {
++	if (mz == pn)
++	    goto add_unlock;
++    }
++    list_add_tail(&pn->kmigraterd_list, &pgdat->kmigraterd_head);
++add_unlock:
++    spin_unlock(&pgdat->kmigraterd_lock);
++}
++
++void del_memcg_from_kmigraterd(struct mem_cgroup *memcg, int nid)
++{
++    struct mem_cgroup_per_node *mz, *pn = memcg->nodeinfo[nid];
++    pg_data_t *pgdat = NODE_DATA(nid);
++    
++    if (!pgdat)
++	return;
++
++    spin_lock(&pgdat->kmigraterd_lock);
++    list_for_each_entry(mz, &pgdat->kmigraterd_head, kmigraterd_list) {
++	if (mz == pn) {
++	    list_del(&pn->kmigraterd_list);
++	    break;
++	}
++    }
++    spin_unlock(&pgdat->kmigraterd_lock);
++}
++
++unsigned long get_memcg_demotion_watermark(unsigned long max_nr_pages)
++{
++    max_nr_pages = max_nr_pages * 2 / 100; // 2%
++    if (max_nr_pages < MIN_WATERMARK_LOWER_LIMIT)
++	return MIN_WATERMARK_LOWER_LIMIT;
++    else if (max_nr_pages > MIN_WATERMARK_UPPER_LIMIT)
++	return MIN_WATERMARK_UPPER_LIMIT;
++    else
++	return max_nr_pages;
++}
++
++unsigned long get_memcg_promotion_watermark(unsigned long max_nr_pages)
++{
++    max_nr_pages = max_nr_pages * 3 / 100; // 3%
++    if (max_nr_pages < MAX_WATERMARK_LOWER_LIMIT)
++	return MIN_WATERMARK_LOWER_LIMIT;
++    else if (max_nr_pages > MAX_WATERMARK_UPPER_LIMIT)
++	return MIN_WATERMARK_UPPER_LIMIT;
++    else
++	return max_nr_pages;
++}
++
++unsigned long get_nr_lru_pages_node(struct mem_cgroup *memcg, pg_data_t *pgdat)
++{
++    struct lruvec *lruvec;
++    unsigned long nr_pages = 0;
++    enum lru_list lru;
++
++    lruvec = mem_cgroup_lruvec(memcg, pgdat);
++
++    for_each_lru(lru)
++	nr_pages += lruvec_lru_size(lruvec, lru, MAX_NR_ZONES);
++   
++    return nr_pages;
++}
++
++static unsigned long need_lowertier_promotion(pg_data_t *pgdat, struct mem_cgroup *memcg)
++{
++    struct lruvec *lruvec;
++    unsigned long lruvec_size;
++
++    lruvec = mem_cgroup_lruvec(memcg, pgdat);
++    lruvec_size = lruvec_lru_size(lruvec, LRU_ACTIVE_ANON, MAX_NR_ZONES);
++    
++    if (htmm_mode == HTMM_NO_MIG)
++	return 0;
++
++    return lruvec_size;
++}
++
++static bool need_direct_demotion(pg_data_t *pgdat, struct mem_cgroup *memcg)
++{
++    return READ_ONCE(memcg->nodeinfo[pgdat->node_id]->need_demotion);
++}
++
++static bool need_toptier_demotion(pg_data_t *pgdat, struct mem_cgroup *memcg, unsigned long *nr_exceeded)
++{
++    unsigned long nr_lru_pages, max_nr_pages;
++    unsigned long nr_need_promoted;
++    unsigned long fasttier_max_watermark, fasttier_min_watermark;
++    int target_nid = htmm_cxl_mode ? 1 : next_demotion_node(pgdat->node_id);
++    pg_data_t *target_pgdat;
++  
++    if (target_nid == NUMA_NO_NODE)
++	return false;
++
++    target_pgdat = NODE_DATA(target_nid);
++
++    max_nr_pages = memcg->nodeinfo[pgdat->node_id]->max_nr_base_pages;
++    nr_lru_pages = get_nr_lru_pages_node(memcg, pgdat);
++
++    fasttier_max_watermark = get_memcg_promotion_watermark(max_nr_pages);
++    fasttier_min_watermark = get_memcg_demotion_watermark(max_nr_pages);
++
++    if (need_direct_demotion(pgdat, memcg)) {
++	if (nr_lru_pages + fasttier_max_watermark <= max_nr_pages)
++	    goto check_nr_need_promoted;
++	else if (nr_lru_pages < max_nr_pages)
++	    *nr_exceeded = fasttier_max_watermark - (max_nr_pages - nr_lru_pages);
++	else
++	    *nr_exceeded = nr_lru_pages + fasttier_max_watermark - max_nr_pages;
++	*nr_exceeded += 1U * 128 * 100; // 100 MB
++	return true;
++    }
++
++check_nr_need_promoted:
++    nr_need_promoted = need_lowertier_promotion(target_pgdat, memcg);
++    if (nr_need_promoted) {
++	if (nr_lru_pages + nr_need_promoted + fasttier_max_watermark <= max_nr_pages)
++	    return false;
++    } else {
++	if (nr_lru_pages + fasttier_min_watermark <= max_nr_pages)
++	    return false;
++    }
++
++    *nr_exceeded = nr_lru_pages + nr_need_promoted + fasttier_max_watermark - max_nr_pages;
++    return true;
++}
++
++static unsigned long node_free_pages(pg_data_t *pgdat)
++{
++    int z;
++    long free_pages;
++    long total = 0;
++
++    for (z = pgdat->nr_zones - 1; z >= 0; z--) {
++	struct zone *zone = pgdat->node_zones + z;
++	long nr_high_wmark_pages;
++
++	if (!populated_zone(zone))
++	    continue;
++
++	free_pages = zone_page_state(zone, NR_FREE_PAGES);
++	free_pages -= zone->nr_reserved_highatomic;
++	free_pages -= zone->lowmem_reserve[ZONE_MOVABLE];
++
++	nr_high_wmark_pages = high_wmark_pages(zone);
++	if (free_pages >= nr_high_wmark_pages)
++	    total += (free_pages - nr_high_wmark_pages);
++    }
++    return (unsigned long)total;
++}
++
++static bool promotion_available(int target_nid, struct mem_cgroup *memcg,
++	unsigned long *nr_to_promote)
++{
++    pg_data_t *pgdat;
++    unsigned long max_nr_pages, cur_nr_pages;
++    unsigned long nr_isolated;
++    unsigned long fasttier_max_watermark;
++
++    if (target_nid == NUMA_NO_NODE)
++	return false;
++    
++    pgdat = NODE_DATA(target_nid);
++
++    cur_nr_pages = get_nr_lru_pages_node(memcg, pgdat);
++    max_nr_pages = memcg->nodeinfo[target_nid]->max_nr_base_pages;
++    nr_isolated = node_page_state(pgdat, NR_ISOLATED_ANON) +
++		  node_page_state(pgdat, NR_ISOLATED_FILE);
++    
++    fasttier_max_watermark = get_memcg_promotion_watermark(max_nr_pages);
++
++    if (max_nr_pages == ULONG_MAX) {
++	*nr_to_promote = node_free_pages(pgdat);
++	return true;
++    }
++    else if (cur_nr_pages + nr_isolated < max_nr_pages - fasttier_max_watermark) {
++	*nr_to_promote = max_nr_pages - fasttier_max_watermark - cur_nr_pages - nr_isolated;
++	return true;
++    }
++    return false;
++}
++
++static bool need_lru_cooling(struct mem_cgroup_per_node *pn)
++{
++    return READ_ONCE(pn->need_cooling);
++}
++
++static bool need_lru_adjusting(struct mem_cgroup_per_node *pn)
++{
++    return READ_ONCE(pn->need_adjusting);
++}
++
++static __always_inline void update_lru_sizes(struct lruvec *lruvec,
++	enum lru_list lru, unsigned long *nr_zone_taken)
++{
++    int zid;
++
++    for (zid = 0; zid < MAX_NR_ZONES; zid++) {
++	if (!nr_zone_taken[zid])
++	    continue;
++
++	update_lru_size(lruvec, lru, zid, -nr_zone_taken[zid]);
++    }
++}
++
++static unsigned long isolate_lru_pages(unsigned long nr_to_scan,
++	struct lruvec *lruvec, enum lru_list lru, struct list_head *dst,
++	isolate_mode_t mode)
++{
++    struct list_head *src = &lruvec->lists[lru];
++    unsigned long nr_zone_taken[MAX_NR_ZONES] = { 0 };
++    unsigned long scan = 0, nr_taken = 0;
++    LIST_HEAD(busy_list);
++
++    while (scan < nr_to_scan && !list_empty(src)) {
++	struct page *page;
++	unsigned long nr_pages;
++
++	page = lru_to_page(src);
++	prefetchw_prev_lru_page(page, src, flags);
++	VM_WARN_ON(!PageLRU(page));
++
++	nr_pages = compound_nr(page);
++	scan += nr_pages;
++
++	if (!__isolate_lru_page_prepare(page, 0)) {
++	    list_move(&page->lru, src);
++	    continue;
++	}
++	if (unlikely(!get_page_unless_zero(page))) {
++	    list_move(&page->lru, src);
++	    continue;
++	}
++	if (!TestClearPageLRU(page)) {
++	    put_page(page);
++	    list_move(&page->lru, src);
++	    continue;
++	}
++
++	nr_taken += nr_pages;
++	nr_zone_taken[page_zonenum(page)] += nr_pages;
++	list_move(&page->lru, dst);
++    }
++
++    update_lru_sizes(lruvec, lru, nr_zone_taken);
++    return nr_taken;
++}
++
++
++static struct page *alloc_migrate_page(struct page *page, unsigned long node)
++{
++    int nid = (int) node;
++    int zidx;
++    struct page *newpage = NULL;
++    gfp_t mask = (GFP_HIGHUSER_MOVABLE |
++		  __GFP_THISNODE | __GFP_NOMEMALLOC |
++		  __GFP_NORETRY | __GFP_NOWARN) &
++		  ~__GFP_RECLAIM;
++
++    if (PageHuge(page))
++	return NULL;
++
++    zidx = zone_idx(page_zone(page));
++    if (is_highmem_idx(zidx) || zidx == ZONE_MOVABLE)
++	mask |= __GFP_HIGHMEM;
++
++    if (thp_migration_supported() && PageTransHuge(page)) {
++	mask |= GFP_TRANSHUGE_LIGHT;
++	newpage = __alloc_pages_node(nid, mask, HPAGE_PMD_ORDER);
++
++	if (!newpage)
++	    return NULL;
++
++	prep_transhuge_page(newpage);
++	__prep_transhuge_page_for_htmm(NULL, newpage);
++    } else
++	newpage = __alloc_pages_node(nid, mask, 0);
++
++    return newpage;
++}
++
++static unsigned long migrate_page_list(struct list_head *migrate_list,
++	pg_data_t *pgdat, bool promotion)
++{
++    int target_nid;
++    unsigned int nr_succeeded = 0;
++
++    if (promotion)
++	target_nid = htmm_cxl_mode ? 0 : next_promotion_node(pgdat->node_id);
++    else
++	target_nid = htmm_cxl_mode ? 1 : next_demotion_node(pgdat->node_id);
++
++    if (list_empty(migrate_list))
++	return 0;
++
++    if (target_nid == NUMA_NO_NODE)
++	return 0;
++
++    migrate_pages(migrate_list, alloc_migrate_page, NULL,
++	    target_nid, MIGRATE_ASYNC, MR_NUMA_MISPLACED, &nr_succeeded);
++
++    if (promotion)
++	count_vm_events(HTMM_NR_PROMOTED, nr_succeeded);
++    else
++	count_vm_events(HTMM_NR_DEMOTED, nr_succeeded);
++
++    return nr_succeeded;
++}
++
++static unsigned long shrink_page_list(struct list_head *page_list,
++	pg_data_t* pgdat, struct mem_cgroup *memcg, bool shrink_active,
++	unsigned long nr_to_reclaim)
++{
++    LIST_HEAD(demote_pages);
++    LIST_HEAD(ret_pages);
++    unsigned long nr_reclaimed = 0;
++    unsigned long nr_demotion_cand = 0;
++
++    cond_resched();
++
++    while (!list_empty(page_list)) {
++	struct page *page;
++	
++	page = lru_to_page(page_list);
++	list_del(&page->lru);
++
++	if (!trylock_page(page))
++	    goto keep;
++	if (!shrink_active && PageAnon(page) && PageActive(page))
++	    goto keep_locked;
++	if (unlikely(!page_evictable(page)))
++	    goto keep_locked;
++	if (PageWriteback(page))
++	    goto keep_locked;
++	if (PageTransHuge(page) && !thp_migration_supported())
++	    goto keep_locked;
++	if (!PageAnon(page) && nr_demotion_cand > nr_to_reclaim + HTMM_MIN_FREE_PAGES)
++	    goto keep_locked;
++
++	if (htmm_nowarm == 0 && PageAnon(page)) {
++	    if (PageTransHuge(page)) {
++		struct page *meta = get_meta_page(page);
++
++		if (meta->idx >= memcg->warm_threshold)
++		    goto keep_locked;
++	    } else {
++		unsigned int idx = get_pginfo_idx(page);
++
++		if (idx >= memcg->warm_threshold)
++		    goto keep_locked;
++	    }
++	}
++
++	unlock_page(page);
++	list_add(&page->lru, &demote_pages);
++	nr_demotion_cand += compound_nr(page);
++	continue;
++
++keep_locked:
++	unlock_page(page);
++keep:
++	list_add(&page->lru, &ret_pages);
++    }
++
++    nr_reclaimed = migrate_page_list(&demote_pages, pgdat, false);
++    if (!list_empty(&demote_pages))
++	list_splice(&demote_pages, page_list);
++
++    list_splice(&ret_pages, page_list);
++    return nr_reclaimed;
++}
++
++static unsigned long promote_page_list(struct list_head *page_list,
++	pg_data_t *pgdat)
++{
++    LIST_HEAD(promote_pages);
++    LIST_HEAD(ret_pages);
++    unsigned long nr_promoted = 0;
++
++    cond_resched();
++
++    while (!list_empty(page_list)) {
++	struct page *page;
++
++	page = lru_to_page(page_list);
++	list_del(&page->lru);
++	
++	if (!trylock_page(page))
++	    goto __keep;
++	if (!PageActive(page) && htmm_mode != HTMM_NO_MIG)
++	    goto __keep_locked;
++	if (unlikely(!page_evictable(page)))
++	    goto __keep_locked;
++	if (PageWriteback(page))
++	    goto __keep_locked;
++	if (PageTransHuge(page) && !thp_migration_supported())
++	    goto __keep_locked;
++
++	list_add(&page->lru, &promote_pages);
++	unlock_page(page);
++	continue;
++__keep_locked:
++	unlock_page(page);
++__keep:
++	list_add(&page->lru, &ret_pages);
++    }
++
++    nr_promoted = migrate_page_list(&promote_pages, pgdat, true);
++    if (!list_empty(&promote_pages))
++	list_splice(&promote_pages, page_list);
++
++    list_splice(&ret_pages, page_list);
++    return nr_promoted;
++}
++
++static unsigned long demote_inactive_list(unsigned long nr_to_scan,
++	unsigned long nr_to_reclaim, struct lruvec *lruvec,
++	enum lru_list lru, bool shrink_active)
++{
++    LIST_HEAD(page_list);
++    pg_data_t *pgdat = lruvec_pgdat(lruvec);
++    unsigned long nr_reclaimed = 0, nr_taken;
++    int file = is_file_lru(lru);
++
++    lru_add_drain();
++
++    spin_lock_irq(&lruvec->lru_lock);
++    nr_taken = isolate_lru_pages(nr_to_scan, lruvec, lru, &page_list, 0);
++    __mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
++    spin_unlock_irq(&lruvec->lru_lock);
++
++    if (nr_taken == 0) {
++	return 0;
++    }
++
++    nr_reclaimed = shrink_page_list(&page_list, pgdat, lruvec_memcg(lruvec),
++	    shrink_active, nr_to_reclaim);
++
++    spin_lock_irq(&lruvec->lru_lock);
++    move_pages_to_lru(lruvec, &page_list);
++    __mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
++    spin_unlock_irq(&lruvec->lru_lock);
++
++    mem_cgroup_uncharge_list(&page_list);
++    free_unref_page_list(&page_list);
++
++    return nr_reclaimed;
++}
++
++static unsigned long promote_active_list(unsigned long nr_to_scan,
++	struct lruvec *lruvec, enum lru_list lru)
++{
++    LIST_HEAD(page_list);
++    pg_data_t *pgdat = lruvec_pgdat(lruvec);
++    unsigned long nr_taken, nr_promoted;
++    
++    lru_add_drain();
++
++    spin_lock_irq(&lruvec->lru_lock);
++    nr_taken = isolate_lru_pages(nr_to_scan, lruvec, lru, &page_list, 0);
++    __mod_node_page_state(pgdat, NR_ISOLATED_ANON, nr_taken);
++    spin_unlock_irq(&lruvec->lru_lock);
++
++    if (nr_taken == 0)
++	return 0;
++
++    nr_promoted = promote_page_list(&page_list, pgdat);
++
++    spin_lock_irq(&lruvec->lru_lock);
++    move_pages_to_lru(lruvec, &page_list);
++    __mod_node_page_state(pgdat, NR_ISOLATED_ANON, -nr_taken);
++    spin_unlock_irq(&lruvec->lru_lock);
++
++    mem_cgroup_uncharge_list(&page_list);
++    free_unref_page_list(&page_list);
++
++    return nr_promoted;
++}
++
++static unsigned long demote_lruvec(unsigned long nr_to_reclaim, short priority,
++	pg_data_t *pgdat, struct lruvec *lruvec, bool shrink_active)
++{
++    enum lru_list lru, tmp;
++    unsigned long nr_reclaimed = 0;
++    long nr_to_scan;
++
++    /* we need to scan file lrus first */
++    for_each_evictable_lru(tmp) {
++	lru = (tmp + 2) % 4;
++
++	if (!shrink_active && !is_file_lru(lru) && is_active_lru(lru))
++	    continue;	
++	
++	if (is_file_lru(lru)) {
++	    nr_to_scan = lruvec_lru_size(lruvec, lru, MAX_NR_ZONES);
++	} else {
++	    nr_to_scan = lruvec_lru_size(lruvec, lru, MAX_NR_ZONES) >> priority;
++
++	    if (nr_to_scan < nr_to_reclaim)
++		nr_to_scan = nr_to_reclaim * 11 / 10; // because warm pages are not demoted
++	}
++
++	if (!nr_to_scan)
++	    continue;
++
++	while (nr_to_scan > 0) {
++	    unsigned long scan = min(nr_to_scan, SWAP_CLUSTER_MAX);
++	    nr_reclaimed += demote_inactive_list(scan, scan,
++					     lruvec, lru, shrink_active);
++	    nr_to_scan -= (long)scan;
++	    if (nr_reclaimed >= nr_to_reclaim)
++		break;
++	}
++
++	if (nr_reclaimed >= nr_to_reclaim)
++	    break;
++    }
++
++    return nr_reclaimed;
++}
++
++static unsigned long promote_lruvec(unsigned long nr_to_promote, short priority,
++	pg_data_t *pgdat, struct lruvec *lruvec, enum lru_list lru)
++{
++    unsigned long nr_promoted = 0, nr;
++    
++    nr = nr_to_promote >> priority;
++    if (nr)
++	nr_promoted += promote_active_list(nr, lruvec, lru);
++
++    return nr_promoted;
++}
++
++static unsigned long demote_node(pg_data_t *pgdat, struct mem_cgroup *memcg,
++	unsigned long nr_exceeded)
++{
++    struct lruvec *lruvec = mem_cgroup_lruvec(memcg, pgdat);
++    short priority = DEF_PRIORITY;
++    unsigned long nr_to_reclaim = 0, nr_evictable_pages = 0, nr_reclaimed = 0;
++    enum lru_list lru;
++    bool shrink_active = false;
++
++    for_each_evictable_lru(lru) {
++	if (!is_file_lru(lru) && is_active_lru(lru))
++	    continue;
++
++	nr_evictable_pages += lruvec_lru_size(lruvec, lru, MAX_NR_ZONES);
++    }
++    
++    nr_to_reclaim = nr_exceeded;	
++    
++    if (nr_exceeded > nr_evictable_pages && need_direct_demotion(pgdat, memcg))
++	shrink_active = true;
++
++    do {
++	nr_reclaimed += demote_lruvec(nr_to_reclaim - nr_reclaimed, priority,
++					pgdat, lruvec, shrink_active);
++	if (nr_reclaimed >= nr_to_reclaim)
++	    break;
++	priority--;
++    } while (priority);
++
++    if (htmm_nowarm == 0) {
++	int target_nid = htmm_cxl_mode ? 1 : next_demotion_node(pgdat->node_id);
++	unsigned long nr_lowertier_active =
++	    target_nid == NUMA_NO_NODE ? 0: need_lowertier_promotion(NODE_DATA(target_nid), memcg);
++	
++	nr_lowertier_active = nr_lowertier_active < nr_to_reclaim ?
++			nr_lowertier_active : nr_to_reclaim;
++	if (nr_lowertier_active && nr_reclaimed < nr_lowertier_active)
++	    memcg->warm_threshold = memcg->active_threshold;
++    }
++
++    /* check the condition */
++    do {
++	unsigned long max = memcg->nodeinfo[pgdat->node_id]->max_nr_base_pages;
++	if (get_nr_lru_pages_node(memcg, pgdat) +
++		get_memcg_demotion_watermark(max) < max)
++	    WRITE_ONCE(memcg->nodeinfo[pgdat->node_id]->need_demotion, false);
++    } while (0);
++    return nr_reclaimed;
++}
++
++static unsigned long promote_node(pg_data_t *pgdat, struct mem_cgroup *memcg)
++{
++    struct lruvec *lruvec = mem_cgroup_lruvec(memcg, pgdat);
++    unsigned long nr_to_promote, nr_promoted = 0, tmp;
++    enum lru_list lru = LRU_ACTIVE_ANON;
++    short priority = DEF_PRIORITY;
++    int target_nid = htmm_cxl_mode ? 0 : next_promotion_node(pgdat->node_id);
++
++    if (!promotion_available(target_nid, memcg, &nr_to_promote))
++	return 0;
++
++    nr_to_promote = min(nr_to_promote,
++		    lruvec_lru_size(lruvec, lru, MAX_NR_ZONES));
++    
++    if (nr_to_promote == 0 && htmm_mode == HTMM_NO_MIG) {
++	lru = LRU_INACTIVE_ANON;
++	nr_to_promote = min(tmp, lruvec_lru_size(lruvec, lru, MAX_NR_ZONES));
++    }
++    do {
++	nr_promoted += promote_lruvec(nr_to_promote, priority, pgdat, lruvec, lru);
++	if (nr_promoted >= nr_to_promote)
++	    break;
++	priority--;
++    } while (priority);
++    
++    return nr_promoted;
++}
++
++static unsigned long cooling_active_list(unsigned long nr_to_scan,
++	struct lruvec *lruvec, enum lru_list lru)
++{
++    unsigned long nr_taken;
++    struct mem_cgroup *memcg = lruvec_memcg(lruvec);
++    pg_data_t *pgdat = lruvec_pgdat(lruvec);
++    LIST_HEAD(l_hold);
++    LIST_HEAD(l_active);
++    LIST_HEAD(l_inactive);
++    int file = is_file_lru(lru);
++
++    lru_add_drain();
++
++    spin_lock_irq(&lruvec->lru_lock);
++    nr_taken = isolate_lru_pages(nr_to_scan, lruvec, lru, &l_hold, 0);
++    __mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
++    spin_unlock_irq(&lruvec->lru_lock);
++
++    cond_resched();
++    while (!list_empty(&l_hold)) {
++	struct page *page;
++
++	page = lru_to_page(&l_hold);
++	list_del(&page->lru);
++
++	if (unlikely(!page_evictable(page))) {
++	    putback_lru_page(page);
++	    continue;
++	}
++
++	if (!file) {
++	    int still_hot;
++
++	    if (PageTransHuge(compound_head(page))) {
++		struct page *meta = get_meta_page(page);
++
++#ifdef DEFERRED_SPLIT_ISOLATED
++		if (check_split_huge_page(memcg, get_meta_page(page), false)) {
++
++		    spin_lock_irq(&lruvec->lru_lock);
++		    if (deferred_split_huge_page_for_htmm(compound_head(page))) {
++			spin_unlock_irq(&lruvec->lru_lock);
++			check_transhuge_cooling((void *)memcg, page, false);
++			continue;
++		    }
++		    spin_unlock_irq(&lruvec->lru_lock);
++		}
++#endif
++		check_transhuge_cooling((void *)memcg, page, false);
++
++		if (meta->idx >= memcg->active_threshold)
++		    still_hot = 2;
++		else
++		    still_hot = 1;
++	    }
++	    else {
++		still_hot = cooling_page(page, lruvec_memcg(lruvec));
++	    }
++
++	    if (still_hot == 2) {
++		/* page is still hot after cooling */
++		if (!PageActive(page))
++		    SetPageActive(page);
++		list_add(&page->lru, &l_active);
++		continue;
++	    } 
++	    else if (still_hot == 0) {
++		/* not cooled page */
++		if (PageActive(page))
++		    list_add(&page->lru, &l_active);
++		else
++		    list_add(&page->lru, &l_inactive);
++		continue;
++	    }
++	    // still_hot == 1
++	}
++	/* cold or file page */
++	ClearPageActive(page);
++	SetPageWorkingset(page);
++	list_add(&page->lru, &l_inactive);
++    }
++
++    spin_lock_irq(&lruvec->lru_lock);
++    move_pages_to_lru(lruvec, &l_active);
++    move_pages_to_lru(lruvec, &l_inactive);
++    list_splice(&l_inactive, &l_active);
++
++    __mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
++    spin_unlock_irq(&lruvec->lru_lock);
++
++    mem_cgroup_uncharge_list(&l_active);
++    free_unref_page_list(&l_active);
++    
++    return nr_taken;
++}
++
++static void cooling_node(pg_data_t *pgdat, struct mem_cgroup *memcg)
++{
++    unsigned long nr_to_scan, nr_scanned = 0, nr_max_scan = 12;
++    struct lruvec *lruvec = mem_cgroup_lruvec(memcg, pgdat);
++    struct mem_cgroup_per_node *pn = memcg->nodeinfo[pgdat->node_id];
++    enum lru_list lru = LRU_ACTIVE_ANON; 
++
++re_cooling:
++    nr_to_scan = lruvec_lru_size(lruvec, lru, MAX_NR_ZONES);
++    do {
++	unsigned long scan = nr_to_scan >> 3; /* 12.5% */
++
++	if (!scan)
++	    scan = nr_to_scan;
++	/* limits the num. of scanned pages to reduce the lock holding time */
++	nr_scanned += cooling_active_list(scan, lruvec, lru);
++	nr_max_scan--;
++    } while (nr_scanned < nr_to_scan && nr_max_scan);
++
++    if (is_active_lru(lru)) {
++	lru = LRU_INACTIVE_ANON;
++	nr_max_scan = 12;
++	nr_scanned = 0;
++	goto re_cooling;
++    }
++
++    /* active file list */
++    cooling_active_list(lruvec_lru_size(lruvec, LRU_ACTIVE_FILE, MAX_NR_ZONES),
++					lruvec, LRU_ACTIVE_FILE);
++    //if (nr_scanned >= nr_to_scan)
++    WRITE_ONCE(pn->need_cooling, false);
++}
++
++static unsigned long adjusting_lru_list(unsigned long nr_to_scan,
++	struct lruvec *lruvec, enum lru_list lru, unsigned int *nr_huge, unsigned int *nr_base)
++{
++    unsigned long nr_taken;
++    pg_data_t *pgdat = lruvec_pgdat(lruvec);
++    struct mem_cgroup *memcg = lruvec_memcg(lruvec);
++    LIST_HEAD(l_hold);
++    LIST_HEAD(l_active);
++    LIST_HEAD(l_inactive);
++    int file = is_file_lru(lru);
++    bool active = is_active_lru(lru);
++
++    unsigned int nr_split_cand = 0, nr_split_hot = 0;
++
++    if (file)
++	return 0;
++
++    lru_add_drain();
++
++    spin_lock_irq(&lruvec->lru_lock);
++    nr_taken = isolate_lru_pages(nr_to_scan, lruvec, lru, &l_hold, 0);
++    __mod_node_page_state(pgdat, NR_ISOLATED_ANON, nr_taken);
++    spin_unlock_irq(&lruvec->lru_lock);
++
++    cond_resched();
++    while (!list_empty(&l_hold)) {
++	struct page *page;
++	int status;
++
++	page = lru_to_page(&l_hold);
++	list_del(&page->lru);
++
++	if (unlikely(!page_evictable(page))) {
++	    putback_lru_page(page);
++	    continue;
++	}
++#ifdef DEFERRED_SPLIT_ISOLATED
++	if (PageCompound(page) && check_split_huge_page(memcg, get_meta_page(page), false)) {
++
++	    spin_lock_irq(&lruvec->lru_lock);
++	    if (!deferred_split_huge_page_for_htmm(compound_head(page))) {
++	        if (PageActive(page))
++		    list_add(&page->lru, &l_active);
++		else
++		    list_add(&page->lru, &l_inactive);
++	    }
++	    spin_unlock_irq(&lruvec->lru_lock);
++	    continue;
++	}
++#endif
++	if (PageTransHuge(compound_head(page))) {
++	    struct page *meta = get_meta_page(page);
++	    
++	    if (meta->idx >= memcg->active_threshold)
++		status = 2;
++	    else
++		status = 1;
++	    nr_split_hot++;
++	}
++	else {
++	    status = page_check_hotness(page, memcg);
++	    nr_split_cand++;
++	}
++	
++	if (status == 2) {
++	    if (active) {
++		list_add(&page->lru, &l_active);
++		continue;
++	    }
++
++	    SetPageActive(page);
++	    list_add(&page->lru, &l_active);
++	} else if (status == 0) {
++	    if (PageActive(page))
++		list_add(&page->lru, &l_active);
++	    else
++		list_add(&page->lru, &l_inactive);
++	} else {
++	    if (!active) {
++		list_add(&page->lru, &l_inactive);
++		continue;
++	    }
++
++	    ClearPageActive(page);
++	    SetPageWorkingset(page);
++	    list_add(&page->lru, &l_inactive);
++
++	}
++    }
++
++    spin_lock_irq(&lruvec->lru_lock);
++    move_pages_to_lru(lruvec, &l_active);
++    move_pages_to_lru(lruvec, &l_inactive);
++    list_splice(&l_inactive, &l_active);
++
++    __mod_node_page_state(pgdat, NR_ISOLATED_ANON, -nr_taken);
++    spin_unlock_irq(&lruvec->lru_lock);
++
++    mem_cgroup_uncharge_list(&l_active);
++    free_unref_page_list(&l_active);
++
++    *nr_huge += nr_split_hot;
++    *nr_base += nr_split_cand;
++
++    return nr_taken;
++}
++
++static void adjusting_node(pg_data_t *pgdat, struct mem_cgroup *memcg, bool active)
++{
++    struct lruvec *lruvec = mem_cgroup_lruvec(memcg, pgdat);
++    struct mem_cgroup_per_node *pn = memcg->nodeinfo[pgdat->node_id];
++    enum lru_list lru = active ? LRU_ACTIVE_ANON : LRU_INACTIVE_ANON;
++    unsigned long nr_to_scan, nr_scanned = 0, nr_max_scan =12;
++    unsigned int nr_huge = 0, nr_base = 0;
++
++    nr_to_scan = lruvec_lru_size(lruvec, lru, MAX_NR_ZONES);
++    do {
++	unsigned long scan = nr_to_scan >> 3;
++
++	if (!scan)
++	    scan = nr_to_scan;
++	nr_scanned += adjusting_lru_list(scan, lruvec, lru, &nr_huge, &nr_base);
++	nr_max_scan--;
++    } while (nr_scanned < nr_to_scan && nr_max_scan);
++    
++    if (nr_scanned >= nr_to_scan)
++	WRITE_ONCE(pn->need_adjusting, false);
++    if (nr_scanned >= nr_to_scan && !active)
++	WRITE_ONCE(pn->need_adjusting_all, false);
++}
++
++static struct mem_cgroup_per_node *next_memcg_cand(pg_data_t *pgdat)
++{
++    struct mem_cgroup_per_node *pn;
++
++    spin_lock(&pgdat->kmigraterd_lock);
++    if (!list_empty(&pgdat->kmigraterd_head)) {
++	pn = list_first_entry(&pgdat->kmigraterd_head, typeof(*pn), kmigraterd_list);
++	list_move_tail(&pn->kmigraterd_list, &pgdat->kmigraterd_head);
++    }
++    else
++	pn = NULL;
++    spin_unlock(&pgdat->kmigraterd_lock);
++
++    return pn;
++}
++
++static int kmigraterd_demotion(pg_data_t *pgdat)
++{
++    const struct cpumask *cpumask = cpumask_of_node(pgdat->node_id);
++
++    if (!cpumask_empty(cpumask))
++	set_cpus_allowed_ptr(pgdat->kmigraterd, cpumask);
++
++    for ( ; ; ) {
++	struct mem_cgroup_per_node *pn;
++	struct mem_cgroup *memcg;
++	unsigned long nr_exceeded = 0;
++	LIST_HEAD(split_list);
++
++	if (kthread_should_stop())
++	    break;
++
++	pn = next_memcg_cand(pgdat);
++	if (!pn) {
++	    msleep_interruptible(1000);
++	    continue;
++	}
++
++	memcg = pn->memcg;
++	if (!memcg || !memcg->htmm_enabled) {
++	    spin_lock(&pgdat->kmigraterd_lock);
++	    if (!list_empty_careful(&pn->kmigraterd_list))
++		list_del(&pn->kmigraterd_list);
++	    spin_unlock(&pgdat->kmigraterd_lock);
++	    continue;
++	}
++
++	/* performs split */
++	if (htmm_thres_split != 0 &&
++		!list_empty(&(&pn->deferred_split_queue)->split_queue)) {
++	    unsigned long nr_split;
++	    nr_split = deferred_split_scan_for_htmm(pn, &split_list);
++	    if (!list_empty(&split_list)) {
++		putback_split_pages(&split_list, mem_cgroup_lruvec(memcg, pgdat));
++	    }
++	}
++	/* performs cooling */
++	if (need_lru_cooling(pn))
++	    cooling_node(pgdat, memcg);
++	else if (need_lru_adjusting(pn)) {
++	    adjusting_node(pgdat, memcg, true);
++	    if (pn->need_adjusting_all == true)
++		// adjusting the inactive list
++		adjusting_node(pgdat, memcg, false);
++	}
++	
++	/* demotes inactive lru pages */
++	if (need_toptier_demotion(pgdat, memcg, &nr_exceeded)) {
++	    demote_node(pgdat, memcg, nr_exceeded);
++	}
++	//if (need_direct_demotion(pgdat, memcg))
++	  //  goto demotion;
++
++	/* default: wait 50 ms */
++	wait_event_interruptible_timeout(pgdat->kmigraterd_wait,
++	    need_direct_demotion(pgdat, memcg),
++	    msecs_to_jiffies(htmm_demotion_period_in_ms));	    
++    }
++    return 0;
++}
++
++static int kmigraterd_promotion(pg_data_t *pgdat)
++{
++    const struct cpumask *cpumask;
++
++    if (htmm_cxl_mode)
++    	cpumask = cpumask_of_node(pgdat->node_id);
++    else
++	cpumask = cpumask_of_node(pgdat->node_id - 2);
++
++    if (!cpumask_empty(cpumask))
++	set_cpus_allowed_ptr(pgdat->kmigraterd, cpumask);
++
++    for ( ; ; ) {
++	struct mem_cgroup_per_node *pn;
++	struct mem_cgroup *memcg;
++	LIST_HEAD(split_list);
++
++	if (kthread_should_stop())
++	    break;
++
++	pn = next_memcg_cand(pgdat);
++	if (!pn) {
++	    msleep_interruptible(1000);
++	    continue;
++	}
++
++	memcg = pn->memcg;
++	if (!memcg || !memcg->htmm_enabled) {
++	    spin_lock(&pgdat->kmigraterd_lock);
++	    if (!list_empty_careful(&pn->kmigraterd_list))
++		list_del(&pn->kmigraterd_list);
++	    spin_unlock(&pgdat->kmigraterd_lock);
++	    continue;
++	}
++
++	/* performs split */
++	if (htmm_thres_split != 0 &&
++		!list_empty(&(&pn->deferred_split_queue)->split_queue)) {
++	    unsigned long nr_split;
++	    nr_split = deferred_split_scan_for_htmm(pn, &split_list);
++	    if (!list_empty(&split_list)) {
++		putback_split_pages(&split_list, mem_cgroup_lruvec(memcg, pgdat));
++	    }
++	}
++
++	if (need_lru_cooling(pn))
++	    cooling_node(pgdat, memcg);
++	else if (need_lru_adjusting(pn)) {
++	    adjusting_node(pgdat, memcg, true);
++	    if (pn->need_adjusting_all == true)
++		// adjusting the inactive list
++		adjusting_node(pgdat, memcg, false);
++	}
++
++	/* promotes hot pages to fast memory node */
++	if (need_lowertier_promotion(pgdat, memcg)) {
++	    promote_node(pgdat, memcg);
++	}
++
++	msleep_interruptible(htmm_promotion_period_in_ms);
++    }
++
++    return 0;
++}
++
++static int kmigraterd(void *p)
++{
++    pg_data_t *pgdat = (pg_data_t *)p;
++    int nid = pgdat->node_id;
++
++    if (htmm_cxl_mode) {
++	if (nid == 0)
++	    return kmigraterd_demotion(pgdat);
++	else
++	    return kmigraterd_promotion(pgdat);
++    }
++
++    if (node_is_toptier(nid))
++	return kmigraterd_demotion(pgdat);
++    else
++	return kmigraterd_promotion(pgdat);
++}
++
++void kmigraterd_wakeup(int nid)
++{
++    pg_data_t *pgdat = NODE_DATA(nid);
++    wake_up_interruptible(&pgdat->kmigraterd_wait);  
++}
++
++static void kmigraterd_run(int nid)
++{
++    pg_data_t *pgdat = NODE_DATA(nid);
++    if (!pgdat || pgdat->kmigraterd)
++	return;
++
++    init_waitqueue_head(&pgdat->kmigraterd_wait);
++
++    pgdat->kmigraterd = kthread_run(kmigraterd, pgdat, "kmigraterd%d", nid);
++    if (IS_ERR(pgdat->kmigraterd)) {
++	pr_err("Fails to start kmigraterd on node %d\n", nid);
++	pgdat->kmigraterd = NULL;
++    }
++}
++
++void kmigraterd_stop(void)
++{
++    int nid;
++
++    for_each_node_state(nid, N_MEMORY) {
++	struct task_struct *km = NODE_DATA(nid)->kmigraterd;
++
++	if (km) {
++	    kthread_stop(km);
++	    NODE_DATA(nid)->kmigraterd = NULL;
++	}
++    }
++}
++
++int kmigraterd_init(void)
++{
++    int nid;
++
++    for_each_node_state(nid, N_MEMORY)
++	kmigraterd_run(nid);
++    return 0;
++}
+diff --git a/linux/mm/htmm_sampler.c b/linux/mm/htmm_sampler.c
+new file mode 100644
+index 000000000..778b5a45f
+--- /dev/null
++++ b/linux/mm/htmm_sampler.c
+@@ -0,0 +1,430 @@
++/*
++ * memory access sampling for hugepage-aware tiered memory management.
++ */
++#include <linux/kthread.h>
++#include <linux/memcontrol.h>
++#include <linux/mempolicy.h>
++#include <linux/sched.h>
++#include <linux/perf_event.h>
++#include <linux/delay.h>
++#include <linux/sched/cputime.h>
++
++#include "../kernel/events/internal.h"
++
++#include <linux/htmm.h>
++
++struct task_struct *access_sampling = NULL;
++struct perf_event ***mem_event;
++
++static bool valid_va(unsigned long addr)
++{
++    if (!(addr >> (PGDIR_SHIFT + 9)) && addr != 0)
++	return true;
++    else
++	return false;
++}
++
++static __u64 get_pebs_event(enum events e)
++{
++    switch (e) {
++	case DRAMREAD:
++	    return DRAM_LLC_LOAD_MISS;
++	case NVMREAD:
++	    if (!htmm_cxl_mode)
++		return NVM_LLC_LOAD_MISS;
++	    else
++		return N_HTMMEVENTS;
++	case MEMWRITE:
++	    return ALL_STORES;
++	case CXLREAD:
++	    if (htmm_cxl_mode)
++		return REMOTE_DRAM_LLC_LOAD_MISS;
++	    else
++		return N_HTMMEVENTS;
++	default:
++	    return N_HTMMEVENTS;
++    }
++}
++
++static int __perf_event_open(__u64 config, __u64 config1, __u64 cpu,
++	__u64 type, __u32 pid)
++{
++    struct perf_event_attr attr;
++    struct file *file;
++    int event_fd, __pid;
++
++    memset(&attr, 0, sizeof(struct perf_event_attr));
++
++    attr.type = PERF_TYPE_RAW;
++    attr.size = sizeof(struct perf_event_attr);
++    attr.config = config;
++    attr.config1 = config1;
++    if (config == ALL_STORES)
++	attr.sample_period = htmm_inst_sample_period;
++    else
++	attr.sample_period = get_sample_period(0);
++    attr.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_ADDR;
++    attr.disabled = 0;
++    attr.exclude_kernel = 1;
++    attr.exclude_hv = 1;
++    attr.exclude_callchain_kernel = 1;
++    attr.exclude_callchain_user = 1;
++    attr.precise_ip = 1;
++    attr.enable_on_exec = 1;
++
++    if (pid == 0)
++	__pid = -1;
++    else
++	__pid = pid;
++	
++    event_fd = htmm__perf_event_open(&attr, __pid, cpu, -1, 0);
++    //event_fd = htmm__perf_event_open(&attr, -1, cpu, -1, 0);
++    if (event_fd <= 0) {
++	printk("[error htmm__perf_event_open failure] event_fd: %d\n", event_fd);
++	return -1;
++    }
++
++    file = fget(event_fd);
++    if (!file) {
++	printk("invalid file\n");
++	return -1;
++    }
++    mem_event[cpu][type] = fget(event_fd)->private_data;
++    return 0;
++}
++
++static int pebs_init(pid_t pid, int node)
++{
++    int cpu, event;
++
++    mem_event = kzalloc(sizeof(struct perf_event **) * CPUS_PER_SOCKET, GFP_KERNEL);
++    for (cpu = 0; cpu < CPUS_PER_SOCKET; cpu++) {
++	mem_event[cpu] = kzalloc(sizeof(struct perf_event *) * N_HTMMEVENTS, GFP_KERNEL);
++    }
++    
++    printk("pebs_init\n");   
++    for (cpu = 0; cpu < CPUS_PER_SOCKET; cpu++) {
++	for (event = 0; event < N_HTMMEVENTS; event++) {
++	    if (get_pebs_event(event) == N_HTMMEVENTS) {
++		mem_event[cpu][event] = NULL;
++		continue;
++	    }
++
++	    if (__perf_event_open(get_pebs_event(event), 0, cpu, event, pid))
++		return -1;
++	    if (htmm__perf_event_init(mem_event[cpu][event], BUFFER_SIZE))
++		return -1;
++	}
++    }
++
++    return 0;
++}
++
++static void pebs_disable(void)
++{
++    int cpu, event;
++
++    printk("pebs disable\n");
++    for (cpu = 0; cpu < CPUS_PER_SOCKET; cpu++) {
++	for (event = 0; event < N_HTMMEVENTS; event++) {
++	    if (mem_event[cpu][event])
++		perf_event_disable(mem_event[cpu][event]);
++	}
++    }
++}
++
++static void pebs_enable(void)
++{
++    int cpu, event;
++
++    printk("pebs enable\n");
++    for (cpu = 0; cpu < CPUS_PER_SOCKET; cpu++) {
++	for (event = 0; event < N_HTMMEVENTS; event++) {
++	    if (mem_event[cpu][event])
++		perf_event_enable(mem_event[cpu][event]);
++	}
++    }
++}
++
++static void pebs_update_period(uint64_t value, uint64_t inst_value)
++{
++    int cpu, event;
++
++    for (cpu = 0; cpu < CPUS_PER_SOCKET; cpu++) {
++	for (event = 0; event < N_HTMMEVENTS; event++) {
++	    int ret;
++	    if (!mem_event[cpu][event])
++		continue;
++
++	    switch (event) {
++		case DRAMREAD:
++		case NVMREAD:
++		case CXLREAD:
++		    ret = perf_event_period(mem_event[cpu][event], value);
++		    break;
++		case MEMWRITE:
++		    ret = perf_event_period(mem_event[cpu][event], inst_value);
++		    break;
++		default:
++		    ret = 0;
++		    break;
++	    }
++
++	    if (ret == -EINVAL)
++		printk("failed to update sample period");
++	}
++    }
++}
++
++static int ksamplingd(void *data)
++{
++    unsigned long long nr_sampled = 0, nr_dram = 0, nr_nvm = 0, nr_write = 0;
++    unsigned long long nr_throttled = 0, nr_lost = 0, nr_unknown = 0;
++    unsigned long long nr_skip = 0;
++
++    /* used for calculating average cpu usage of ksampled */
++    struct task_struct *t = current;
++    /* a unit of cputime: permil (1/1000) */
++    u64 total_runtime, exec_runtime, cputime = 0;
++    unsigned long total_cputime, elapsed_cputime, cur;
++    /* used for periodic checks*/
++    unsigned long cpucap_period = msecs_to_jiffies(15000); // 15s
++    unsigned long sample_period = 0;
++    unsigned long sample_inst_period = 0;
++    /* report cpu/period stat */
++    unsigned long trace_cputime, trace_period = msecs_to_jiffies(1500); // 3s
++    unsigned long trace_runtime;
++    /* for timeout */ 
++    unsigned long sleep_timeout;
++
++    /* for analytic purpose */
++    unsigned long hr_dram = 0, hr_nvm = 0;
++
++    /* orig impl: see read_sum_exec_runtime() */
++    trace_runtime = total_runtime = exec_runtime = t->se.sum_exec_runtime;
++
++    trace_cputime = total_cputime = elapsed_cputime = jiffies;
++    sleep_timeout = usecs_to_jiffies(2000);
++
++    /* TODO implements per-CPU node ksamplingd by using pg_data_t */
++    /* Currently uses a single CPU node(0) */
++    const struct cpumask *cpumask = cpumask_of_node(0);
++    if (!cpumask_empty(cpumask))
++	do_set_cpus_allowed(access_sampling, cpumask);
++
++    while (!kthread_should_stop()) {
++	int cpu, event, cond = false;
++    
++	if (htmm_mode == HTMM_NO_MIG) {
++	    msleep_interruptible(10000);
++	    continue;
++	}
++	
++	for (cpu = 0; cpu < CPUS_PER_SOCKET; cpu++) {
++	    for (event = 0; event < N_HTMMEVENTS; event++) {
++		do {
++		    struct perf_buffer *rb;
++		    struct perf_event_mmap_page *up;
++		    struct perf_event_header *ph;
++		    struct htmm_event *he;
++		    unsigned long pg_index, offset;
++		    int page_shift;
++		    __u64 head;
++
++		    if (!mem_event[cpu][event]) {
++			//continue;
++			break;
++		    }
++
++		    __sync_synchronize();
++
++		    rb = mem_event[cpu][event]->rb;
++		    if (!rb) {
++			printk("event->rb is NULL\n");
++			return -1;
++		    }
++		    /* perf_buffer is ring buffer */
++		    up = READ_ONCE(rb->user_page);
++		    head = READ_ONCE(up->data_head);
++		    if (head == up->data_tail) {
++			if (cpu < 16)
++			    nr_skip++;
++			//continue;
++			break;
++		    }
++
++		    head -= up->data_tail;
++		    if (head > (BUFFER_SIZE * ksampled_max_sample_ratio / 100)) {
++			cond = true;
++		    } else if (head < (BUFFER_SIZE * ksampled_min_sample_ratio / 100)) {
++			cond = false;
++		    }
++
++		    /* read barrier */
++		    smp_rmb();
++
++		    page_shift = PAGE_SHIFT + page_order(rb);
++		    /* get address of a tail sample */
++		    offset = READ_ONCE(up->data_tail);
++		    pg_index = (offset >> page_shift) & (rb->nr_pages - 1);
++		    offset &= (1 << page_shift) - 1;
++
++		    ph = (void*)(rb->data_pages[pg_index] + offset);
++		    switch (ph->type) {
++			case PERF_RECORD_SAMPLE:
++			    he = (struct htmm_event *)ph;
++			    if (!valid_va(he->addr)) {
++				break;
++			    }
++
++			    update_pginfo(he->pid, he->addr, event);
++			    //count_vm_event(HTMM_NR_SAMPLED);
++			    nr_sampled++;
++
++			    if (event == DRAMREAD) {
++				nr_dram++;
++				hr_dram++;
++			    }
++			    else if (event == CXLREAD || event == NVMREAD) {
++				nr_nvm++;
++				hr_nvm++;
++			    }
++			    else
++				nr_write++;
++			    break;
++			case PERF_RECORD_THROTTLE:
++			case PERF_RECORD_UNTHROTTLE:
++			    nr_throttled++;
++			    break;
++			case PERF_RECORD_LOST_SAMPLES:
++			    nr_lost ++;
++			    break;
++			default:
++			    nr_unknown++;
++			    break;
++		    }
++		    if (nr_sampled % 500000 == 0) {
++			trace_printk("nr_sampled: %llu, nr_dram: %llu, nr_nvm: %llu, nr_write: %llu, nr_throttled: %llu \n", nr_sampled, nr_dram, nr_nvm, nr_write,
++				nr_throttled);
++			nr_dram = 0;
++			nr_nvm = 0;
++			nr_write = 0;
++		    }
++		    /* read, write barrier */
++		    smp_mb();
++		    WRITE_ONCE(up->data_tail, up->data_tail + ph->size);
++		} while (cond);
++	    }
++	}
++	/* if ksampled_soft_cpu_quota is zero, disable dynamic pebs feature */
++	if (!ksampled_soft_cpu_quota)
++	    continue;
++
++	/* sleep */
++	schedule_timeout_interruptible(sleep_timeout);
++
++	/* check elasped time */
++	cur = jiffies;
++	if ((cur - elapsed_cputime) >= cpucap_period) {
++	    u64 cur_runtime = t->se.sum_exec_runtime;
++	    exec_runtime = cur_runtime - exec_runtime; //ns
++	    elapsed_cputime = jiffies_to_usecs(cur - elapsed_cputime); //us
++	    if (!cputime) {
++		u64 cur_cputime = div64_u64(exec_runtime, elapsed_cputime);
++		// EMA with the scale factor (0.2)
++		cputime = ((cur_cputime << 3) + (cputime << 1)) / 10;
++	    } else
++		cputime = div64_u64(exec_runtime, elapsed_cputime);
++
++	    /* to prevent frequent updates, allow for a slight variation of +/- 0.5% */
++	    if (cputime > (ksampled_soft_cpu_quota + 5) &&
++		    sample_period != pcount) {
++		/* need to increase the sample period */
++		/* only increase by 1 */
++		unsigned long tmp1 = sample_period, tmp2 = sample_inst_period;
++		increase_sample_period(&sample_period, &sample_inst_period);
++		if (tmp1 != sample_period || tmp2 != sample_inst_period)
++		    pebs_update_period(get_sample_period(sample_period),
++				       get_sample_inst_period(sample_inst_period));
++	    } else if (cputime < (ksampled_soft_cpu_quota - 5) && sample_period) {
++		unsigned long tmp1 = sample_period, tmp2 = sample_inst_period;
++		decrease_sample_period(&sample_period, &sample_inst_period);
++		if (tmp1 != sample_period || tmp2 != sample_inst_period)
++		    pebs_update_period(get_sample_period(sample_period),
++				    get_sample_inst_period(sample_inst_period));
++	    }
++	    /* does it need to prevent ping-pong behavior? */
++	    
++	    elapsed_cputime = cur;
++	    exec_runtime = cur_runtime;
++	}
++
++	/* This is used for reporting the sample period and cputime */
++	if (cur - trace_cputime >= trace_period) {
++	    unsigned long hr = 0;
++	    u64 cur_runtime = t->se.sum_exec_runtime;
++	    trace_runtime = cur_runtime - trace_runtime;
++	    trace_cputime = jiffies_to_usecs(cur - trace_cputime);
++	    trace_cputime = div64_u64(trace_runtime, trace_cputime);
++	    
++	    if (hr_dram + hr_nvm == 0)
++		hr = 0;
++	    else
++		hr = hr_dram * 10000 / (hr_dram + hr_nvm);
++	    trace_printk("sample_period: %lu || cputime: %lu  || hit ratio: %lu\n",
++		    get_sample_period(sample_period), trace_cputime, hr);
++	    
++	    hr_dram = hr_nvm = 0;
++	    trace_cputime = cur;
++	    trace_runtime = cur_runtime;
++	}
++    }
++
++    total_runtime = (t->se.sum_exec_runtime) - total_runtime; // ns
++    total_cputime = jiffies_to_usecs(jiffies - total_cputime); // us
++
++    printk("nr_sampled: %llu, nr_throttled: %llu, nr_lost: %llu\n", nr_sampled, nr_throttled, nr_lost);
++    printk("total runtime: %llu ns, total cputime: %lu us, cpu usage: %llu\n",
++	    total_runtime, total_cputime, (total_runtime) / total_cputime);
++
++    return 0;
++}
++
++static int ksamplingd_run(void)
++{
++    int err = 0;
++    
++    if (!access_sampling) {
++	access_sampling = kthread_run(ksamplingd, NULL, "ksamplingd");
++	if (IS_ERR(access_sampling)) {
++	    err = PTR_ERR(access_sampling);
++	    access_sampling = NULL;
++	}
++    }
++    return err;
++}
++
++int ksamplingd_init(pid_t pid, int node)
++{
++    int ret;
++
++    if (access_sampling)
++	return 0;
++
++    ret = pebs_init(pid, node);
++    if (ret) {
++	printk("htmm__perf_event_init failure... ERROR:%d\n", ret);
++	return 0;
++    }
++
++    return ksamplingd_run();
++}
++
++void ksamplingd_exit(void)
++{
++    if (access_sampling) {
++	kthread_stop(access_sampling);
++	access_sampling = NULL;
++    }
++    pebs_disable();
++}
+diff --git a/linux/mm/huge_memory.c b/linux/mm/huge_memory.c
+index c5142d237..f6e053ad0 100644
+--- a/linux/mm/huge_memory.c
++++ b/linux/mm/huge_memory.c
+@@ -34,6 +34,7 @@
+ #include <linux/oom.h>
+ #include <linux/numa.h>
+ #include <linux/page_owner.h>
++#include <linux/htmm.h>
+ 
+ #include <asm/tlb.h>
+ #include <asm/pgalloc.h>
+@@ -499,13 +500,24 @@ pmd_t maybe_pmd_mkwrite(pmd_t pmd, struct vm_area_struct *vma)
+ }
+ 
+ #ifdef CONFIG_MEMCG
+-static inline struct deferred_split *get_deferred_split_queue(struct page *page)
++struct deferred_split *get_deferred_split_queue(struct page *page)
+ {
+ 	struct mem_cgroup *memcg = page_memcg(compound_head(page));
+ 	struct pglist_data *pgdat = NODE_DATA(page_to_nid(page));
+ 
+ 	if (memcg)
++#ifdef CONFIG_HTMM
++	{
++		if (memcg->htmm_enabled) {
++			struct mem_cgroup_per_node *pn = memcg->nodeinfo[page_to_nid(page)];
++			return &pn->deferred_split_queue;
++		}
++		else
++		    return &memcg->deferred_split_queue;
++	}
++#else
+ 		return &memcg->deferred_split_queue;
++#endif
+ 	else
+ 		return &pgdat->deferred_split_queue;
+ }
+@@ -657,6 +669,12 @@ static vm_fault_t __do_huge_pmd_anonymous_page(struct vm_fault *vmf,
+ 		spin_unlock(vmf->ptl);
+ 		count_vm_event(THP_FAULT_ALLOC);
+ 		count_memcg_event_mm(vma->vm_mm, THP_FAULT_ALLOC);
++#ifdef CONFIG_HTMM
++		if (page != NULL && node_is_toptier(page_to_nid(page)))
++		    count_vm_events(HTMM_ALLOC_DRAM, HPAGE_PMD_NR);
++		else
++		    count_vm_events(HTMM_ALLOC_NVM, HPAGE_PMD_NR);
++#endif
+ 	}
+ 
+ 	return 0;
+@@ -779,7 +797,11 @@ vm_fault_t do_huge_pmd_anonymous_page(struct vm_fault *vmf)
+ 		count_vm_event(THP_FAULT_FALLBACK);
+ 		return VM_FAULT_FALLBACK;
+ 	}
++#ifdef CONFIG_HTMM
++	prep_transhuge_page_for_htmm(vma, page);
++#else
+ 	prep_transhuge_page(page);
++#endif
+ 	return __do_huge_pmd_anonymous_page(vmf, page, gfp);
+ }
+ 
+@@ -1610,6 +1632,9 @@ int zap_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
+ 
+ 		if (pmd_present(orig_pmd)) {
+ 			page = pmd_page(orig_pmd);
++#ifdef CONFIG_HTMM
++			uncharge_htmm_page(page, get_mem_cgroup_from_mm(vma->vm_mm));
++#endif
+ 			page_remove_rmap(page, true);
+ 			VM_BUG_ON_PAGE(page_mapcount(page) < 0, page);
+ 			VM_BUG_ON_PAGE(!PageHead(page), page);
+@@ -2105,7 +2130,42 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
+ 			atomic_inc(&page[i]._mapcount);
+ 		pte_unmap(pte);
+ 	}
++#ifdef CONFIG_HTMM
++	/* pginfo-s managed by the huge page should be copied into pte->pginfo*/
++	if (PageHtmm(&page[3])) {
++	    struct mem_cgroup *memcg = get_mem_cgroup_from_mm(mm);
++	    pte_t *pte = pte_offset_map(&_pmd, haddr);
++	
++	    SetPageHtmm(&page[0]);
++
++	    for (i = 0, addr = haddr; i < HPAGE_PMD_NR; i++, addr += PAGE_SIZE) {
++		pginfo_t *pte_pginfo, *tail_pginfo;
++
++		pte_pginfo = get_pginfo_from_pte(&pte[i]);
++		tail_pginfo = get_compound_pginfo(page, addr);
++		if (!pte_pginfo || !tail_pginfo) {
++		    printk("split - pginfo - none...\n");
++		    goto skip_copy_pginfo;
++		}
+ 
++		pte_pginfo->nr_accesses = tail_pginfo->nr_accesses;
++		pte_pginfo->total_accesses = tail_pginfo->total_accesses;
++		pte_pginfo->cooling_clock = tail_pginfo->cooling_clock;
++		
++		if (get_idx(pte_pginfo->total_accesses) >= (memcg->active_threshold - 1))
++		    SetPageActive(&page[i]);
++		else
++		    ClearPageActive(&page[i]);
++
++		spin_lock(&memcg->access_lock);
++		memcg->hotness_hg[get_idx(pte_pginfo->total_accesses)]++;
++		spin_unlock(&memcg->access_lock);
++		/* Htmm flag will be cleared later */
++		/* ClearPageHtmm(&page[i]); */
++	    }
++	}
++skip_copy_pginfo:
++#endif
+ 	if (!pmd_migration) {
+ 		/*
+ 		 * Set PG_double_map before dropping compound_mapcount to avoid
+@@ -2301,7 +2361,7 @@ static void unmap_page(struct page *page)
+ 	VM_WARN_ON_ONCE_PAGE(page_mapped(page), page);
+ }
+ 
+-static void remap_page(struct page *page, unsigned int nr)
++static void remap_page(struct page *page, unsigned int nr, bool unmap_clean)
+ {
+ 	int i;
+ 
+@@ -2309,10 +2369,10 @@ static void remap_page(struct page *page, unsigned int nr)
+ 	if (!PageAnon(page))
+ 		return;
+ 	if (PageTransHuge(page)) {
+-		remove_migration_ptes(page, page, true);
++		remove_migration_ptes(page, page, true, unmap_clean);
+ 	} else {
+ 		for (i = 0; i < nr; i++)
+-			remove_migration_ptes(page + i, page + i, true);
++			remove_migration_ptes(page + i, page + i, true, unmap_clean);
+ 	}
+ }
+ 
+@@ -2341,7 +2401,13 @@ static void __split_huge_page_tail(struct page *head, int tail,
+ 		struct lruvec *lruvec, struct list_head *list)
+ {
+ 	struct page *page_tail = head + tail;
+-
++#ifdef CONFIG_HTMM
++	bool htmm_tail = PageHtmm(page_tail) ? true : false;
++	bool htmm_active_tail = PageHtmm(head) && PageActive(page_tail);
++#else
++	bool htmm_tail = false;
++	bool htmm_active_tail = false;
++#endif
+ 	VM_BUG_ON_PAGE(atomic_read(&page_tail->_mapcount) != -1, page_tail);
+ 
+ 	/*
+@@ -2363,12 +2429,24 @@ static void __split_huge_page_tail(struct page *head, int tail,
+ 			 (1L << PG_unevictable) |
+ #ifdef CONFIG_64BIT
+ 			 (1L << PG_arch_2) |
++#endif
++#ifdef CONFIG_HTMM
++			// (1L << PG_htmm) |
+ #endif
+ 			 (1L << PG_dirty)));
+ 
+ 	/* ->mapping in first tail page is compound_mapcount */
+-	VM_BUG_ON_PAGE(tail > 2 && page_tail->mapping != TAIL_MAPPING,
+-			page_tail);
++	//VM_BUG_ON_PAGE(tail > 2 && !PageHtmm(head) && !htmm_tail && page_tail->mapping != TAIL_MAPPING,
++//			page_tail);
++
++#ifdef CONFIG_HTMM
++	if (htmm_tail)
++	    clear_transhuge_pginfo(page_tail);
++	if (htmm_active_tail)
++	    SetPageActive(page_tail);
++	else
++	    ClearPageActive(page_tail);
++#endif
+ 	page_tail->mapping = head->mapping;
+ 	page_tail->index = head->index + tail;
+ 
+@@ -2410,6 +2488,8 @@ static void __split_huge_page(struct page *page, struct list_head *list,
+ 	struct address_space *swap_cache = NULL;
+ 	unsigned long offset = 0;
+ 	unsigned int nr = thp_nr_pages(head);
++	LIST_HEAD(pages_to_free);
++	int nr_pages_to_free = 0;
+ 	int i;
+ 
+ 	/* complete memcg works before add pages to LRU */
+@@ -2445,7 +2525,9 @@ static void __split_huge_page(struct page *page, struct list_head *list,
+ 					head + i, 0);
+ 		}
+ 	}
+-
++#ifdef CONFIG_HTMM
++	ClearPageHtmm(head);
++#endif
+ 	ClearPageCompound(head);
+ 	unlock_page_lruvec(lruvec);
+ 	/* Caller disabled irqs, so they are still disabled here */
+@@ -2468,7 +2550,7 @@ static void __split_huge_page(struct page *page, struct list_head *list,
+ 	}
+ 	local_irq_enable();
+ 
+-	remap_page(head, nr);
++	remap_page(head, nr, PageAnon(head));
+ 
+ 	if (PageSwapCache(head)) {
+ 		swp_entry_t entry = { .val = page_private(head) };
+@@ -2482,6 +2564,34 @@ static void __split_huge_page(struct page *page, struct list_head *list,
+ 			continue;
+ 		unlock_page(subpage);
+ 		
++		/*
++		 * If a tail page has only two references left, one inherited
++		 * from the isolation of its head and the other from
++		 * lru_add_page_tail() which we are about to drop, it means this
++		 * tail page was concurrently zapped. Then we can safely free it
++		 * and save page reclaim or migration the trouble of trying it.
++		 */
++		if (list && page_ref_freeze(subpage, 2)) {
++		    VM_BUG_ON_PAGE(PageLRU(subpage), subpage);
++		    VM_BUG_ON_PAGE(PageCompound(subpage), subpage);
++		    VM_BUG_ON_PAGE(page_mapped(subpage), subpage);
++
++		    ClearPageActive(subpage);
++		    ClearPageUnevictable(subpage);
++		    list_move(&subpage->lru, &pages_to_free);
++		    nr_pages_to_free++;
++		    continue;
++		}
++
++		/*
++		 * If a tail page has only one reference left, it will be freed
++		 * by the call to free_page_and_swap_cache below. Since zero
++		 * subpages are no longer remapped, there will only be one
++		 * reference left in cases outside of reclaim or migration.
++		 */
++		if (page_ref_count(subpage) == 1)
++		    nr_pages_to_free++;
++
+ 		/*
+ 		 * Subpages may be freed if there wasn't any mapping
+ 		 * like if add_to_swap() is running on a lru page that
+@@ -2491,6 +2601,12 @@ static void __split_huge_page(struct page *page, struct list_head *list,
+ 		 */
+ 		put_page(subpage);
+ 	}
++
++	if (!nr_pages_to_free)
++	    return;
++
++	mem_cgroup_uncharge_list(&pages_to_free);
++	free_unref_page_list(&pages_to_free);
+ }
+ 
+ int total_mapcount(struct page *page)
+@@ -2711,7 +2827,22 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
+ 				filemap_nr_thps_dec(mapping);
+ 			}
+ 		}
++#ifdef CONFIG_HTMM
++		{
++		    struct mem_cgroup *memcg = page_memcg(head);
++		    unsigned int idx;
++
++		    spin_lock(&memcg->access_lock);
++		    idx = head[3].idx;
++
++		    if (memcg->hotness_hg[idx] < HPAGE_PMD_NR)
++			memcg->hotness_hg[idx] = 0;
++		    else
++			memcg->hotness_hg[idx] -= HPAGE_PMD_NR;
+ 
++		    spin_unlock(&memcg->access_lock);
++		}
++#endif
+ 		__split_huge_page(page, list, end);
+ 		ret = 0;
+ 	} else {
+@@ -2720,7 +2851,20 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
+ 		if (mapping)
+ 			xa_unlock(&mapping->i_pages);
+ 		local_irq_enable();
+-		remap_page(head, thp_nr_pages(head));
++		remap_page(head, thp_nr_pages(head), false);
++#if 0 //def CONFIG_HTMM
++		{
++		    struct mem_cgroup *memcg = page_memcg(head);
++		    if (memcg->htmm_enabled) {
++			spin_lock(&ds_queue->split_queue_lock);
++			if (!list_empty(page_deferred_list(head))) {
++			    ds_queue->split_queue_len--;
++			    list_del(page_deferred_list(head));
++			}
++			spin_unlock(&ds_queue->split_queue_lock);
++		    }
++		}
++#endif
+ 		ret = -EBUSY;
+ 	}
+ 
+@@ -2813,8 +2957,58 @@ static unsigned long deferred_split_scan(struct shrinker *shrink,
+ #ifdef CONFIG_MEMCG
+ 	if (sc->memcg)
+ 		ds_queue = &sc->memcg->deferred_split_queue;
+-#endif
++#ifdef CONFIG_HTMM
++	if (sc->memcg) {
++	    int nid, nr_nonempty = 0;
++	    
++	    for_each_node_state(nid, N_MEMORY) {
++		struct mem_cgroup_per_node *pn = sc->memcg->nodeinfo[nid];
++		struct deferred_split *pn_ds_queue = &pn->deferred_split_queue;
++		
++		if (list_empty(&pn_ds_queue->split_queue))
++		    continue;
++		
++		spin_lock_irqsave(&pn_ds_queue->split_queue_lock, flags);
++		list_for_each_safe(pos, next, &pn_ds_queue->split_queue) {
++		    page = list_entry((void *)pos, struct page, deferred_list);
++		    page = compound_head(page);
++		    if (get_page_unless_zero(page))
++			list_move(page_deferred_list(page), &list);
++		    else {
++			list_del_init(page_deferred_list(page));
++			pn_ds_queue->split_queue_len--;
++		    }
++		    if (!--sc->nr_to_scan)
++			break;
++		}
++		spin_unlock_irqrestore(&pn_ds_queue->split_queue_lock, flags);
++		    list_for_each_safe(pos, next, &list) {
++			page = list_entry((void *)pos, struct page, deferred_list);
++			if (!trylock_page(page))
++			    goto next;
++			/* split_huge_page() removes page from list on success */
++			if (!split_huge_page(page))
++			    split++;
++			unlock_page(page);
++next:
++			put_page(page);
++		}
+ 
++		spin_lock_irqsave(&pn_ds_queue->split_queue_lock, flags);
++		list_splice_tail(&list, &pn_ds_queue->split_queue);
++		spin_unlock_irqrestore(&pn_ds_queue->split_queue_lock, flags);
++
++		if (!list_empty(&pn_ds_queue->split_queue))
++		    nr_nonempty++;
++	    }
++	    
++	    if (!split && !nr_nonempty)
++		return SHRINK_STOP;
++	}
++	return split;
++#endif
++#endif
++#ifndef CONFIG_HTMM
+ 	spin_lock_irqsave(&ds_queue->split_queue_lock, flags);
+ 	/* Take pin on all head pages to avoid freeing them under us */
+ 	list_for_each_safe(pos, next, &ds_queue->split_queue) {
+@@ -2855,6 +3049,7 @@ static unsigned long deferred_split_scan(struct shrinker *shrink,
+ 	if (!split && list_empty(&ds_queue->split_queue))
+ 		return SHRINK_STOP;
+ 	return split;
++#endif
+ }
+ 
+ static struct shrinker deferred_split_shrinker = {
+@@ -3202,6 +3397,11 @@ void remove_migration_pmd(struct page_vma_mapped_walk *pvmw, struct page *new)
+ 	else
+ 		page_add_file_rmap(new, true);
+ 	set_pmd_at(mm, mmun_start, pvmw->pmd, pmde);
++#ifdef CONFIG_HTMM
++	{
++	    check_transhuge_cooling(NULL, new, true);
++	}
++#endif
+ 	if ((vma->vm_flags & VM_LOCKED) && !PageDoubleMap(new))
+ 		mlock_vma_page(new);
+ 	update_mmu_cache_pmd(vma, address, pvmw->pmd);
+diff --git a/linux/mm/khugepaged.c b/linux/mm/khugepaged.c
+index 8a8b3aa92..e1164d250 100644
+--- a/linux/mm/khugepaged.c
++++ b/linux/mm/khugepaged.c
+@@ -18,6 +18,11 @@
+ #include <linux/page_idle.h>
+ #include <linux/swapops.h>
+ #include <linux/shmem_fs.h>
++#ifdef CONFIG_HTMM
++#include <linux/mempolicy.h>
++#include <linux/htmm.h>
++#include <linux/migrate.h>
++#endif
+ 
+ #include <asm/tlb.h>
+ #include <asm/pgalloc.h>
+@@ -854,7 +859,6 @@ static int khugepaged_find_target_node(void)
+ 				target_node = nid;
+ 				break;
+ 			}
+-
+ 	last_khugepaged_target_node = target_node;
+ 	return target_node;
+ }
+@@ -1056,7 +1060,7 @@ static bool __collapse_huge_page_swapin(struct mm_struct *mm,
+ 	return true;
+ }
+ 
+-static void collapse_huge_page(struct mm_struct *mm,
++static int collapse_huge_page(struct mm_struct *mm,
+ 				   unsigned long address,
+ 				   struct page **hpage,
+ 				   int node, int referenced, int unmapped)
+@@ -1071,6 +1075,7 @@ static void collapse_huge_page(struct mm_struct *mm,
+ 	struct vm_area_struct *vma;
+ 	struct mmu_notifier_range range;
+ 	gfp_t gfp;
++	int ret = 0;
+ 
+ 	VM_BUG_ON(address & ~HPAGE_PMD_MASK);
+ 
+@@ -1084,7 +1089,35 @@ static void collapse_huge_page(struct mm_struct *mm,
+ 	 * that. We will recheck the vma after taking it again in write mode.
+ 	 */
+ 	mmap_read_unlock(mm);
++#ifdef CONFIG_HTMM
++	/* check whether there is enough free space in target memory node */
++	if (node_is_toptier(node)) {
++	    struct mem_cgroup *memcg = get_mem_cgroup_from_mm(mm);
++	    unsigned long max_nr_pages, cur_nr_pages;
++	    pg_data_t *pgdat;
++
++	    if (!memcg || !memcg->htmm_enabled)
++		goto normal_exec;
++	    
++	    pgdat = NODE_DATA(node);
++	    cur_nr_pages = get_nr_lru_pages_node(memcg, pgdat);
++	    max_nr_pages = memcg->nodeinfo[node]->max_nr_base_pages;
++
++	    if (max_nr_pages == ULONG_MAX)
++		goto normal_exec;
++	    else if (cur_nr_pages + HPAGE_PMD_NR <= max_nr_pages)
++		goto normal_exec;
++	    else {
++		result = SCAN_ALLOC_HUGE_PAGE_FAIL;
++		//ret = 1;
++		goto out_nolock;
++	    }
++	}
++normal_exec:
+ 	new_page = khugepaged_alloc_page(hpage, gfp, node);
++#else
++	new_page = khugepaged_alloc_page(hpage, gfp, node);
++#endif
+ 	if (!new_page) {
+ 		result = SCAN_ALLOC_HUGE_PAGE_FAIL;
+ 		goto out_nolock;
+@@ -1216,7 +1249,7 @@ static void collapse_huge_page(struct mm_struct *mm,
+ 	if (!IS_ERR_OR_NULL(*hpage))
+ 		mem_cgroup_uncharge(*hpage);
+ 	trace_mm_collapse_huge_page(mm, isolated, result);
+-	return;
++	return ret;
+ }
+ 
+ static int khugepaged_scan_pmd(struct mm_struct *mm,
+@@ -1233,6 +1266,9 @@ static int khugepaged_scan_pmd(struct mm_struct *mm,
+ 	spinlock_t *ptl;
+ 	int node = NUMA_NO_NODE, unmapped = 0;
+ 	bool writable = false;
++#ifdef CONFIG_HTMM
++	pginfo_t *pginfo;
++#endif
+ 
+ 	VM_BUG_ON(address & ~HPAGE_PMD_MASK);
+ 
+@@ -1288,7 +1324,16 @@ static int khugepaged_scan_pmd(struct mm_struct *mm,
+ 		}
+ 		if (pte_write(pteval))
+ 			writable = true;
++#ifdef CONFIG_HTMM
++		if (mm->htmm_enabled) {
++		    pginfo = get_pginfo_from_pte(_pte);
++		    if (!pginfo)
++			goto out_unmap;
+ 		    
++		    if (!pginfo->may_hot)
++			goto out_unmap;
++		}
++#endif
+ 		page = vm_normal_page(vma, _address, pteval);
+ 		if (unlikely(!page)) {
+ 			result = SCAN_PAGE_NULL;
+@@ -1367,7 +1412,7 @@ static int khugepaged_scan_pmd(struct mm_struct *mm,
+ 	if (ret) {
+ 		node = khugepaged_find_target_node();
+ 		/* collapse_huge_page will return with the mmap_lock released */
+-		collapse_huge_page(mm, address, hpage, node,
++		ret += collapse_huge_page(mm, address, hpage, node,
+ 				referenced, unmapped);
+ 	}
+ out:
+@@ -1635,7 +1680,7 @@ static void retract_page_tables(struct address_space *mapping, pgoff_t pgoff)
+  *    + restore gaps in the page cache;
+  *    + unlock and free huge page;
+  */
+-static void collapse_file(struct mm_struct *mm,
++static int collapse_file(struct mm_struct *mm,
+ 		struct file *file, pgoff_t start,
+ 		struct page **hpage, int node)
+ {
+@@ -1647,15 +1692,42 @@ static void collapse_file(struct mm_struct *mm,
+ 	XA_STATE_ORDER(xas, &mapping->i_pages, start, HPAGE_PMD_ORDER);
+ 	int nr_none = 0, result = SCAN_SUCCEED;
+ 	bool is_shmem = shmem_file(file);
+-	int nr;
++	int nr, ret = 0;
+ 
+ 	VM_BUG_ON(!IS_ENABLED(CONFIG_READ_ONLY_THP_FOR_FS) && !is_shmem);
+ 	VM_BUG_ON(start & (HPAGE_PMD_NR - 1));
+ 
+ 	/* Only allocate from the target node */
+ 	gfp = alloc_hugepage_khugepaged_gfpmask() | __GFP_THISNODE;
+-
++#ifdef CONFIG_HTMM
++	/* check whether there is enough free space in target memory node */
++	if (node_is_toptier(node)) {
++	    struct mem_cgroup *memcg = get_mem_cgroup_from_mm(mm);
++	    unsigned long max_nr_pages, cur_nr_pages;
++	    pg_data_t *pgdat;
++
++	    if (!memcg || !memcg->htmm_enabled)
++		goto normal_exec_file;
++	    
++	    pgdat = NODE_DATA(node);
++	    cur_nr_pages = get_nr_lru_pages_node(memcg, pgdat);
++	    max_nr_pages = memcg->nodeinfo[node]->max_nr_base_pages;
++
++	    if (max_nr_pages == ULONG_MAX)
++		goto normal_exec_file;
++	    else if (cur_nr_pages + HPAGE_PMD_NR <= max_nr_pages)
++		goto normal_exec_file;
++	    else {
++		result = SCAN_ALLOC_HUGE_PAGE_FAIL;
++		//ret = 1;
++		goto out;
++	    }
++	}
++normal_exec_file:
++	new_page = khugepaged_alloc_page(hpage, gfp, node);
++#else
+ 	new_page = khugepaged_alloc_page(hpage, gfp, node);
++#endif
+ 	if (!new_page) {
+ 		result = SCAN_ALLOC_HUGE_PAGE_FAIL;
+ 		goto out;
+@@ -1938,6 +2010,7 @@ static void collapse_file(struct mm_struct *mm,
+ 		*hpage = NULL;
+ 
+ 		khugepaged_pages_collapsed++;
++		ret = 2;
+ 	} else {
+ 		struct page *page;
+ 
+@@ -1985,9 +2058,10 @@ static void collapse_file(struct mm_struct *mm,
+ 	if (!IS_ERR_OR_NULL(*hpage))
+ 		mem_cgroup_uncharge(*hpage);
+ 	/* TODO: tracepoints */
++	return ret;
+ }
+ 
+-static void khugepaged_scan_file(struct mm_struct *mm,
++static int khugepaged_scan_file(struct mm_struct *mm,
+ 		struct file *file, pgoff_t start, struct page **hpage)
+ {
+ 	struct page *page = NULL;
+@@ -2056,14 +2130,15 @@ static void khugepaged_scan_file(struct mm_struct *mm,
+ 			result = SCAN_EXCEED_NONE_PTE;
+ 		} else {
+ 			node = khugepaged_find_target_node();
+-			collapse_file(mm, file, start, hpage, node);
++			return 1 + collapse_file(mm, file, start, hpage, node);
+ 		}
+ 	}
+ 
+ 	/* TODO: tracepoints */
++	return 1;
+ }
+ #else
+-static void khugepaged_scan_file(struct mm_struct *mm,
++static int khugepaged_scan_file(struct mm_struct *mm,
+ 		struct file *file, pgoff_t start, struct page **hpage)
+ {
+ 	BUILD_BUG();
+diff --git a/linux/mm/memcontrol.c b/linux/mm/memcontrol.c
+index 96cd7eae8..9ecdf68f6 100644
+--- a/linux/mm/memcontrol.c
++++ b/linux/mm/memcontrol.c
+@@ -67,6 +67,8 @@
+ #include <net/ip.h>
+ #include "slab.h"
+ 
++#include <linux/mempolicy.h>
++#include <linux/htmm.h>
+ #include <linux/uaccess.h>
+ 
+ #include <trace/events/vmscan.h>
+@@ -1297,7 +1299,7 @@ void mem_cgroup_update_lru_size(struct lruvec *lruvec, enum lru_list lru,
+ 	if (WARN_ONCE(size < 0,
+ 		"%s(%p, %d, %d): lru_size %ld\n",
+ 		__func__, lruvec, lru, nr_pages, size)) {
+-		VM_BUG_ON(1);
++		//VM_BUG_ON(1);
+ 		*lru_size = 0;
+ 	}
+ 
+@@ -5125,6 +5127,18 @@ static int alloc_mem_cgroup_per_node_info(struct mem_cgroup *memcg, int node)
+ 	pn->usage_in_excess = 0;
+ 	pn->on_tree = false;
+ 	pn->memcg = memcg;
++#ifdef CONFIG_HTMM /* alloc_mem_cgroup_per_node_info() */
++	pn->max_nr_base_pages = ULONG_MAX;
++	INIT_LIST_HEAD(&pn->kmigraterd_list);
++	pn->need_cooling = false;
++	pn->need_adjusting = false;
++	pn->need_adjusting_all = false;
++	pn->need_demotion = false;
++	spin_lock_init(&pn->deferred_split_queue.split_queue_lock);
++	INIT_LIST_HEAD(&pn->deferred_split_queue.split_queue);
++	INIT_LIST_HEAD(&pn->deferred_list);
++	pn->deferred_split_queue.split_queue_len = 0;
++#endif
+ 
+ 	memcg->nodeinfo[node] = pn;
+ 	return 0;
+@@ -5145,8 +5159,12 @@ static void __mem_cgroup_free(struct mem_cgroup *memcg)
+ {
+ 	int node;
+ 
+-	for_each_node(node)
++	for_each_node(node) {
++#ifdef CONFIG_HTMM
++		del_memcg_from_kmigraterd(memcg, node);
++#endif
+ 		free_mem_cgroup_per_node_info(memcg, node);
++	}
+ 	free_percpu(memcg->vmstats_percpu);
+ 	kfree(memcg);
+ }
+@@ -5214,6 +5232,43 @@ static struct mem_cgroup *mem_cgroup_alloc(void)
+ 	spin_lock_init(&memcg->deferred_split_queue.split_queue_lock);
+ 	INIT_LIST_HEAD(&memcg->deferred_split_queue.split_queue);
+ 	memcg->deferred_split_queue.split_queue_len = 0;
++#endif
++#ifdef CONFIG_HTMM /* mem_cgroup_alloc() */
++	memcg->htmm_enabled = false;
++	memcg->max_nr_dram_pages = ULONG_MAX;
++	memcg->nr_active_pages = 0;
++	memcg->nr_sampled = 0;
++	memcg->nr_dram_sampled = 0;
++	memcg->prev_dram_sampled = 0;
++	memcg->max_dram_sampled = 0;
++	memcg->prev_max_dram_sampled = 0;
++	memcg->nr_max_sampled = 0;
++	/* thresholds */
++	memcg->active_threshold = htmm_thres_hot;
++	memcg->warm_threshold = htmm_thres_hot;
++	memcg->bp_active_threshold = htmm_thres_hot;
++
++	/* split */
++	memcg->split_threshold = 21;
++	memcg->split_active_threshold = 16;
++	memcg->nr_split = 0;
++	memcg->nr_split_tail_idx = 0;
++	memcg->sum_util = 0;
++	memcg->num_util = 0;
++
++	for (i = 0; i < 21; i++)
++	    memcg->access_map[i] = 0;
++	for (i = 0; i < 16; i++) {
++	    memcg->hotness_hg[i] = 0;
++	    memcg->ebp_hotness_hg[i] = 0;
++	}
++
++	spin_lock_init(&memcg->access_lock);
++	memcg->cooled = false;
++	memcg->split_happen = false;
++	memcg->need_split = false;
++	memcg->cooling_clock = 0;
++	memcg->nr_alloc = 0;
+ #endif
+ 	idr_replace(&mem_cgroup_idr, memcg, memcg->id.id);
+ 	return memcg;
+@@ -6750,6 +6805,9 @@ int __mem_cgroup_charge(struct page *page, struct mm_struct *mm,
+ 
+ 	memcg = get_mem_cgroup_from_mm(mm);
+ 	ret = charge_memcg(page, memcg, gfp_mask);
++#ifdef CONFIG_HTMM
++	//charge_htmm_page(page, memcg);
++#endif
+ 	css_put(&memcg->css);
+ 
+ 	return ret;
+@@ -6932,7 +6990,9 @@ void __mem_cgroup_uncharge(struct page *page)
+ 	/* Don't touch page->lru of any random page, pre-check: */
+ 	if (!page_memcg(page))
+ 		return;
+-
++#ifdef CONFIG_HTMM
++	//uncharge_htmm_page(page, page_memcg(page));
++#endif
+ 	uncharge_gather_clear(&ug);
+ 	uncharge_page(page, &ug);
+ 	uncharge_batch(&ug);
+@@ -7509,3 +7569,238 @@ static int __init mem_cgroup_swap_init(void)
+ core_initcall(mem_cgroup_swap_init);
+ 
+ #endif /* CONFIG_MEMCG_SWAP */
++
++#ifdef CONFIG_HTMM /* memcg interfaces for htmm */
++static int memcg_htmm_show(struct seq_file *m, void *v)
++{
++    struct mem_cgroup *memcg = mem_cgroup_from_css(seq_css(m));
++
++    if (memcg->htmm_enabled)
++	seq_printf(m, "[enabled] disabled\n");
++    else
++	seq_printf(m, "enabled [disabled]\n");
++
++    return 0;
++}
++
++static ssize_t memcg_htmm_write(struct kernfs_open_file *of,
++	char *buf, size_t nbytes, loff_t off)
++{
++    struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
++    int nid;
++
++    if (sysfs_streq(buf, "enabled"))
++	memcg->htmm_enabled = true;
++    else if (sysfs_streq(buf, "disabled"))
++	memcg->htmm_enabled = false;
++    else
++	return -EINVAL;
++
++    if (memcg->htmm_enabled) {
++	kmigraterd_init();
++    } else {
++	kmigraterd_stop();
++    }
++    for_each_node_state(nid, N_MEMORY) {
++	struct pglist_data *pgdat = NODE_DATA(nid);
++	
++	if (memcg->htmm_enabled) {
++	    WRITE_ONCE(pgdat->kswapd_failures, MAX_RECLAIM_RETRIES);
++	    add_memcg_to_kmigraterd(memcg, nid);
++	} else {
++	    WRITE_ONCE(pgdat->kswapd_failures, 0);
++	    del_memcg_from_kmigraterd(memcg, nid);
++	}
++    }
++
++    return nbytes;
++}
++
++static struct cftype memcg_htmm_file[] = {
++    {
++	.name = "htmm_enabled",
++	.flags = CFTYPE_NOT_ON_ROOT,
++	.seq_show = memcg_htmm_show,
++	.write = memcg_htmm_write,
++    },
++    {}, /* terminate */
++};
++
++static int __init mem_cgroup_htmm_init(void)
++{
++    WARN_ON(cgroup_add_dfl_cftypes(&memory_cgrp_subsys,
++		memcg_htmm_file));
++    return 0;
++}
++subsys_initcall(mem_cgroup_htmm_init);
++
++static int memcg_access_map_show(struct seq_file *m, void *v)
++{
++    struct mem_cgroup *memcg = mem_cgroup_from_css(seq_css(m));
++    struct seq_buf s;
++    int i;
++
++    seq_buf_init(&s, kmalloc(PAGE_SIZE, GFP_KERNEL), PAGE_SIZE);
++    if (!s.buffer)
++	return 0;
++    for (i = 20; i > 15; i--) {
++	seq_buf_printf(&s, "skewness_idx_map[%2d]: %10lu\n", i, memcg->access_map[i]);
++    }
++
++    for (i = 15; i >= 0; i--) {
++	seq_buf_printf(&s, "skewness_idx_map[%2d]: %10lu  hotness_hg[%2d]: %10lu  ebp_hotness_hg[%2d]: %10lu\n",
++		i, memcg->access_map[i], i, memcg->hotness_hg[i], i, memcg->ebp_hotness_hg[i]);
++
++
++    }
++
++    seq_puts(m, s.buffer);
++    kfree(s.buffer);
++
++    return 0;
++}
++
++static struct cftype memcg_access_map_file[] = {
++    {
++	.name = "access_map",
++	.flags = CFTYPE_NOT_ON_ROOT,
++	.seq_show = memcg_access_map_show,
++    },
++    {},
++};
++
++static int __init mem_cgroup_access_map_init(void)
++{
++    WARN_ON(cgroup_add_dfl_cftypes(&memory_cgrp_subsys,
++		memcg_access_map_file));
++    return 0;
++}
++subsys_initcall(mem_cgroup_access_map_init);
++
++static int memcg_hotness_stat_show(struct seq_file *m, void *v)
++{
++    struct mem_cgroup *memcg = mem_cgroup_from_css(seq_css(m));
++    struct seq_buf s;
++    unsigned long hot = 0, warm = 0, cold = 0;
++    int i;
++
++    seq_buf_init(&s, kmalloc(PAGE_SIZE, GFP_KERNEL), PAGE_SIZE);
++    if (!s.buffer)
++	return 0;
++
++    for (i = 15; i >= 0; i--) {
++	if (i >= memcg->active_threshold)
++	    hot += memcg->hotness_hg[i];
++	else if (i >= memcg->warm_threshold)
++	    warm += memcg->hotness_hg[i];
++	else
++	    cold += memcg->hotness_hg[i];
++    }
++
++    seq_buf_printf(&s, "hot %lu warm %lu cold %lu\n", hot, warm, cold);
++
++    seq_puts(m, s.buffer);
++    kfree(s.buffer);
++    
++    return 0;
++}
++
++static struct cftype memcg_hotness_stat_file[] = {
++    {
++	.name = "hotness_stat",
++	.flags = CFTYPE_NOT_ON_ROOT,
++	.seq_show = memcg_hotness_stat_show,
++    },
++    {},
++};
++
++static int __init mem_cgroup_hotness_stat_init(void)
++{
++    WARN_ON(cgroup_add_dfl_cftypes(&memory_cgrp_subsys,
++		memcg_hotness_stat_file));
++    return 0;
++}
++subsys_initcall(mem_cgroup_hotness_stat_init);
++
++static int memcg_per_node_max_show(struct seq_file *m, void *v)
++{
++    struct mem_cgroup *memcg = mem_cgroup_from_css(seq_css(m));
++    struct cftype *cur_file = seq_cft(m);
++    int nid = cur_file->numa_node_id;
++    unsigned long max = READ_ONCE(memcg->nodeinfo[nid]->max_nr_base_pages);
++
++    if (max == ULONG_MAX)
++	seq_puts(m, "max\n");
++    else
++	seq_printf(m, "%llu\n", (u64)max * PAGE_SIZE);
++
++    return 0;
++}
++
++static ssize_t memcg_per_node_max_write(struct kernfs_open_file *of,
++	char *buf, size_t nbytes, loff_t off)
++{
++    struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
++    struct cftype *cur_file = of_cft(of);
++    int nid = cur_file->numa_node_id;
++    unsigned long max, nr_dram_pages = 0;
++    int err, n;
++
++    buf = strstrip(buf);
++    err = page_counter_memparse(buf, "max", &max);
++    if (err)
++	return err;
++
++    xchg(&memcg->nodeinfo[nid]->max_nr_base_pages, max);
++    
++    for_each_node_state(n, N_MEMORY) {
++	if (node_is_toptier(n)) {
++	    if (memcg->nodeinfo[n]->max_nr_base_pages != ULONG_MAX)
++		nr_dram_pages += memcg->nodeinfo[n]->max_nr_base_pages;
++	}
++    }
++    if (nr_dram_pages)
++	memcg->max_nr_dram_pages = nr_dram_pages;
++
++    return nbytes;
++}
++
++static int pgdat_memcg_htmm_init(struct pglist_data *pgdat)
++{
++    pgdat->memcg_htmm_file = kzalloc(sizeof(struct cftype) * 2, GFP_KERNEL);
++    if (!pgdat->memcg_htmm_file) {
++	printk("error: fails to allocate pgdat->memcg_htmm_file\n");
++	return -ENOMEM;
++    }
++#ifdef CONFIG_LOCKDEP
++    lockdep_register_key(&(pgdat->memcg_htmm_file->lockdep_key));
++#endif
++    return 0;
++}
++
++int mem_cgroup_per_node_htmm_init(void)
++{
++    int nid;
++
++    for_each_node_state(nid, N_MEMORY) {
++	struct pglist_data *pgdat = NODE_DATA(nid);
++
++	if (!pgdat || pgdat->memcg_htmm_file)
++	    continue;
++	if (pgdat_memcg_htmm_init(pgdat))
++	    continue;
++
++	snprintf(pgdat->memcg_htmm_file[0].name, MAX_CFTYPE_NAME,
++		"max_at_node%d", nid);
++	pgdat->memcg_htmm_file[0].flags = CFTYPE_NOT_ON_ROOT;
++	pgdat->memcg_htmm_file[0].seq_show = memcg_per_node_max_show;
++	pgdat->memcg_htmm_file[0].write = memcg_per_node_max_write;
++	pgdat->memcg_htmm_file[0].numa_node_id = nid;
++
++	WARN_ON(cgroup_add_dfl_cftypes(&memory_cgrp_subsys,
++		    pgdat->memcg_htmm_file));
++    }
++    return 0;
++}
++subsys_initcall(mem_cgroup_per_node_htmm_init);
++#endif /* CONFIG_HTMM */
+diff --git a/linux/mm/memory.c b/linux/mm/memory.c
+index c52be6d6b..35498be07 100644
+--- a/linux/mm/memory.c
++++ b/linux/mm/memory.c
+@@ -74,6 +74,10 @@
+ #include <linux/ptrace.h>
+ #include <linux/vmalloc.h>
+ 
++#ifdef CONFIG_HTMM
++#include <linux/htmm.h>
++#endif
++
+ #include <trace/events/kmem.h>
+ 
+ #include <asm/io.h>
+@@ -1358,6 +1362,9 @@ static unsigned long zap_pte_range(struct mmu_gather *tlb,
+ 				    likely(!(vma->vm_flags & VM_SEQ_READ)))
+ 					mark_page_accessed(page);
+ 			}
++#ifdef CONFIG_HTMM
++			uncharge_htmm_pte(pte, get_mem_cgroup_from_mm(vma->vm_mm));
++#endif
+ 			rss[mm_counter(page)]--;
+ 			page_remove_rmap(page, false);
+ 			if (unlikely(page_mapcount(page) < 0))
+@@ -3802,13 +3809,26 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 		put_page(page);
+ 		return handle_userfault(vmf, VM_UFFD_MISSING);
+ 	}
+-
++#ifdef CONFIG_HTMM
++	do {
++	    struct mem_cgroup *memcg = get_mem_cgroup_from_mm(vma->vm_mm);
++	    if (!memcg) {
++		ClearPageActive(page);
++	    }
++	} while (0);
++	if (page != NULL && node_is_toptier(page_to_nid(page)))
++	    count_vm_event(HTMM_ALLOC_DRAM);
++	else
++	    count_vm_event(HTMM_ALLOC_NVM);
++#endif
+ 	inc_mm_counter_fast(vma->vm_mm, MM_ANONPAGES);
+ 	page_add_new_anon_rmap(page, vma, vmf->address, false);
+ 	lru_cache_add_inactive_or_unevictable(page, vma);
+ setpte:
+ 	set_pte_at(vma->vm_mm, vmf->address, vmf->pte, entry);
+-
++#ifdef CONFIG_HTMM
++	set_page_coolstatus(page, vmf->pte, vma->vm_mm);
++#endif
+ 	/* No need to invalidate - it was non-present before */
+ 	update_mmu_cache(vma, vmf->address, vmf->pte);
+ unlock:
+diff --git a/linux/mm/memory_hotplug.c b/linux/mm/memory_hotplug.c
+index 9fd0be32a..bbaf3f553 100644
+--- a/linux/mm/memory_hotplug.c
++++ b/linux/mm/memory_hotplug.c
+@@ -37,6 +37,10 @@
+ #include <linux/compaction.h>
+ #include <linux/rmap.h>
+ 
++#ifdef CONFIG_HTMM /* include header */
++#include <linux/memcontrol.h>
++#endif
++
+ #include <asm/tlbflush.h>
+ 
+ #include "internal.h"
+@@ -1147,11 +1151,14 @@ int __ref online_pages(unsigned long pfn, unsigned long nr_pages,
+ 
+ 	kswapd_run(nid);
+ 	kcompactd_run(nid);
+-
+ 	writeback_set_ratelimit();
+ 
+ 	memory_notify(MEM_ONLINE, &arg);
+ 	mem_hotplug_done();
++#ifdef CONFIG_HTMM /* online_pages() */
++	mem_cgroup_per_node_htmm_init();
++#endif
++
+ 	return 0;
+ 
+ failed_addition:
+diff --git a/linux/mm/mempolicy.c b/linux/mm/mempolicy.c
+index fa9ed9c98..3630fe9b4 100644
+--- a/linux/mm/mempolicy.c
++++ b/linux/mm/mempolicy.c
+@@ -102,6 +102,9 @@
+ #include <linux/mmu_notifier.h>
+ #include <linux/printk.h>
+ #include <linux/swapops.h>
++#ifdef CONFIG_HTMM
++#include <linux/htmm.h>
++#endif
+ 
+ #include <asm/tlbflush.h>
+ #include <linux/uaccess.h>
+@@ -2101,6 +2104,54 @@ struct page *alloc_pages_vma(gfp_t gfp, int order, struct vm_area_struct *vma,
+ 		goto out;
+ 	}
+ 
++#ifdef CONFIG_HTMM /* alloc_pages_vma() */
++	if (vma->vm_mm && vma->vm_mm->htmm_enabled) {
++	    struct task_struct *p = current;
++	    struct mem_cgroup *memcg = mem_cgroup_from_task(p);
++	    unsigned long max_nr_pages;
++	    int nid = pol->mode == MPOL_PREFERRED ? first_node(pol->nodes) : node;
++	    int orig_nid = nid;
++	    unsigned int nr_pages = 1U << order;
++	    pg_data_t *pgdat = NODE_DATA(nid);
++	    
++	    if (!memcg || !memcg->htmm_enabled)
++		goto use_default_pol;
++
++	    max_nr_pages = READ_ONCE(memcg->nodeinfo[nid]->max_nr_base_pages);
++	    if (max_nr_pages == ULONG_MAX)
++		goto use_default_pol;
++
++	    while (max_nr_pages <= (get_nr_lru_pages_node(memcg, pgdat) + nr_pages)) {
++		if (htmm_cxl_mode) {
++		    nid = 1;
++		    break;
++		}
++		if ((nid = next_demotion_node(nid)) == NUMA_NO_NODE) {
++		    nid = first_memory_node;
++		    break;
++		}
++		max_nr_pages = READ_ONCE(memcg->nodeinfo[nid]->max_nr_base_pages);
++		pgdat = NODE_DATA(nid);
++	    }
++
++	    //nid = orig_nid;
++
++	    if (orig_nid != nid) {
++		WRITE_ONCE(memcg->nodeinfo[orig_nid]->need_demotion, true);
++		kmigraterd_wakeup(orig_nid);
++	    }
++	    else if (max_nr_pages <= (get_nr_lru_pages_node(memcg, pgdat) +
++			get_memcg_demotion_watermark(max_nr_pages))) {
++		WRITE_ONCE(memcg->nodeinfo[nid]->need_demotion, true);
++		kmigraterd_wakeup(nid);
++	    }
++	    
++	    mpol_cond_put(pol);
++	    page = __alloc_pages_node(nid, gfp | __GFP_THISNODE, order);
++	    goto out;
++	}
++use_default_pol:
++#endif
+ 	if (pol->mode == MPOL_PREFERRED_MANY) {
+ 		page = alloc_pages_preferred_many(gfp, order, node, pol);
+ 		mpol_cond_put(pol);
+@@ -2976,6 +3027,27 @@ void mpol_to_str(char *buffer, int maxlen, struct mempolicy *pol)
+ }
+ 
+ bool numa_demotion_enabled = false;
++#ifdef CONFIG_HTMM /* sysfs htmm */
++unsigned int htmm_sample_period = 199;
++unsigned int htmm_inst_sample_period = 100007;
++unsigned int htmm_thres_hot = 1;
++unsigned int htmm_cooling_period = 2000000;
++unsigned int htmm_adaptation_period = 100000;
++unsigned int htmm_split_period = 2; /* used to shift the wss of memcg */
++unsigned int ksampled_min_sample_ratio = 50; // 50%
++unsigned int ksampled_max_sample_ratio = 10; // 10%
++unsigned int htmm_demotion_period_in_ms = 500;
++unsigned int htmm_promotion_period_in_ms = 500;
++unsigned int htmm_thres_split = 2; 
++unsigned int htmm_nowarm = 0; // enabled: 0, disabled: 1
++unsigned int htmm_util_weight = 10; // no impact (unused)
++unsigned int htmm_mode = 1;
++unsigned int htmm_gamma = 4; /* 0.4; divide this by 10 */
++bool htmm_cxl_mode = false;
++bool htmm_skip_cooling = true;
++unsigned int htmm_thres_cooling_alloc = 256 * 1024 * 10; // unit: 4KiB, default: 10GB
++unsigned int ksampled_soft_cpu_quota = 30; // 3 %
++#endif
+ 
+ #ifdef CONFIG_SYSFS
+ static ssize_t numa_demotion_enabled_show(struct kobject *kobj,
+@@ -3034,4 +3106,554 @@ static int __init numa_init_sysfs(void)
+ 	return err;
+ }
+ subsys_initcall(numa_init_sysfs);
++#ifdef CONFIG_HTMM
++static ssize_t htmm_sample_period_show(struct kobject *kobj,
++				   struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", htmm_sample_period);
++}
++
++static ssize_t htmm_sample_period_store(struct kobject *kobj,
++				    struct kobj_attribute *attr,
++				    const char *buf, size_t count)
++{
++	int err;
++	unsigned int period;
++
++	err = kstrtouint(buf, 10, &period);
++	if (err)
++		return err;
++
++	WRITE_ONCE(htmm_sample_period, period);
++	return count;
++}
++
++static struct kobj_attribute htmm_sample_period_attr =
++	__ATTR(htmm_sample_period, 0644, htmm_sample_period_show,
++	       htmm_sample_period_store);
++
++static ssize_t htmm_inst_sample_period_show(struct kobject *kobj,
++				   struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", htmm_inst_sample_period);
++}
++
++static ssize_t htmm_inst_sample_period_store(struct kobject *kobj,
++				    struct kobj_attribute *attr,
++				    const char *buf, size_t count)
++{
++	int err;
++	unsigned int period;
++
++	err = kstrtouint(buf, 10, &period);
++	if (err)
++		return err;
++
++	WRITE_ONCE(htmm_inst_sample_period, period);
++	return count;
++}
++
++static struct kobj_attribute htmm_inst_sample_period_attr =
++	__ATTR(htmm_inst_sample_period, 0644, htmm_inst_sample_period_show,
++	       htmm_inst_sample_period_store);
++
++static ssize_t htmm_split_period_show(struct kobject *kobj,
++				   struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", htmm_split_period);
++}
++
++static ssize_t htmm_split_period_store(struct kobject *kobj,
++				    struct kobj_attribute *attr,
++				    const char *buf, size_t count)
++{
++	int err;
++	unsigned int thres;
++
++	err = kstrtouint(buf, 10, &thres);
++	if (err)
++		return err;
++
++	WRITE_ONCE(htmm_split_period, thres);
++	return count;
++}
++
++static struct kobj_attribute htmm_split_period_attr =
++	__ATTR(htmm_split_period, 0644, htmm_split_period_show,
++	       htmm_split_period_store);
++
++
++static ssize_t htmm_thres_hot_show(struct kobject *kobj,
++				   struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", htmm_thres_hot);
++}
++
++static ssize_t htmm_thres_hot_store(struct kobject *kobj,
++				    struct kobj_attribute *attr,
++				    const char *buf, size_t count)
++{
++	int err;
++	unsigned int thres;
++
++	err = kstrtouint(buf, 10, &thres);
++	if (err)
++		return err;
++
++	WRITE_ONCE(htmm_thres_hot, thres);
++	return count;
++}
++
++static struct kobj_attribute htmm_thres_hot_attr =
++	__ATTR(htmm_thres_hot, 0644, htmm_thres_hot_show,
++	       htmm_thres_hot_store);
++
++static ssize_t htmm_cooling_period_show(struct kobject *kobj,
++				    struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", htmm_cooling_period);
++}
++
++static ssize_t htmm_cooling_period_store(struct kobject *kobj,
++				     struct kobj_attribute *attr,
++				     const char *buf, size_t count)
++{
++	int err;
++	unsigned int period;
++
++	err = kstrtouint(buf, 10, &period);
++	if (err)
++		return err;
++
++	WRITE_ONCE(htmm_cooling_period, period);
++	return count;
++}
++
++static struct kobj_attribute htmm_cooling_period_attr =
++	__ATTR(htmm_cooling_period, 0644, htmm_cooling_period_show,
++	       htmm_cooling_period_store);
++
++static ssize_t ksampled_min_sample_ratio_show(struct kobject *kobj,
++				    struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", ksampled_min_sample_ratio);
++}
++
++static ssize_t ksampled_min_sample_ratio_store(struct kobject *kobj,
++				     struct kobj_attribute *attr,
++				     const char *buf, size_t count)
++{
++	int err;
++	unsigned int interval;
++
++	err = kstrtouint(buf, 10, &interval);
++	if (err)
++		return err;
++
++	WRITE_ONCE(ksampled_min_sample_ratio, interval);
++	return count;
++}
++
++static struct kobj_attribute ksampled_min_sample_ratio_attr =
++	__ATTR(ksampled_min_sample_ratio, 0644, ksampled_min_sample_ratio_show,
++	       ksampled_min_sample_ratio_store);
++
++static ssize_t ksampled_max_sample_ratio_show(struct kobject *kobj,
++				    struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", ksampled_max_sample_ratio);
++}
++
++static ssize_t ksampled_max_sample_ratio_store(struct kobject *kobj,
++				     struct kobj_attribute *attr,
++				     const char *buf, size_t count)
++{
++	int err;
++	unsigned int interval;
++
++	err = kstrtouint(buf, 10, &interval);
++	if (err)
++		return err;
++
++	WRITE_ONCE(ksampled_max_sample_ratio, interval);
++	return count;
++}
++
++static struct kobj_attribute ksampled_max_sample_ratio_attr =
++	__ATTR(ksampled_max_sample_ratio, 0644, ksampled_max_sample_ratio_show,
++	       ksampled_max_sample_ratio_store);
++
++static ssize_t htmm_demotion_period_show(struct kobject *kobj,
++				   struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", htmm_demotion_period_in_ms);
++}
++
++static ssize_t htmm_demotion_period_store(struct kobject *kobj,
++				    struct kobj_attribute *attr,
++				    const char *buf, size_t count)
++{
++	int err;
++	unsigned int thres;
++
++	err = kstrtouint(buf, 10, &thres);
++	if (err)
++		return err;
++
++	WRITE_ONCE(htmm_demotion_period_in_ms, thres);
++	return count;
++}
++
++static struct kobj_attribute htmm_demotion_period_attr =
++	__ATTR(htmm_demotion_period_in_ms, 0644, htmm_demotion_period_show,
++	       htmm_demotion_period_store);
++
++static ssize_t htmm_promotion_period_show(struct kobject *kobj,
++				   struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", htmm_promotion_period_in_ms);
++}
++
++static ssize_t htmm_promotion_period_store(struct kobject *kobj,
++				    struct kobj_attribute *attr,
++				    const char *buf, size_t count)
++{
++	int err;
++	unsigned int thres;
++
++	err = kstrtouint(buf, 10, &thres);
++	if (err)
++		return err;
++
++	WRITE_ONCE(htmm_promotion_period_in_ms, thres);
++	return count;
++}
++
++static struct kobj_attribute htmm_promotion_period_attr =
++	__ATTR(htmm_promotion_period_in_ms, 0644, htmm_promotion_period_show,
++	       htmm_promotion_period_store);
++
++static ssize_t ksampled_soft_cpu_quota_show(struct kobject *kobj,
++				   struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", ksampled_soft_cpu_quota);
++}
++
++static ssize_t ksampled_soft_cpu_quota_store(struct kobject *kobj,
++				    struct kobj_attribute *attr,
++				    const char *buf, size_t count)
++{
++	int err;
++	unsigned int sp_count;
++
++	err = kstrtouint(buf, 10, &sp_count);
++	if (err)
++		return err;
++
++	WRITE_ONCE(ksampled_soft_cpu_quota, sp_count);
++	return count;
++}
++
++static struct kobj_attribute ksampled_soft_cpu_quota_attr =
++	__ATTR(ksampled_soft_cpu_quota, 0644, ksampled_soft_cpu_quota_show,
++	       ksampled_soft_cpu_quota_store);
++
++static ssize_t htmm_thres_split_show(struct kobject *kobj,
++				   struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", htmm_thres_split);
++}
++
++static ssize_t htmm_thres_split_store(struct kobject *kobj,
++				    struct kobj_attribute *attr,
++				    const char *buf, size_t count)
++{
++	int err;
++	unsigned int thres;
++
++	err = kstrtouint(buf, 10, &thres);
++	if (err)
++		return err;
++
++	WRITE_ONCE(htmm_thres_split, thres);
++	return count;
++}
++
++static struct kobj_attribute htmm_thres_split_attr =
++	__ATTR(htmm_thres_split, 0644, htmm_thres_split_show,
++	       htmm_thres_split_store);
++
++static ssize_t htmm_nowarm_show(struct kobject *kobj,
++				   struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", htmm_nowarm);
++}
++
++static ssize_t htmm_nowarm_store(struct kobject *kobj,
++				    struct kobj_attribute *attr,
++				    const char *buf, size_t count)
++{
++	int err;
++	unsigned int thres;
++
++	err = kstrtouint(buf, 10, &thres);
++	if (err)
++		return err;
++
++	WRITE_ONCE(htmm_nowarm, thres);
++	return count;
++}
++
++static struct kobj_attribute htmm_nowarm_attr =
++	__ATTR(htmm_nowarm, 0644, htmm_nowarm_show,
++	       htmm_nowarm_store);
++
++static ssize_t htmm_adaptation_period_show(struct kobject *kobj,
++				   struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", htmm_adaptation_period);
++}
++
++static ssize_t htmm_adaptation_period_store(struct kobject *kobj,
++				    struct kobj_attribute *attr,
++				    const char *buf, size_t count)
++{
++	int err;
++	unsigned int period;
++
++	err = kstrtouint(buf, 10, &period);
++	if (err)
++		return err;
++
++	WRITE_ONCE(htmm_adaptation_period, period);
++	return count;
++}
++
++static struct kobj_attribute htmm_adaptation_period_attr =
++	__ATTR(htmm_adaptation_period, 0644, htmm_adaptation_period_show,
++	       htmm_adaptation_period_store);
++
++static ssize_t htmm_util_weight_show(struct kobject *kobj,
++				   struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", htmm_util_weight);
++}
++
++static ssize_t htmm_util_weight_store(struct kobject *kobj,
++				    struct kobj_attribute *attr,
++				    const char *buf, size_t count)
++{
++	int err;
++	unsigned int util_w;
++
++	err = kstrtouint(buf, 10, &util_w);
++	if (err)
++		return err;
++
++	WRITE_ONCE(htmm_util_weight, util_w);
++	return count;
++}
++
++static struct kobj_attribute htmm_util_weight_attr =
++	__ATTR(htmm_util_weight, 0644, htmm_util_weight_show,
++	       htmm_util_weight_store);
++
++static ssize_t htmm_gamma_show(struct kobject *kobj,
++			       struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", htmm_gamma);
++}
++
++static ssize_t htmm_gamma_store(struct kobject *kobj,
++				struct kobj_attribute *attr,
++				const char *buf, size_t count)
++{
++	int err;
++	unsigned int g;
++
++	err = kstrtouint(buf, 10, &g);
++	if (err)
++		return err;
++
++	WRITE_ONCE(htmm_gamma, g);
++	return count;
++}
++
++static struct kobj_attribute htmm_gamma_attr =
++	__ATTR(htmm_gamma, 0644, htmm_gamma_show,
++	       htmm_gamma_store);
++
++
++static ssize_t htmm_cxl_mode_show(struct kobject *kobj,
++				  struct kobj_attribute *attr, char *buf)
++{
++	if (htmm_cxl_mode)
++	    return sysfs_emit(buf, "CXL-emulated: %s\n", "[enabled] disabled");
++	else
++	    return sysfs_emit(buf, "CXL-emulated: %s\n", "enabled [disabled]");
++}
++
++static ssize_t htmm_cxl_mode_store(struct kobject *kobj,
++				   struct kobj_attribute *attr,
++				   const char *buf, size_t count)
++{
++    if (sysfs_streq(buf, "enabled"))
++	htmm_cxl_mode = true;
++    else if (sysfs_streq(buf, "disabled"))
++	htmm_cxl_mode = false;
++    else
++	return -EINVAL;
++
++    return count;
++}
++
++static struct kobj_attribute htmm_cxl_mode_attr = 
++	__ATTR(htmm_cxl_mode, 0644, htmm_cxl_mode_show,
++	       htmm_cxl_mode_store);
++
++static ssize_t htmm_mode_show(struct kobject *kobj,
++			      struct kobj_attribute *attr, char *buf)
++{
++	if (htmm_mode == HTMM_NO_MIG)
++		return sysfs_emit(buf, "%s\n", "[NO MIG-0], BASELINE-1, HUGEPAGE_OPT-2, HUGEPAGE_OPT_V2-3");
++	else if (htmm_mode == HTMM_BASELINE)
++		return sysfs_emit(buf, "%s\n", "NO MIG-0, [BASELINE-1], HUGEPAGE_OPT-2, HUGEPAGE_OPT_V2");
++	else if (htmm_mode == HTMM_HUGEPAGE_OPT)
++		return sysfs_emit(buf, "%s\n", "NO MIG-0, BASELINE-1, [HUGEPAGE_OPT-2], HUGEPAGE_OPT_V2-3");
++	else /* htmm_mode == HTMM_HUGEPAGE_OPT_V2 */
++		return sysfs_emit(buf, "%s\n", "NO MIG-0, BASELINE-1, HUGEPAGE_OPT-2, [HUGEPAGE_OPT_V2]");
++}
++
++static ssize_t htmm_mode_store(struct kobject *kobj,
++			       struct kobj_attribute *attr,
++			       const char *buf, size_t count)
++{
++	int err;
++	unsigned int mode;
++
++	err = kstrtouint(buf, 10, &mode);
++	if (err)
++		return err;
++
++	switch (mode) {
++		case HTMM_NO_MIG:
++		case HTMM_BASELINE:
++		case HTMM_HUGEPAGE_OPT:
++		case HTMM_HUGEPAGE_OPT_V2:
++			WRITE_ONCE(htmm_mode, mode);
++			break;
++		default:
++			return -EINVAL;
++	}
++	return count;
++}
++
++static struct kobj_attribute htmm_mode_attr =
++	__ATTR(htmm_mode, 0644, htmm_mode_show,
++	       htmm_mode_store);
++/* sysfs related to newly allocated pages */
++static ssize_t htmm_skip_cooling_show(struct kobject *kobj,
++	struct kobj_attribute *attr, char *buf)
++{
++	if (htmm_skip_cooling)
++	    return sysfs_emit(buf, "[enabled] disabled\n");
++	else
++	    return sysfs_emit(buf, "enabled [disabled]\n");
++}
++
++static ssize_t htmm_skip_cooling_store(struct kobject *kobj,
++	struct kobj_attribute *attr,
++	const char *buf, size_t count)
++{
++    if (sysfs_streq(buf, "enabled"))
++	htmm_skip_cooling = true;
++    else if (sysfs_streq(buf, "disabled"))
++	htmm_skip_cooling= false;
++    else
++	return -EINVAL;
++
++    return count;
++}
++
++static struct kobj_attribute htmm_skip_cooling_attr =
++	__ATTR(htmm_skip_cooling, 0644, htmm_skip_cooling_show,
++	       htmm_skip_cooling_store);
++
++static ssize_t htmm_thres_cooling_alloc_show(struct kobject *kobj,
++	struct kobj_attribute *attr, char *buf)
++{
++        return sysfs_emit(buf, "%u\n", htmm_thres_cooling_alloc);
++}
++
++static ssize_t htmm_thres_cooling_alloc_store(struct kobject *kobj,
++	struct kobj_attribute *attr,
++	const char *buf, size_t count)
++{
++	int err;
++	unsigned int thres;
++
++	err = kstrtouint(buf, 10, &thres);
++	if (err)
++		return err;
++
++	WRITE_ONCE(htmm_thres_cooling_alloc, thres);
++	return count;
++}
++
++static struct kobj_attribute htmm_thres_cooling_alloc_attr =
++	__ATTR(htmm_thres_cooling_alloc, 0644, htmm_thres_cooling_alloc_show,
++	       htmm_thres_cooling_alloc_store);
++
++
++
++static struct attribute *htmm_attrs[] = {
++	&htmm_sample_period_attr.attr,
++	&htmm_inst_sample_period_attr.attr,
++	&htmm_split_period_attr.attr,
++	&htmm_thres_hot_attr.attr,
++	&htmm_cooling_period_attr.attr,
++	&htmm_adaptation_period_attr.attr,
++	&ksampled_min_sample_ratio_attr.attr,
++	&ksampled_max_sample_ratio_attr.attr,
++	&htmm_demotion_period_attr.attr,
++	&htmm_promotion_period_attr.attr,
++	&ksampled_soft_cpu_quota_attr.attr,
++	&htmm_thres_split_attr.attr,
++	&htmm_nowarm_attr.attr,
++	&htmm_util_weight_attr.attr,
++	&htmm_mode_attr.attr,
++	&htmm_gamma_attr.attr,
++	&htmm_cxl_mode_attr.attr,
++	&htmm_skip_cooling_attr.attr,
++	&htmm_thres_cooling_alloc_attr.attr,
++	NULL,
++};
++
++static const struct attribute_group htmm_attr_group = {
++	.attrs = htmm_attrs,
++};
++
++static int __init htmm_init_sysfs(void)
++{
++	int err;
++	struct kobject *htmm_kobj;
++
++    	htmm_kobj = kobject_create_and_add("htmm", mm_kobj);
++	if (!htmm_kobj) {
++		pr_err("failed to create htmm kobject\n");
++		return -ENOMEM;
++	}
++	err = sysfs_create_group(htmm_kobj, &htmm_attr_group);
++	if (err) {
++		pr_err("failed to register numa group\n");
++		goto delete_obj;
++	}
++	return 0;
++
++delete_obj:
++	kobject_put(htmm_kobj);
++	return err;
++}
++subsys_initcall(htmm_init_sysfs);
++#endif /* CONFIG_HTMM */
+ #endif
+diff --git a/linux/mm/migrate.c b/linux/mm/migrate.c
+index 1852d787e..11591b057 100644
+--- a/linux/mm/migrate.c
++++ b/linux/mm/migrate.c
+@@ -50,6 +50,7 @@
+ #include <linux/ptrace.h>
+ #include <linux/oom.h>
+ #include <linux/memory.h>
++#include <linux/htmm.h>
+ 
+ #include <asm/tlbflush.h>
+ 
+@@ -169,14 +170,79 @@ void putback_movable_pages(struct list_head *l)
+ 	}
+ }
+ 
++#ifdef CONFIG_HTMM
++
++static bool try_to_unmap_clean(struct page_vma_mapped_walk *pvmw, struct page *page)
++{
++    void *addr;
++    bool dirty;
++    pte_t newpte;
++    pginfo_t *pginfo;
++
++    VM_BUG_ON_PAGE(PageCompound(page), page);
++    VM_BUG_ON_PAGE(!PageAnon(page), page);
++    VM_BUG_ON_PAGE(!PageLocked(page), page);
++    VM_BUG_ON_PAGE(pte_present(*pvmw->pte), page);
++
++    if (PageMlocked(page) || (pvmw->vma->vm_flags & VM_LOCKED))
++	return false;
++
++    /* accessed ptes --> no zeroed pages */
++    pginfo = get_pginfo_from_pte(pvmw->pte);
++    if (!pginfo)
++	return false;
++    if (pginfo->nr_accesses > 0)
++	return false;
++
++    /*
++     * The pmd entry mapping the old thp was flushed and the pte mapping
++     * this subpage has been non present. Therefore, this subpage is
++     * inaccessible. We don't need to remap it if it contains only zeros.
++     */
++    addr = kmap_local_page(page);
++    dirty = memchr_inv(addr, 0, PAGE_SIZE);
++    kunmap_local(addr);
++
++    if (dirty)
++	return false;
++
++    pte_clear_not_present_full(pvmw->vma->vm_mm, pvmw->address, pvmw->pte, false);
++
++    if (userfaultfd_armed(pvmw->vma)) {
++	newpte = pte_mkspecial(pfn_pte(page_to_pfn(ZERO_PAGE(pvmw->address)),
++		    pvmw->vma->vm_page_prot));
++	ptep_clear_flush(pvmw->vma, pvmw->address, pvmw->pte);
++	set_pte_at(pvmw->vma->vm_mm, pvmw->address, pvmw->pte, newpte);
++	dec_mm_counter(pvmw->vma->vm_mm, MM_ANONPAGES);
++	return true;
++    }
++
++    dec_mm_counter(pvmw->vma->vm_mm, mm_counter(page));
++    return true;
++}
++
++
++struct rmap_walk_arg {
++    void *arg;
++    bool unmap_clean;   
++};
++#endif
++
+ /*
+  * Restore a potential migration pte to a working pte entry
+  */
+ static bool remove_migration_pte(struct page *page, struct vm_area_struct *vma,
+ 				 unsigned long addr, void *old)
+ {
++#ifdef CONFIG_HTMM
++	struct rmap_walk_arg *rmap_walk_arg = old;
++#endif
+ 	struct page_vma_mapped_walk pvmw = {
++#ifdef CONFIG_HTMM
++		.page = rmap_walk_arg->arg,
++#else
+ 		.page = old,
++#endif
+ 		.vma = vma,
+ 		.address = addr,
+ 		.flags = PVMW_SYNC | PVMW_MIGRATION,
+@@ -201,7 +267,10 @@ static bool remove_migration_pte(struct page *page, struct vm_area_struct *vma,
+ 			continue;
+ 		}
+ #endif
+-
++#ifdef CONFIG_HTMM
++		if (rmap_walk_arg->unmap_clean && try_to_unmap_clean(&pvmw, new))
++		    continue;
++#endif
+ 		get_page(new);
+ 		pte = pte_mkold(mk_pte(new, READ_ONCE(vma->vm_page_prot)));
+ 		if (pte_swp_soft_dirty(*pvmw.pte))
+@@ -251,6 +320,28 @@ static bool remove_migration_pte(struct page *page, struct vm_area_struct *vma,
+ 			else
+ 				page_add_file_rmap(new, false);
+ 		}
++#ifdef CONFIG_HTMM /* remove_migration_pte() */
++		{
++
++			struct mem_cgroup *memcg = page_memcg(pvmw.page);
++			struct page *pte_page;
++			pginfo_t *pginfo;
++
++			if (!memcg || !memcg->htmm_enabled)
++			    goto out_cooling_check;
++
++			pte_page = virt_to_page((unsigned long)pvmw.pte);
++			if (!PageHtmm(pte_page))
++			    goto out_cooling_check;
++			
++			pginfo = get_pginfo_from_pte(pvmw.pte);
++			if (!pginfo)
++			    goto out_cooling_check;
++
++			check_base_cooling(pginfo, new, true);
++		}
++out_cooling_check:
++#endif
+ 		if (vma->vm_flags & VM_LOCKED && !PageTransCompound(new))
+ 			mlock_vma_page(new);
+ 
+@@ -268,11 +359,22 @@ static bool remove_migration_pte(struct page *page, struct vm_area_struct *vma,
+  * Get rid of all migration entries and replace them by
+  * references to the indicated page.
+  */
+-void remove_migration_ptes(struct page *old, struct page *new, bool locked)
++void remove_migration_ptes(struct page *old, struct page *new, bool locked,
++			    bool unmap_clean)
+ {
++#ifdef CONFIG_HTMM
++	struct rmap_walk_arg rmap_walk_arg = {
++		.arg = old,
++		.unmap_clean = unmap_clean,
++	};
++#endif
+ 	struct rmap_walk_control rwc = {
+ 		.rmap_one = remove_migration_pte,
++#ifdef CONFIG_HTMM
++		.arg = &rmap_walk_arg,
++#else
+ 		.arg = old,
++#endif
+ 	};
+ 
+ 	if (locked)
+@@ -607,6 +709,10 @@ void migrate_page_states(struct page *newpage, struct page *page)
+ 		SetPageReadahead(newpage);
+ 
+ 	copy_page_owner(page, newpage);
++#ifdef CONFIG_HTMM
++	if (PageTransHuge(page))
++	    copy_transhuge_pginfo(page, newpage);
++#endif
+ 
+ 	if (!PageHuge(page))
+ 		mem_cgroup_migrate(page, newpage);
+@@ -828,7 +934,7 @@ static int writeout(struct address_space *mapping, struct page *page)
+ 	 * At this point we know that the migration attempt cannot
+ 	 * be successful.
+ 	 */
+-	remove_migration_ptes(page, page, false);
++	remove_migration_ptes(page, page, false, false);
+ 
+ 	rc = mapping->a_ops->writepage(page, &wbc);
+ 
+@@ -1071,7 +1177,7 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
+ 
+ 	if (page_was_mapped)
+ 		remove_migration_ptes(page,
+-			rc == MIGRATEPAGE_SUCCESS ? newpage : page, false);
++			rc == MIGRATEPAGE_SUCCESS ? newpage : page, false, false);
+ 
+ out_unlock_both:
+ 	unlock_page(newpage);
+@@ -1145,6 +1251,9 @@ static int __unmap_and_move(struct page *page, struct page *newpage,
+ static int node_demotion[MAX_NUMNODES] __read_mostly =
+ 	{[0 ...  MAX_NUMNODES - 1] = NUMA_NO_NODE};
+ 
++static int node_promotion[MAX_NUMNODES] __read_mostly =
++	{[0 ...  MAX_NUMNODES - 1] = NUMA_NO_NODE};
++
+ /**
+  * next_demotion_node() - Get the next node in the demotion path
+  * @node: The starting node to lookup the next node
+@@ -1174,6 +1283,17 @@ int next_demotion_node(int node)
+ 	return target;
+ }
+ 
++/* can be used when CONFIG_HTMM is set */
++int next_promotion_node(int node)
++{
++    int target;
++
++    rcu_read_lock();
++    target = READ_ONCE(node_promotion[node]);
++    rcu_read_unlock();
++
++    return target;
++}
+ /*
+  * Obtain the lock on page, remove all ptes and migrate the page
+  * to the newly allocated page in newpage.
+@@ -1367,7 +1487,7 @@ static int unmap_and_move_huge_page(new_page_t get_new_page,
+ 
+ 	if (page_was_mapped)
+ 		remove_migration_ptes(hpage,
+-			rc == MIGRATEPAGE_SUCCESS ? new_hpage : hpage, false);
++			rc == MIGRATEPAGE_SUCCESS ? new_hpage : hpage, false, false);
+ 
+ unlock_put_anon:
+ 	unlock_page(new_hpage);
+@@ -2668,7 +2788,7 @@ static void migrate_vma_unmap(struct migrate_vma *migrate)
+ 		if (!page || (migrate->src[i] & MIGRATE_PFN_MIGRATE))
+ 			continue;
+ 
+-		remove_migration_ptes(page, page, false);
++		remove_migration_ptes(page, page, false, false);
+ 
+ 		migrate->src[i] = 0;
+ 		unlock_page(page);
+@@ -3046,7 +3166,7 @@ void migrate_vma_finalize(struct migrate_vma *migrate)
+ 			newpage = page;
+ 		}
+ 
+-		remove_migration_ptes(page, newpage, false);
++		remove_migration_ptes(page, newpage, false, false);
+ 		unlock_page(page);
+ 
+ 		if (is_zone_device_page(page))
+@@ -3072,8 +3192,10 @@ static void __disable_all_migrate_targets(void)
+ {
+ 	int node;
+ 
+-	for_each_online_node(node)
++	for_each_online_node(node) {
+ 		node_demotion[node] = NUMA_NO_NODE;
++		node_promotion[node] = NUMA_NO_NODE;
++	}
+ }
+ 
+ static void disable_all_migrate_targets(void)
+@@ -3120,6 +3242,7 @@ static int establish_migrate_target(int node, nodemask_t *used)
+ 		return NUMA_NO_NODE;
+ 
+ 	node_demotion[node] = migration_target;
++	node_promotion[migration_target] = node;
+ 
+ 	return migration_target;
+ }
+diff --git a/linux/mm/page_alloc.c b/linux/mm/page_alloc.c
+index 7773bae3b..9c4c5ba70 100644
+--- a/linux/mm/page_alloc.c
++++ b/linux/mm/page_alloc.c
+@@ -1239,6 +1239,14 @@ static int free_tail_pages_check(struct page *head_page, struct page *page)
+ 		 */
+ 		break;
+ 	default:
++#ifdef CONFIG_HTMM
++		/* from the third tail page ~  */
++		if (page - head_page < 132) {
++		    ClearPageHtmm(page);
++		    page->mapping = TAIL_MAPPING;
++		    break;
++		}
++#endif
+ 		if (page->mapping != TAIL_MAPPING) {
+ 			bad_page(page, "corrupted mapping in tail page");
+ 			goto out;
+@@ -7407,6 +7415,11 @@ static void __meminit pgdat_init_internals(struct pglist_data *pgdat)
+ 
+ 	pgdat_page_ext_init(pgdat);
+ 	lruvec_init(&pgdat->__lruvec);
++#ifdef CONFIG_HTMM /* pgdat_init_internals() */
++	pgdat->memcg_htmm_file = NULL;
++	spin_lock_init(&pgdat->kmigraterd_lock);
++	INIT_LIST_HEAD(&pgdat->kmigraterd_head);
++#endif
+ }
+ 
+ static void __meminit zone_init_internals(struct zone *zone, enum zone_type idx, int nid,
+diff --git a/linux/mm/rmap.c b/linux/mm/rmap.c
+index 6aebd1747..88685fe28 100644
+--- a/linux/mm/rmap.c
++++ b/linux/mm/rmap.c
+@@ -74,6 +74,10 @@
+ #include <linux/memremap.h>
+ #include <linux/userfaultfd_k.h>
+ 
++#ifdef CONFIG_HTMM
++#include <linux/random.h>
++#include <linux/htmm.h>
++#endif
+ #include <asm/tlbflush.h>
+ 
+ #include <trace/events/tlb.h>
+@@ -899,6 +903,233 @@ int page_referenced(struct page *page,
+ 	return pra.referenced;
+ }
+ 
++#ifdef CONFIG_HTMM
++struct htmm_cooling_arg {
++    /*
++     * page_is_hot: 0 --> already cooled.
++     * page_is_hot: 1 --> cold after cooling
++     * page_is_hot: 2 --> hot after cooling
++     */
++    int page_is_hot;
++    struct mem_cgroup *memcg;
++};
++
++static bool cooling_page_one(struct page *page, struct vm_area_struct *vma,
++	unsigned long address, void *arg)
++{
++    struct htmm_cooling_arg *hca = arg;
++    struct page_vma_mapped_walk pvmw = {
++	.page = page,
++	.vma = vma,
++	.address = address,
++    };
++    pginfo_t *pginfo;
++
++    while (page_vma_mapped_walk(&pvmw)) {
++	address = pvmw.address;
++	page = pvmw.page;
++
++	if (pvmw.pte) {
++	    struct page *pte_page;
++	    unsigned long prev_accessed, cur_idx;
++	    unsigned int memcg_cclock;
++	    pte_t *pte = pvmw.pte;
++
++	    pte_page = virt_to_page((unsigned long)pte);
++	    if (!PageHtmm(pte_page))
++		continue;
++
++	    pginfo = get_pginfo_from_pte(pte);
++	    if (!pginfo)
++		continue;
++
++	    spin_lock(&hca->memcg->access_lock);
++	    memcg_cclock = READ_ONCE(hca->memcg->cooling_clock);
++	    if (memcg_cclock > pginfo->cooling_clock) {
++		unsigned int diff = memcg_cclock - pginfo->cooling_clock;
++		int j;
++		
++		prev_accessed = pginfo->total_accesses;
++		pginfo->nr_accesses = 0;
++		for (j = 0; j < diff; j++)
++		    pginfo->total_accesses >>= 1;
++
++		cur_idx = get_idx(pginfo->total_accesses);
++		hca->memcg->hotness_hg[cur_idx]++;
++		hca->memcg->ebp_hotness_hg[cur_idx]++;
++
++		if (cur_idx >= (hca->memcg->active_threshold - 1))
++		    hca->page_is_hot = 2;
++		else
++		    hca->page_is_hot = 1;
++		if (get_idx(prev_accessed) >= (hca->memcg->bp_active_threshold))
++		    pginfo->may_hot = true;
++		else
++		    pginfo->may_hot = false;
++		pginfo->cooling_clock = memcg_cclock;
++		
++	    }
++	    spin_unlock(&hca->memcg->access_lock);
++	} else if (pvmw.pmd) {
++	    /* do nothing */
++	    continue;
++	}
++    }
++
++    return true;
++}
++
++/**
++ * cooling_page - cooling page and return true if the page is still hot page
++ */
++int cooling_page(struct page *page, struct mem_cgroup *memcg)
++{
++    struct htmm_cooling_arg hca = {
++	.page_is_hot = 0,
++	.memcg = memcg,
++    };
++    struct rmap_walk_control rwc = {
++	.rmap_one = cooling_page_one,
++	.arg = (void *)&hca,
++    };
++
++    if (!memcg || !memcg->htmm_enabled)
++	return false;
++
++    if (!PageAnon(page) || PageKsm(page))
++	return false;
++
++    if (!page_mapped(page))
++	return false;
++
++    rmap_walk(page, &rwc);
++    return hca.page_is_hot;
++}
++
++static bool page_check_hotness_one(struct page *page, struct vm_area_struct *vma,
++	unsigned long address, void *arg)
++{
++    struct htmm_cooling_arg *hca = arg;
++    struct page_vma_mapped_walk pvmw = {
++	.page = page,
++	.vma = vma,
++	.address = address,
++    };
++    pginfo_t *pginfo;
++
++    while (page_vma_mapped_walk(&pvmw)) {
++	address = pvmw.address;
++	page = pvmw.page;
++
++	if (pvmw.pte) {
++	    struct page *pte_page;
++	    unsigned long cur_idx;
++	    pte_t *pte = pvmw.pte;
++
++	    pte_page = virt_to_page((unsigned long)pte);
++	    if (!PageHtmm(pte_page))
++		continue;
++
++	    pginfo = get_pginfo_from_pte(pte);
++	    if (!pginfo)
++		continue;
++	    
++	    cur_idx = pginfo->total_accesses;
++	    cur_idx = get_idx(cur_idx);
++	    if (cur_idx >= hca->memcg->active_threshold)
++		hca->page_is_hot = 2;
++	    else
++		hca->page_is_hot = 1;
++	} else if (pvmw.pmd) {
++	    /* do nothing */
++	    continue;
++	}
++    }
++
++    return true;
++}
++    
++int page_check_hotness(struct page *page, struct mem_cgroup *memcg)
++{
++    struct htmm_cooling_arg hca = {
++	.page_is_hot = 0,
++	.memcg = memcg,
++    };
++    struct rmap_walk_control rwc = {
++	.rmap_one = page_check_hotness_one,
++	.arg = (void *)&hca,
++    };
++
++    if (!PageAnon(page) || PageKsm(page))
++	return -1;
++
++    if (!page_mapped(page))
++	return -1;
++
++    rmap_walk(page, &rwc);
++    return hca.page_is_hot;
++}
++
++static bool get_pginfo_idx_one(struct page *page, struct vm_area_struct *vma,
++	unsigned long address, void *arg)
++{
++    struct htmm_cooling_arg *hca = arg;
++    struct page_vma_mapped_walk pvmw = {
++	.page = page,
++	.vma = vma,
++	.address = address,
++    };
++    pginfo_t *pginfo;
++
++    while (page_vma_mapped_walk(&pvmw)) {
++	address = pvmw.address;
++	page = pvmw.page;
++
++	if (pvmw.pte) {
++	    struct page *pte_page;
++	    unsigned long cur_idx;
++	    pte_t *pte = pvmw.pte;
++
++	    pte_page = virt_to_page((unsigned long)pte);
++	    if (!PageHtmm(pte_page))
++		continue;
++
++	    pginfo = get_pginfo_from_pte(pte);
++	    if (!pginfo)
++		continue;
++	    
++	    cur_idx = pginfo->total_accesses;
++	    cur_idx = get_idx(cur_idx);
++	    hca->page_is_hot = cur_idx;
++	} else if (pvmw.pmd) {
++	    hca->page_is_hot = -1;
++	}
++    }
++
++    return true;
++}
++    
++int get_pginfo_idx(struct page *page)
++{
++    struct htmm_cooling_arg hca = {
++	.page_is_hot = -1,
++    };
++    struct rmap_walk_control rwc = {
++	.rmap_one = get_pginfo_idx_one,
++	.arg = (void *)&hca,
++    };
++
++    if (!PageAnon(page) || PageKsm(page))
++	return -1;
++
++    if (!page_mapped(page))
++	return -1;
++
++    rmap_walk(page, &rwc);
++    return hca.page_is_hot;
++}
++#endif
++
+ static bool page_mkclean_one(struct page *page, struct vm_area_struct *vma,
+ 			    unsigned long address, void *arg)
+ {
+diff --git a/linux/mm/vmscan.c b/linux/mm/vmscan.c
+index 74296c2d1..c4dc9fc15 100644
+--- a/linux/mm/vmscan.c
++++ b/linux/mm/vmscan.c
+@@ -588,7 +588,7 @@ unsigned long zone_reclaimable_pages(struct zone *zone)
+  * @lru: lru to use
+  * @zone_idx: zones to consider (use MAX_NR_ZONES for the whole LRU list)
+  */
+-static unsigned long lruvec_lru_size(struct lruvec *lruvec, enum lru_list lru,
++unsigned long lruvec_lru_size(struct lruvec *lruvec, enum lru_list lru,
+ 				     int zone_idx)
+ {
+ 	unsigned long size = 0;
+@@ -2151,7 +2151,7 @@ static int too_many_isolated(struct pglist_data *pgdat, int file,
+  *
+  * Returns the number of pages moved to the given lruvec.
+  */
+-static unsigned int move_pages_to_lru(struct lruvec *lruvec,
++unsigned int move_pages_to_lru(struct lruvec *lruvec,
+ 			       struct list_head *list)
+ {
+ 	int nr_pages, nr_moved = 0;
+diff --git a/linux/mm/vmstat.c b/linux/mm/vmstat.c
+index 8ce262034..0e5217738 100644
+--- a/linux/mm/vmstat.c
++++ b/linux/mm/vmstat.c
+@@ -1361,6 +1361,16 @@ const char * const vmstat_text[] = {
+ #ifdef CONFIG_BALLOON_COMPACTION
+ 	"balloon_migrate",
+ #endif
++#ifdef CONFIG_HTMM
++	"htmm_nr_promoted",
++	"htmm_nr_demoted",
++	"htmm_nr_sampled",
++	"htmm_missed_dramread",
++	"htmm_missed_nvmread",
++	"htmm_missed_write",
++	"htmm_alloc_dram",
++	"htmm_alloc_nvm",
++#endif
+ #endif /* CONFIG_MEMORY_BALLOON */
+ #ifdef CONFIG_DEBUG_TLBFLUSH
+ 	"nr_tlb_remote_flush",
