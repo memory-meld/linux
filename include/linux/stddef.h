@@ -7,10 +7,10 @@
 #undef NULL
 #define NULL ((void *)0)
 
-enum {
-	false	= 0,
-	true	= 1
-};
+// enum {
+// 	false	= 0,
+// 	true	= 1
+// };
 
 #undef offsetof
 #ifdef __compiler_offsetof
