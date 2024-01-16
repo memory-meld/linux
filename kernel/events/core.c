@@ -12546,6 +12546,7 @@ int htmm__perf_event_init(struct perf_event *event, unsigned long nr_pages)
 	rb = rb_alloc(nr_pages,
 		      event->attr.watermark ? event->attr.wakeup_watermark : 0,
 		      event->cpu, flags);
+	pr_info("%s: rb_alloc() = %px\n", __func__, rb);
 	if (!rb) {
 		ret = -ENOMEM;
 		goto unlock;
@@ -12674,6 +12675,7 @@ int htmm__perf_event_open(struct perf_event_attr *attr_ptr, pid_t pid, int cpu,
 
 	event = perf_event_alloc(&attr, cpu, task, group_leader, NULL, NULL,
 				 NULL, cgroup_fd);
+	pr_info("%s: perf_event_alloc() = %px\n", __func__, event);
 	if (IS_ERR(event)) {
 		err = PTR_ERR(event);
 		goto err_task;
