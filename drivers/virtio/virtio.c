@@ -204,6 +204,39 @@ int virtio_finalize_features(struct virtio_device *dev)
 }
 EXPORT_SYMBOL_GPL(virtio_finalize_features);
 
+/**
+ * virtio_reset_device - quiesce device for removal
+ * @dev: the device to reset
+ *
+ * Prevents device from sending interrupts and accessing memory.
+ *
+ * Generally used for cleanup during driver / device removal.
+ *
+ * Once this has been invoked, caller must ensure that
+ * virtqueue_notify / virtqueue_kick are not in progress.
+ *
+ * Note: this guarantees that vq callbacks are not in progress, however caller
+ * is responsible for preventing access from other contexts, such as a system
+ * call/workqueue/bh.  Invoking virtio_break_device then flushing any such
+ * contexts is one way to handle that.
+ * */
+void virtio_reset_device(struct virtio_device *dev)
+{
+#ifdef CONFIG_VIRTIO_HARDEN_NOTIFICATION
+	/*
+	 * The below virtio_synchronize_cbs() guarantees that any
+	 * interrupt for this line arriving after
+	 * virtio_synchronize_vqs() has completed is guaranteed to see
+	 * vq->broken as true.
+	 */
+	virtio_break_device(dev);
+	virtio_synchronize_cbs(dev);
+#endif
+
+	dev->config->reset(dev);
+}
+EXPORT_SYMBOL_GPL(virtio_reset_device);
+
 static int virtio_dev_probe(struct device *_d)
 {
 	int err, i;
