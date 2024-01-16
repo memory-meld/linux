@@ -1391,6 +1391,11 @@ const char * const vmstat_text[] = {
 	"direct_map_level2_splits",
 	"direct_map_level3_splits",
 #endif
+	"pebs_sample_collected",
+	"pebs_collection_cost",
+	"hotness_identification_cost",
+	"page_migration_cost",
+	"page_split_cost",
 #endif /* CONFIG_VM_EVENT_COUNTERS || CONFIG_MEMCG */
 };
 #endif /* CONFIG_PROC_FS || CONFIG_SYSFS || CONFIG_NUMA || CONFIG_MEMCG */
