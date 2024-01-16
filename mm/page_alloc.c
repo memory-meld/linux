@@ -5790,7 +5790,6 @@ void si_meminfo(struct sysinfo *val)
 	val->freehigh = nr_free_highpages();
 	val->mem_unit = PAGE_SIZE;
 }
-
 EXPORT_SYMBOL(si_meminfo);
 
 #ifdef CONFIG_NUMA
@@ -5824,6 +5823,7 @@ void si_meminfo_node(struct sysinfo *val, int nid)
 #endif
 	val->mem_unit = PAGE_SIZE;
 }
+EXPORT_SYMBOL(si_meminfo_node);
 #endif
 
 /*
