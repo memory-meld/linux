@@ -37,6 +37,8 @@
 #define VIRTIO_BALLOON_F_FREE_PAGE_HINT	3 /* VQ to report free pages */
 #define VIRTIO_BALLOON_F_PAGE_POISON	4 /* Guest is using page poisoning */
 #define VIRTIO_BALLOON_F_REPORTING	5 /* Page reporting virtqueue */
+#define VIRTIO_BALLOON_F_HETERO_MEM \
+	6 /* Additional inflate/deflate queue for heterogeneous memory*/
 
 /* Size of a PFN in the balloon interface. */
 #define VIRTIO_BALLOON_PFN_SHIFT 12
@@ -59,6 +61,10 @@ struct virtio_balloon_config {
 	};
 	/* Stores PAGE_POISON if page poisoning is in use */
 	__le32 poison_val;
+	/* Number of heterogeneous pages host wants Guest to give up. */
+	__le32 num_hetero_pages;
+	/* Number of pages we've actually got in balloon. */
+	__le32 actual_hetero;
 };
 
 #define VIRTIO_BALLOON_S_SWAP_IN  0   /* Amount of memory swapped in */
@@ -71,7 +77,13 @@ struct virtio_balloon_config {
 #define VIRTIO_BALLOON_S_CACHES   7   /* Disk caches */
 #define VIRTIO_BALLOON_S_HTLB_PGALLOC  8  /* Hugetlb page allocations */
 #define VIRTIO_BALLOON_S_HTLB_PGFAIL   9  /* Hugetlb page allocation failures */
-#define VIRTIO_BALLOON_S_NR       10
+#define VIRTIO_BALLOON_S_DRAM_ACCESS   10 /* DRAM accesses */
+#define VIRTIO_BALLOON_S_DRAM_MEMFREE  11 /* Total amount of free DRAM */
+#define VIRTIO_BALLOON_S_DRAM_MEMTOT   12 /* Total amount of DRAM */
+#define VIRTIO_BALLOON_S_PMEM_ACCESS   13 /* PMEM accesses */
+#define VIRTIO_BALLOON_S_PMEM_MEMFREE  14 /* Total amount of free PMEM */
+#define VIRTIO_BALLOON_S_PMEM_MEMTOT   15 /* Total amount of PMEM */
+#define VIRTIO_BALLOON_S_NR 16
 
 #define VIRTIO_BALLOON_S_NAMES_WITH_PREFIX(VIRTIO_BALLOON_S_NAMES_prefix) { \
 	VIRTIO_BALLOON_S_NAMES_prefix "swap-in", \
@@ -84,6 +96,8 @@ struct virtio_balloon_config {
 	VIRTIO_BALLOON_S_NAMES_prefix "disk-caches", \
 	VIRTIO_BALLOON_S_NAMES_prefix "hugetlb-allocations", \
 	VIRTIO_BALLOON_S_NAMES_prefix "hugetlb-failures" \
+	VIRTIO_BALLOON_S_NAMES_prefix "dram-accesses", \
+	VIRTIO_BALLOON_S_NAMES_prefix "pmem-accesses" \
 }
 
 #define VIRTIO_BALLOON_S_NAMES VIRTIO_BALLOON_S_NAMES_WITH_PREFIX("")
