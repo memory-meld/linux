@@ -1391,6 +1391,8 @@ const char * const vmstat_text[] = {
 	"direct_map_level2_splits",
 	"direct_map_level3_splits",
 #endif
+	"dram_accesses",
+	"pmem_accesses",
 	"pebs_sample_collected",
 	"pebs_collection_cost",
 	"hotness_identification_cost",
