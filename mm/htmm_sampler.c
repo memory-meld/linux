@@ -228,6 +228,7 @@ static int ksamplingd(void *data)
 			msleep_interruptible(10000);
 			continue;
 		}
+		u64 begin = local_clock();
 
 		for (cpu = 0; cpu < CPUS_PER_SOCKET; cpu++) {
 			for (event = 0; event < N_HTMMEVENTS; event++) {
@@ -294,8 +295,19 @@ static int ksamplingd(void *data)
 							break;
 						}
 
-						update_pginfo(he->pid, he->addr,
-							      event);
+						count_vm_events(
+							PEBS_COLLECTION_COST,
+							local_clock() - begin);
+						scoped_guard(
+							vmevent,
+							HOTNESS_IDENTIFICATION_COST)
+						{
+							update_pginfo(he->pid,
+								      he->addr,
+								      event);
+						}
+						begin = local_clock();
+
 						//count_vm_event(HTMM_NR_SAMPLED);
 						nr_sampled++;
 
@@ -337,6 +349,7 @@ static int ksamplingd(void *data)
 				} while (cond);
 			}
 		}
+		count_vm_events(PEBS_COLLECTION_COST, local_clock() - begin);
 		/* if ksampled_soft_cpu_quota is zero, disable dynamic pebs feature */
 		if (!ksampled_soft_cpu_quota)
 			continue;
@@ -344,6 +357,7 @@ static int ksamplingd(void *data)
 		/* sleep */
 		schedule_timeout_interruptible(sleep_timeout);
 
+		begin = local_clock();
 		/* check elasped time */
 		cur = jiffies;
 		if ((cur - elapsed_cputime) >= cpucap_period) {
@@ -419,6 +433,7 @@ static int ksamplingd(void *data)
 			trace_cputime = cur;
 			trace_runtime = cur_runtime;
 		}
+		count_vm_events(PEBS_COLLECTION_COST, local_clock() - begin);
 	}
 
 	total_runtime = (t->se.sum_exec_runtime) - total_runtime; // ns
