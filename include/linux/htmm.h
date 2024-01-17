@@ -147,51 +147,53 @@ extern void set_lru_cooling_pid(pid_t pid);
 extern int ksamplingd_init(pid_t pid, int node);
 extern void ksamplingd_exit(void);
 
-static inline unsigned long get_sample_period(unsigned long cur)
+static inline unsigned long get_sample_period(unsigned long idx)
 {
-	if (cur < 0)
-		return 0;
-	else if (cur < pcount)
-		return pebs_period_list[cur];
+	if (idx < ARRAY_SIZE(pebs_period_list))
+		return pebs_period_list[idx];
 	else
-		return pebs_period_list[pcount - 1];
+		return pebs_period_list[ARRAY_SIZE(pebs_period_list) - 1];
 }
 
-static inline unsigned long get_sample_inst_period(unsigned long cur)
+static inline unsigned long get_sample_inst_period(unsigned long idx)
 {
-	if (cur < 0)
-		return 0;
-	else if (cur < pinstcount)
-		return pebs_inst_period_list[cur];
+	if (idx < ARRAY_SIZE(pebs_inst_period_list))
+		return pebs_inst_period_list[idx];
 	else
-		return pebs_inst_period_list[pinstcount - 1];
+		return pebs_inst_period_list[ARRAY_SIZE(pebs_inst_period_list) -
+					     1];
 }
 #if 1
-static inline void increase_sample_period(unsigned long *llc_period,
-					  unsigned long *inst_period)
+static inline bool increase_sample_period(unsigned long *llc_idx,
+					  unsigned long *inst_idx)
 {
-	unsigned long p;
-	p = *llc_period;
-	if (++p < pcount)
-		*llc_period = p;
-
-	p = *inst_period;
-	if (++p < pinstcount)
-		*inst_period = p;
+	bool ret = false;
+	if (*llc_idx < ARRAY_SIZE(pebs_period_list)) {
+		*llc_idx += 1;
+		ret = true;
+	}
+	if (*inst_idx < ARRAY_SIZE(pebs_inst_period_list)) {
+		*inst_idx += 1;
+		ret = true;
+	}
+	return ret;
 }
 
-static inline void decrease_sample_period(unsigned long *llc_period,
-					  unsigned long *inst_period)
+static inline bool decrease_sample_period(unsigned long *llc_idx,
+					  unsigned long *inst_idx)
 {
-	unsigned long p;
-	p = *llc_period;
-	if (p > 0)
-		*llc_period = p - 1;
-
-	p = *inst_period;
-	if (p > 0)
-		*inst_period = p - 1;
+	bool ret = false;
+	if (*llc_idx > 1) {
+		*llc_idx -= 1;
+		ret = true;
+	}
+	if (*inst_idx > 1) {
+		*inst_idx -= 1;
+		ret = true;
+	}
+	return ret;
 }
+
 #else
 static inline unsigned int increase_sample_period(unsigned int cur,
 						  unsigned int next)
