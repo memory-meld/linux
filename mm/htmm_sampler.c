@@ -65,12 +65,14 @@ static int __perf_event_open(__u64 config, __u64 config1, __u64 cpu, __u64 type,
 		attr.sample_period = get_sample_period(0);
 	attr.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_ADDR;
 	attr.disabled = 0;
+	// must set, or no sample will be collected when using the preload helper
+	attr.inherit = 1;
 	attr.exclude_kernel = 1;
 	attr.exclude_hv = 1;
 	attr.exclude_callchain_kernel = 1;
 	attr.exclude_callchain_user = 1;
-	attr.precise_ip = 1;
-	attr.enable_on_exec = 1;
+	attr.precise_ip = 3;
+	// attr.enable_on_exec = 1;
 
 	if (pid == 0)
 		__pid = -1;
@@ -78,15 +80,16 @@ static int __perf_event_open(__u64 config, __u64 config1, __u64 cpu, __u64 type,
 		__pid = pid;
 
 	event_fd = kernel_perf_event_open(&attr, __pid, cpu, -1, 0);
+	pr_info("%s: perf_event_open(pid=%d, cpu=%d, config=0x%lx, config1=0x%lx, type=0x%lx) = event_fd=%d\n",
+		__func__, __pid, cpu, config, config1, attr.sample_type,
+		event_fd);
 	if (event_fd <= 0) {
-		printk("[error htmm__perf_event_open failure] event_fd: %d\n",
-		       event_fd);
 		return -1;
 	}
 
 	file = fget(event_fd);
 	if (!file) {
-		printk("invalid file\n");
+		pr_err("%s: invalid file\n", __func__);
 		return -1;
 	}
 	mem_event[cpu][type] = fget(event_fd)->private_data;
@@ -184,6 +187,7 @@ static void pebs_update_period(uint64_t value, uint64_t inst_value)
 
 static int ksamplingd(void *data)
 {
+	pr_info("%s: started\n", __func__);
 	unsigned long long nr_sampled = 0, nr_dram = 0, nr_nvm = 0,
 			   nr_write = 0;
 	unsigned long long nr_throttled = 0, nr_lost = 0, nr_unknown = 0;
@@ -217,8 +221,9 @@ static int ksamplingd(void *data)
 	/* TODO implements per-CPU node ksamplingd by using pg_data_t */
 	/* Currently uses a single CPU node(0) */
 	const struct cpumask *cpumask = cpumask_of_node(0);
-	if (!cpumask_empty(cpumask))
-		do_set_cpus_allowed(access_sampling, cpumask);
+	// if (!cpumask_empty(cpumask)) {
+	// 	do_set_cpus_allowed(access_sampling, cpumask);
+	// }
 
 	while (!kthread_should_stop()) {
 		int cpu, event, cond = false;
