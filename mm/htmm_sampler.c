@@ -185,13 +185,128 @@ static void pebs_update_period(uint64_t value, uint64_t inst_value)
 	}
 }
 
+struct ksamplingd_measurements {
+	unsigned long long nr_sampled, nr_dram, nr_nvm, nr_write;
+	unsigned long long nr_throttled, nr_lost, nr_unknown;
+	unsigned long long nr_skip;
+	/* for analytic purpose */
+	unsigned long hr_dram, hr_nvm;
+};
+
+static int ksamplingd_iter(int cpu, int event,
+			   struct ksamplingd_measurements *measurements)
+{
+	u64 begin = local_clock();
+	struct perf_buffer *rb;
+	struct perf_event_mmap_page *up;
+	struct perf_event_header *ph;
+	struct htmm_event *he;
+	unsigned long pg_index, offset;
+	int page_shift;
+	int ret = -EAGAIN;
+	__u64 head;
+
+	if (!mem_event[cpu][event]) {
+		return -ENOENT;
+	}
+
+	__sync_synchronize();
+
+	rb = mem_event[cpu][event]->rb;
+	if (!rb) {
+		return -ENOENT;
+	}
+	/* perf_buffer is ring buffer */
+	up = READ_ONCE(rb->user_page);
+	head = READ_ONCE(up->data_head);
+	if (head == up->data_tail) {
+		if (cpu < 16) {
+			measurements->nr_skip++;
+		}
+		return -ENOSPC;
+	}
+
+	head -= up->data_tail;
+	if (head > (BUFFER_SIZE * ksampled_max_sample_ratio / 100)) {
+		ret = -EAGAIN;
+	} else if (head < (BUFFER_SIZE * ksampled_min_sample_ratio / 100)) {
+		ret = -EBUSY;
+	}
+
+	/* read barrier */
+	smp_rmb();
+
+	page_shift = PAGE_SHIFT + page_order(rb);
+	/* get address of a tail sample */
+	offset = READ_ONCE(up->data_tail);
+	pg_index = (offset >> page_shift) & (rb->nr_pages - 1);
+	offset &= (1 << page_shift) - 1;
+
+	ph = (void *)(rb->data_pages[pg_index] + offset);
+	switch (ph->type) {
+	case PERF_RECORD_SAMPLE:
+		he = (struct htmm_event *)ph;
+		if (!valid_va(he->addr)) {
+			break;
+		}
+
+		count_vm_events(PEBS_COLLECTION_COST, local_clock() - begin);
+		scoped_guard(vmevent, HOTNESS_IDENTIFICATION_COST)
+		{
+			update_pginfo(he->pid, he->addr, event);
+		}
+		begin = local_clock();
+
+		//count_vm_event(HTMM_NR_SAMPLED);
+		measurements->nr_sampled++;
+
+		if (event == DRAMREAD) {
+			measurements->nr_dram++;
+			measurements->hr_dram++;
+		} else if (event == CXLREAD || event == NVMREAD) {
+			measurements->nr_nvm++;
+			measurements->hr_nvm++;
+		} else {
+			measurements->nr_write++;
+		}
+		break;
+	case PERF_RECORD_THROTTLE:
+	case PERF_RECORD_UNTHROTTLE:
+		measurements->nr_throttled++;
+		break;
+	case PERF_RECORD_LOST_SAMPLES:
+		measurements->nr_lost++;
+		break;
+	default:
+		measurements->nr_unknown++;
+		break;
+	}
+	if (measurements->nr_sampled % 500000 == 0) {
+		trace_printk(
+			"nr_sampled: %llu, nr_dram: %llu, nr_nvm: %llu, nr_write: %llu, nr_throttled: %llu \n",
+			measurements->nr_sampled, measurements->nr_dram,
+			measurements->nr_nvm, measurements->nr_write,
+			measurements->nr_throttled);
+		measurements->nr_dram = 0;
+		measurements->nr_nvm = 0;
+		measurements->nr_write = 0;
+	}
+	/* read, write barrier */
+	smp_mb();
+	WRITE_ONCE(up->data_tail, up->data_tail + ph->size);
+	count_vm_events(PEBS_COLLECTION_COST, local_clock() - begin);
+	return ret;
+}
+
+static void ksamplingd_throttle(void)
+{
+}
+
 static int ksamplingd(void *data)
 {
 	pr_info("%s: started\n", __func__);
-	unsigned long long nr_sampled = 0, nr_dram = 0, nr_nvm = 0,
-			   nr_write = 0;
-	unsigned long long nr_throttled = 0, nr_lost = 0, nr_unknown = 0;
-	unsigned long long nr_skip = 0;
+
+	struct ksamplingd_measurements measurements = {};
 
 	/* used for calculating average cpu usage of ksampled */
 	struct task_struct *t = current;
@@ -206,162 +321,40 @@ static int ksamplingd(void *data)
 	unsigned long trace_cputime,
 		trace_period = msecs_to_jiffies(1500); // 3s
 	unsigned long trace_runtime;
-	/* for timeout */
-	unsigned long sleep_timeout;
-
-	/* for analytic purpose */
-	unsigned long hr_dram = 0, hr_nvm = 0;
 
 	/* orig impl: see read_sum_exec_runtime() */
 	trace_runtime = total_runtime = exec_runtime = t->se.sum_exec_runtime;
 
 	trace_cputime = total_cputime = elapsed_cputime = jiffies;
-	sleep_timeout = usecs_to_jiffies(2000);
 
 	/* TODO implements per-CPU node ksamplingd by using pg_data_t */
 	/* Currently uses a single CPU node(0) */
-	const struct cpumask *cpumask = cpumask_of_node(0);
+	// const struct cpumask *cpumask = cpumask_of_node(0);
 	// if (!cpumask_empty(cpumask)) {
 	// 	do_set_cpus_allowed(access_sampling, cpumask);
 	// }
 
 	while (!kthread_should_stop()) {
-		int cpu, event, cond = false;
-
 		if (htmm_mode == HTMM_NO_MIG) {
 			msleep_interruptible(10000);
 			continue;
 		}
-		u64 begin = local_clock();
 
-		for (cpu = 0; cpu < CPUS_PER_SOCKET; cpu++) {
-			for (event = 0; event < N_HTMMEVENTS; event++) {
-				do {
-					struct perf_buffer *rb;
-					struct perf_event_mmap_page *up;
-					struct perf_event_header *ph;
-					struct htmm_event *he;
-					unsigned long pg_index, offset;
-					int page_shift;
-					__u64 head;
-
-					if (!mem_event[cpu][event]) {
-						//continue;
-						break;
-					}
-
-					__sync_synchronize();
-
-					rb = mem_event[cpu][event]->rb;
-					if (!rb) {
-						printk("event->rb is NULL\n");
-						return -1;
-					}
-					/* perf_buffer is ring buffer */
-					up = READ_ONCE(rb->user_page);
-					head = READ_ONCE(up->data_head);
-					if (head == up->data_tail) {
-						if (cpu < 16)
-							nr_skip++;
-						//continue;
-						break;
-					}
-
-					head -= up->data_tail;
-					if (head >
-					    (BUFFER_SIZE *
-					     ksampled_max_sample_ratio / 100)) {
-						cond = true;
-					} else if (head <
-						   (BUFFER_SIZE *
-						    ksampled_min_sample_ratio /
-						    100)) {
-						cond = false;
-					}
-
-					/* read barrier */
-					smp_rmb();
-
-					page_shift =
-						PAGE_SHIFT + page_order(rb);
-					/* get address of a tail sample */
-					offset = READ_ONCE(up->data_tail);
-					pg_index = (offset >> page_shift) &
-						   (rb->nr_pages - 1);
-					offset &= (1 << page_shift) - 1;
-
-					ph = (void *)(rb->data_pages[pg_index] +
-						      offset);
-					switch (ph->type) {
-					case PERF_RECORD_SAMPLE:
-						he = (struct htmm_event *)ph;
-						if (!valid_va(he->addr)) {
-							break;
-						}
-
-						count_vm_events(
-							PEBS_COLLECTION_COST,
-							local_clock() - begin);
-						scoped_guard(
-							vmevent,
-							HOTNESS_IDENTIFICATION_COST)
-						{
-							update_pginfo(he->pid,
-								      he->addr,
-								      event);
-						}
-						begin = local_clock();
-
-						//count_vm_event(HTMM_NR_SAMPLED);
-						nr_sampled++;
-
-						if (event == DRAMREAD) {
-							nr_dram++;
-							hr_dram++;
-						} else if (event == CXLREAD ||
-							   event == NVMREAD) {
-							nr_nvm++;
-							hr_nvm++;
-						} else
-							nr_write++;
-						break;
-					case PERF_RECORD_THROTTLE:
-					case PERF_RECORD_UNTHROTTLE:
-						nr_throttled++;
-						break;
-					case PERF_RECORD_LOST_SAMPLES:
-						nr_lost++;
-						break;
-					default:
-						nr_unknown++;
-						break;
-					}
-					if (nr_sampled % 500000 == 0) {
-						trace_printk(
-							"nr_sampled: %llu, nr_dram: %llu, nr_nvm: %llu, nr_write: %llu, nr_throttled: %llu \n",
-							nr_sampled, nr_dram,
-							nr_nvm, nr_write,
-							nr_throttled);
-						nr_dram = 0;
-						nr_nvm = 0;
-						nr_write = 0;
-					}
-					/* read, write barrier */
-					smp_mb();
-					WRITE_ONCE(up->data_tail,
-						   up->data_tail + ph->size);
-				} while (cond);
+		for (int cpu = 0; cpu < CPUS_PER_SOCKET; cpu++) {
+			for (int event = 0; event < N_HTMMEVENTS; event++) {
+				// clang-format off
+				while (-EAGAIN == ksamplingd_iter(cpu, event,&measurements));
+				// clang-format on
 			}
 		}
-		count_vm_events(PEBS_COLLECTION_COST, local_clock() - begin);
 		/* if ksampled_soft_cpu_quota is zero, disable dynamic pebs feature */
 		if (!ksampled_soft_cpu_quota)
 			continue;
 
 		/* sleep */
-		schedule_timeout_interruptible(sleep_timeout);
+		schedule_timeout_interruptible(usecs_to_jiffies(2000));
 
-		begin = local_clock();
+		u64 begin = local_clock();
 		/* check elasped time */
 		cur = jiffies;
 		if ((cur - elapsed_cputime) >= cpucap_period) {
@@ -370,15 +363,14 @@ static int ksamplingd(void *data)
 			elapsed_cputime =
 				jiffies_to_usecs(cur - elapsed_cputime); //us
 			if (!cputime) {
-				u64 cur_cputime = div64_u64(exec_runtime,
-							    elapsed_cputime);
+				u64 cur_cputime =
+					exec_runtime / elapsed_cputime;
 				// EMA with the scale factor (0.2)
-				cputime =
-					((cur_cputime << 3) + (cputime << 1)) /
-					10;
-			} else
-				cputime = div64_u64(exec_runtime,
-						    elapsed_cputime);
+				cputime = (cur_cputime << 3) + (cputime << 1);
+				cputime /= 10;
+			} else {
+				cputime = exec_runtime / elapsed_cputime;
+			}
 
 			/* to prevent frequent updates, allow for a slight variation of +/- 0.5% */
 			if (cputime > (ksampled_soft_cpu_quota + 5) &&
@@ -390,12 +382,13 @@ static int ksamplingd(void *data)
 				increase_sample_period(&sample_period,
 						       &sample_inst_period);
 				if (tmp1 != sample_period ||
-				    tmp2 != sample_inst_period)
+				    tmp2 != sample_inst_period) {
 					pebs_update_period(
 						get_sample_period(
 							sample_period),
 						get_sample_inst_period(
 							sample_inst_period));
+				}
 			} else if (cputime < (ksampled_soft_cpu_quota - 5) &&
 				   sample_period) {
 				unsigned long tmp1 = sample_period,
@@ -403,12 +396,13 @@ static int ksamplingd(void *data)
 				decrease_sample_period(&sample_period,
 						       &sample_inst_period);
 				if (tmp1 != sample_period ||
-				    tmp2 != sample_inst_period)
+				    tmp2 != sample_inst_period) {
 					pebs_update_period(
 						get_sample_period(
 							sample_period),
 						get_sample_inst_period(
 							sample_inst_period));
+				}
 			}
 			/* does it need to prevent ping-pong behavior? */
 
@@ -422,18 +416,21 @@ static int ksamplingd(void *data)
 			u64 cur_runtime = t->se.sum_exec_runtime;
 			trace_runtime = cur_runtime - trace_runtime;
 			trace_cputime = jiffies_to_usecs(cur - trace_cputime);
-			trace_cputime = div64_u64(trace_runtime, trace_cputime);
+			trace_cputime = trace_runtime / trace_cputime;
 
-			if (hr_dram + hr_nvm == 0)
+			if (measurements.hr_dram + measurements.hr_nvm == 0) {
 				hr = 0;
-			else
-				hr = hr_dram * 10000 / (hr_dram + hr_nvm);
+			} else {
+				hr = measurements.hr_dram * 10000;
+				hr /= measurements.hr_dram +
+				      measurements.hr_nvm;
+			}
 			trace_printk(
 				"sample_period: %lu || cputime: %lu  || hit ratio: %lu\n",
 				get_sample_period(sample_period), trace_cputime,
 				hr);
 
-			hr_dram = hr_nvm = 0;
+			measurements.hr_dram = measurements.hr_nvm = 0;
 			trace_cputime = cur;
 			trace_runtime = cur_runtime;
 		}
@@ -444,7 +441,8 @@ static int ksamplingd(void *data)
 	total_cputime = jiffies_to_usecs(jiffies - total_cputime); // us
 
 	printk("nr_sampled: %llu, nr_throttled: %llu, nr_lost: %llu\n",
-	       nr_sampled, nr_throttled, nr_lost);
+	       measurements.nr_sampled, measurements.nr_throttled,
+	       measurements.nr_lost);
 	printk("total runtime: %llu ns, total cputime: %lu us, cpu usage: %llu\n",
 	       total_runtime, total_cputime, (total_runtime) / total_cputime);
 
