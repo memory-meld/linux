@@ -1,3 +1,4 @@
+#include <asm/timer.h>
 #include <linux/mm.h>
 #include <linux/mm_inline.h>
 #include <linux/migrate.h>
@@ -116,6 +117,80 @@ bool debug_log_samples = false;
 module_param_named(debug_log_samples, debug_log_samples, bool, 0644);
 MODULE_PARM_DESC(debug_log_samples,
 		 "Log every collected pebs sample (only for debugging)");
+
+bool debug_migration_latency = false;
+module_param_named(debug_migration_latency, debug_migration_latency, bool,
+		   0644);
+MODULE_PARM_DESC(debug_migration_latency,
+		 "Log migration latency (only for debugging)");
+
+u64 local_clock(void);
+
+static ssize_t debug_write_file(char *name, void *buf, size_t len)
+{
+	if (!name || !buf) {
+		return -EINVAL;
+	}
+	struct file *file =
+		TRY(filp_open(name, O_WRONLY | O_CREAT | O_TRUNC, 0644));
+	ssize_t written = TRY(kernel_write(file, buf, len, 0));
+	TRY(filp_close(file, NULL));
+	return written;
+}
+
+struct logarithmic_histogram {
+	u64 buckets[64 + 1];
+	u64 len;
+};
+
+static int logarithmic_histogram_init(struct logarithmic_histogram *h)
+{
+	memset(h, 0, sizeof(*h));
+	return 0;
+}
+
+static void logarithmic_histogram_drop(struct logarithmic_histogram *h)
+{
+	memset(h, 0, sizeof(*h));
+}
+
+static void logarithmic_histogram_push(struct logarithmic_histogram *h, u64 val)
+{
+	++h->buckets[val ? 1 + ilog2(val) : 0];
+	++h->len;
+}
+
+static void logarithmic_histogram_print_debug(struct logarithmic_histogram *h)
+{
+	for (u64 i = 0; i < ARRAY_SIZE(h->buckets); ++i) {
+		u64 val = h->buckets[i];
+		if (!val) {
+			continue;
+		}
+		pr_info("%s: [%llu, %llu) = %llu\n", __func__,
+			i ? 1ull << (i - 1) : 0, i ? 1ull << i : 1, val);
+	}
+}
+
+enum folio_debug_info_timestamp_index {
+	// Used for calculating the latency between migration and pebs hardware
+	// first generated the sample
+	FDTI_FIRST_FOUND,
+	FDTI_COLLECTION,
+	FDTI_MIGRATION,
+	// Used for calculating how long does it take for the same sample to
+	// occur again
+	FDTI_LAST_FOUND,
+	FDTI_MAX,
+};
+
+struct folio_debug_info {
+	u64 total_accesses;
+	u64 timestamps[FDTI_MAX];
+};
+
+struct folio_debug_info *folio_debug_info_store = NULL;
+u64 folio_debug_info_store_len = 0;
 
 enum event_index {
 	EI_READ = 0,
@@ -263,8 +338,9 @@ static void streaming_decaying_sketch_drop(struct streaming_decaying_sketch *s)
 	}
 }
 
-static int __must_check streaming_decaying_sketch_init(
-	struct streaming_decaying_sketch *s, u64 w, u64 d)
+static int __must_check
+streaming_decaying_sketch_init(struct streaming_decaying_sketch *s, u64 w,
+			       u64 d)
 {
 	s->w = w;
 	s->d = d;
@@ -395,8 +471,9 @@ static u64 indexable_heap_capacity(struct indexable_heap *h)
 	return h->heap.size;
 }
 
-static int __must_check indexable_heap_index_update_or_insert(
-	struct indexable_heap *h, u64 key, struct pair *p)
+static int __must_check
+indexable_heap_index_update_or_insert(struct indexable_heap *h, u64 key,
+				      struct pair *p)
 {
 	int err = btree_update64(&h->index, key, p);
 	if (err) {
@@ -928,18 +1005,6 @@ enough:
 	return drained;
 }
 
-static ssize_t debug_log_samples_write(void *buf, size_t len)
-{
-	if (likely(!debug_log_samples)) {
-		return 0;
-	}
-	struct file *file = TRY(filp_open("/out/debug_samples",
-					  O_WRONLY | O_CREAT | O_TRUNC, 0644));
-	ssize_t written = TRY(kernel_write(file, buf, len, 0));
-	TRY(filp_close(file, NULL));
-	return written;
-}
-
 static int placement_thread_fn_policy(struct placement *p)
 {
 	pr_info("%s: thread started\n", __func__);
@@ -959,8 +1024,10 @@ static int placement_thread_fn_policy(struct placement *p)
 					 (debug_samples_cap),
 				 GFP_KERNEL) :
 			NULL;
+	struct logarithmic_histogram reoccurrence_latency = {};
 
 	while (!kthread_should_stop()) {
+		u64 begin = native_sched_clock();
 		if (iter++ % interval == 0) {
 			// intel_pmu_print_debug_all();
 			// struct placement_shared_state *state = &p->state;
@@ -980,13 +1047,17 @@ static int placement_thread_fn_policy(struct placement *p)
 		struct placement_shared_state *state = &p->state;
 		scoped_guard(mutex, &state->lock)
 		{
+			u64 ts = local_clock();
 			for_each_sample_from_cpu_x_event(p, cpu, eidx, e, s)
 			{
 				if (unlikely(debug_log_samples &&
-					     debug_samples_store)) {
+					     debug_samples_store &&
+					     debug_samples_len <
+						     debug_samples_cap)) {
 					debug_samples_store[debug_samples_len++ %
 							    debug_samples_cap] =
 						s;
+					// continue;
 				}
 
 				++valid;
@@ -999,6 +1070,32 @@ static int placement_thread_fn_policy(struct placement *p)
 				}
 
 				u64 pfn = PFN_DOWN(s.phys_addr);
+				if (debug_migration_latency &&
+				    folio_debug_info_store) {
+					struct folio_debug_info *info =
+						folio_debug_info_store + pfn;
+					info->total_accesses += 1;
+					if (!info->timestamps[FDTI_FIRST_FOUND]) {
+						info->timestamps
+							[FDTI_FIRST_FOUND] =
+							s.time;
+					}
+					if (info->timestamps[FDTI_LAST_FOUND]) {
+						u64 reoccurrence = saturating_sub(
+							s.time,
+							info->timestamps
+								[FDTI_LAST_FOUND]);
+						logarithmic_histogram_push(
+							&reoccurrence_latency,
+							reoccurrence);
+					}
+					info->timestamps[FDTI_LAST_FOUND] =
+						s.time;
+					if (!info->timestamps[FDTI_COLLECTION]) {
+						info->timestamps[FDTI_COLLECTION] =
+							ts;
+					}
+				}
 				bool in_dram = pfn_to_nid(pfn) == DRAM_NID;
 				u64 count = streaming_decaying_sketch_push(&sds,
 									   pfn);
@@ -1048,15 +1145,65 @@ static int placement_thread_fn_policy(struct placement *p)
 					drained / migration_batch_size);
 			}
 		}
+		count_vm_events(HOTNESS_IDENTIFICATION_COST,
+				native_sched_clock() - begin);
 
 		// give up cpu
 		// pr_info_ratelimited("%s: thread giving up cpu\n", __func__);
 		schedule_timeout_interruptible(timeout);
 	}
 
-	debug_log_samples_write(debug_samples_store,
-				min(debug_samples_len, debug_samples_cap) *
-					sizeof(struct perf_sample));
+	if (debug_log_samples) {
+		debug_write_file("/out/debug_samples", debug_samples_store,
+				 min(debug_samples_len, debug_samples_cap) *
+					 sizeof(struct perf_sample));
+	}
+	if (debug_migration_latency && folio_debug_info_store) {
+		struct logarithmic_histogram total_accesses = {},
+					     collection_latency = {},
+					     migration_latency = {};
+		for (u64 i = 0; i < folio_debug_info_store_len; ++i) {
+			struct folio_debug_info *info =
+				folio_debug_info_store + i;
+
+			logarithmic_histogram_push(&total_accesses,
+						   info->total_accesses);
+			if (!info->timestamps[FDTI_FIRST_FOUND]) {
+				continue;
+			}
+
+			if (!info->timestamps[FDTI_COLLECTION]) {
+				continue;
+			}
+			logarithmic_histogram_push(
+				&collection_latency,
+				saturating_sub(
+					info->timestamps[FDTI_COLLECTION],
+					info->timestamps[FDTI_FIRST_FOUND]));
+
+			if (!info->timestamps[FDTI_MIGRATION]) {
+				continue;
+			}
+			logarithmic_histogram_push(
+				&migration_latency,
+				saturating_sub(
+					info->timestamps[FDTI_MIGRATION],
+					info->timestamps[FDTI_COLLECTION]));
+		}
+
+		pr_info("total_accesses histo:\n");
+		logarithmic_histogram_print_debug(&total_accesses);
+
+		pr_info("collection_latency histo:\n");
+		logarithmic_histogram_print_debug(&collection_latency);
+
+		pr_info("migration_latency histo:\n");
+		logarithmic_histogram_print_debug(&migration_latency);
+
+		pr_info("reoccurrence_latency histo:\n");
+		logarithmic_histogram_print_debug(&reoccurrence_latency);
+	}
+
 	return 0;
 }
 
@@ -1153,23 +1300,59 @@ static int migration_do(struct indexable_heap *heap, bool demotion)
 		return -EAGAIN;
 	}
 
-	u64 migrated = 0;
+	u64 isolated = 0, migrated = 0, *pfns = NULL, pfns_len = 0,
+	    ts = local_clock();
 	scoped_guard(lru)
 	{
-		struct list_head isolated = LIST_HEAD_INIT(isolated);
-		u64 got = migration_isolate_folios(heap, demotion, &isolated);
-		if (!got) {
+		struct list_head folios = LIST_HEAD_INIT(folios);
+		isolated = migration_isolate_folios(heap, demotion, &folios);
+		if (!isolated) {
 			// try again later
 			return -EAGAIN;
 		}
+		pfns = kvcalloc(sizeof(u64), isolated, GFP_KERNEL);
+		struct folio *folio;
+		list_for_each_entry(folio, &folios, lru) {
+			pfns[pfns_len++] = folio_pfn(folio);
+		}
 		pr_info_ratelimited("%s: %s isolated %llu pages\n", __func__,
-				    demotion ? " demotion" : "promotion", got);
-		migrated = migration_migrate_folios(&isolated, demotion);
+				    demotion ? " demotion" : "promotion",
+				    isolated);
+		migrated = migration_migrate_folios(&folios, demotion);
+		count_vm_events(demotion ? PAGE_DEMOTED : PAGE_PROMOTED,
+				migrated);
 		pr_info_ratelimited("%s: %s migrated %llu pages\n", __func__,
 				    demotion ? " demotion" : "promotion",
 				    migrated);
 	}
+	if (debug_migration_latency && folio_debug_info_store &&
+	    isolated == migrated) {
+		for (u64 i = 0; i < pfns_len; ++i) {
+			u64 pfn = pfns[i];
+			struct folio_debug_info *info =
+				folio_debug_info_store + pfn;
+			if (!info->timestamps[FDTI_MIGRATION]) {
+				info->timestamps[FDTI_MIGRATION] = ts;
+			}
+		}
+	}
+	if (pfns) {
+		kvfree(pfns);
+	}
 	return migrated;
+}
+
+// void cyc2ns_print_debug(void);
+void tsc_sched_clock_ratio_print_debug(void *)
+{
+	u64 tsc = rdtsc();
+	u64 lclock = local_clock();
+	u64 sclock = native_sched_clock();
+	pr_info_ratelimited(
+		"%s: cpu=%d tsc=%llu lclock=%llu sclock=%llu lsoffset=%llu\n",
+		__func__, smp_processor_id(), tsc, lclock, sclock,
+		sclock - lclock);
+	// cyc2ns_print_debug();
 }
 
 static int placement_thread_fn_migration(struct placement *p)
@@ -1189,6 +1372,7 @@ static int placement_thread_fn_migration(struct placement *p)
 
 	u64 last_demoted = migration_batch_size;
 	while (!kthread_should_stop()) {
+		u64 begin = native_sched_clock();
 		struct placement_shared_state *state = &p->state;
 		scoped_guard(mutex, &state->lock)
 		{
@@ -1243,9 +1427,13 @@ static int placement_thread_fn_migration(struct placement *p)
 		}
 
 yield:
+		count_vm_events(PAGE_MIGRATION_COST,
+				native_sched_clock() - begin);
 		// give up cpu
 		// pr_info_ratelimited("%s: thread giving up cpu\n", __func__);
 		schedule_timeout_interruptible(timeout);
+		smp_call_function(tsc_sched_clock_ratio_print_debug, NULL,
+				  true);
 	}
 	return 0;
 }
@@ -1331,6 +1519,17 @@ static struct placement __global_placement;
 
 static int init(void)
 {
+	u64 spanned = 0;
+	int nid;
+	for_each_node_state(nid, N_MEMORY) {
+		spanned += NODE_DATA(nid)->node_spanned_pages;
+	}
+	if (debug_migration_latency) {
+		folio_debug_info_store = kvcalloc(
+			spanned, sizeof(struct folio_debug_info), GFP_KERNEL);
+		folio_debug_info_store_len = spanned;
+	}
+
 	struct placement *p = &__global_placement;
 	TRY(placement_init(p));
 	TRY(placement_thread_start(p));
@@ -1338,10 +1537,40 @@ static int init(void)
 	return 0;
 }
 
+// #define DEFINE_CLASS(_name, _type, _exit, _init, _init_args...)     \
+// 	typedef _type class_##_name##_t;                            \
+// 	static inline void class_##_name##_destructor(_type *p)     \
+// 	{                                                           \
+// 		_type _T = *p;                                      \
+// 		_exit;                                              \
+// 	}                                                           \
+// 	static inline _type class_##_name##_constructor(_init_args) \
+// 	{                                                           \
+// 		_type t = _init;                                    \
+// 		return t;                                           \
+// 	}
+
+struct vmevent {
+	enum vm_event_item item;
+	u64 begin;
+};
+static inline struct vmevent vmevent_ctor(enum vm_event_item item)
+{
+	struct vmevent t = { .begin = native_sched_clock(), .item = item };
+	return t;
+}
+DEFINE_CLASS(vmevent, struct vmevent,
+	     count_vm_events(_T.item, native_sched_clock() - _T.begin),
+	     vmevent_ctor(item), enum vm_event_item item);
+
 static void exit(void)
 {
 	struct placement *p = &__global_placement;
 	placement_drop(p);
+
+	if (debug_migration_latency && folio_debug_info_store) {
+		kvfree(folio_debug_info_store);
+	}
 }
 
 module_init(init);
