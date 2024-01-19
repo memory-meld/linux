@@ -2063,9 +2063,10 @@ __intel_pmu_pebs_event(struct perf_event *event,
 	if (!iregs)
 		iregs = &dummy_iregs;
 
+	perf_overflow_handler_t	overflow_handler = READ_ONCE(event->overflow_handler);
 	while (count > 1) {
 		setup_sample(event, iregs, at, data, regs);
-		READ_ONCE(event->overflow_handler)(event, data, regs);
+		overflow_handler(event, data, regs);
 		at += cpuc->pebs_record_size;
 		at = get_next_pebs_record_by_bit(at, top, bit);
 		count--;
@@ -2079,7 +2080,7 @@ __intel_pmu_pebs_event(struct perf_event *event,
 		 * last record the same as other PEBS records, and doesn't
 		 * invoke the generic overflow handler.
 		 */
-		READ_ONCE(event->overflow_handler)(event, data, regs);
+		overflow_handler(event, data, regs);
 	} else {
 		/*
 		 * All but the last records are processed.
@@ -2300,7 +2301,6 @@ static void intel_pmu_drain_pebs_icl(struct pt_regs *iregs, struct perf_sample_d
 		for_each_set_bit(bit, (unsigned long *)&pebs_status, size)
 			counts[bit]++;
 	}
-	count_vm_events(PEBS_COLLECTION_COST, native_sched_clock() - begin);
 
 	for_each_set_bit(bit, (unsigned long *)&mask, size) {
 		if (counts[bit] == 0)
@@ -2318,6 +2318,7 @@ static void intel_pmu_drain_pebs_icl(struct pt_regs *iregs, struct perf_sample_d
 				       setup_pebs_adaptive_sample_data);
 		count_vm_events(PEBS_SAMPLE_COLLECTED, counts[bit]);
 	}
+	count_vm_events(PEBS_COLLECTION_COST, native_sched_clock() - begin);
 }
 
 /*
