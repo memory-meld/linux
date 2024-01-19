@@ -7,39 +7,19 @@
 #ifndef CVECTOR_H_
 #define CVECTOR_H_
 
-/* cvector heap implemented using C library malloc() */
+#include <linux/mm.h>
+#include <linux/string.h>
 
-/* in case C library malloc() needs extra protection,
- * allow these defines to be overridden.
- */
-#ifndef cvector_clib_free
-#include <stdlib.h> /* for free */
-#define cvector_clib_free free
-#endif
-#ifndef cvector_clib_malloc
-#include <stdlib.h> /* for malloc */
-#define cvector_clib_malloc malloc
-#endif
-#ifndef cvector_clib_calloc
-#include <stdlib.h> /* for calloc */
-#define cvector_clib_calloc calloc
-#endif
-#ifndef cvector_clib_realloc
-#include <stdlib.h> /* for realloc */
-#define cvector_clib_realloc realloc
-#endif
-#ifndef cvector_clib_assert
-#include <assert.h> /* for assert */
-#define cvector_clib_assert assert
-#endif
-#ifndef cvector_clib_memcpy
-#include <string.h> /* for memcpy */
+#define CVECTOR_LOGARITHMIC_GROWTH
+
+#define CVECTOR_GFP GFP_KERNEL
+#define cvector_clib_free(p) kfree((p))
+#define cvector_clib_malloc(size) kmalloc((size), CVECTOR_GFP)
+#define cvector_clib_kcalloc(n, size) kcalloc((n), (size), CVECTOR_GFP)
+#define cvector_clib_realloc(p, new_size) krealloc((p), (new_size), CVECTOR_GFP)
+#define cvector_clib_assert BUG_ON
 #define cvector_clib_memcpy memcpy
-#endif
-#ifndef cvector_clib_memmove
-#include <string.h> /* for memmove */
 #define cvector_clib_memmove memmove
-#endif
 
 typedef void (*cvector_elem_destructor_t)(void *elem);
 
