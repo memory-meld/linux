@@ -165,7 +165,7 @@ void *min_heap_back(struct min_heap *heap,
 	return heap->data + ((heap->nr - 1) * func->elem_size);
 }
 
-/* Remove the last element from the heap, O(log2(nr)). */
+/* Remove the last element from the heap, O(1). */
 static __always_inline
 void min_heap_pop_back(struct min_heap *heap,
 		const struct min_heap_callbacks *func)

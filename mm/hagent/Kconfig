@@ -1,6 +1,9 @@
 config HAGENT
 	tristate "Heterogeneous memory agent"
 	default m
+	depends on RUST
+	select BTREE
+	select PRIME_NUMBERS
 	help
 	  Enable heterogeneous memory guest agent to rebalance memory across different memory media.
 
