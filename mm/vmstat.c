@@ -1423,6 +1423,10 @@ const char * const vmstat_text[] = {
 	"hint_fault_page_migrated",
 	"dram_accesses",
 	"pmem_accesses",
+	"hotness_identification_cost",
+	"page_migration_cost",
+	"page_promoted",
+	"page_demoted",
 #endif /* CONFIG_VM_EVENT_COUNTERS || CONFIG_MEMCG */
 };
 #endif /* CONFIG_PROC_FS || CONFIG_SYSFS || CONFIG_NUMA || CONFIG_MEMCG */
