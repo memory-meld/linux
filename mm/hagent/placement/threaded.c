@@ -10,9 +10,6 @@
 #include "debug.h"
 #include "module.h"
 
-struct placement_shared_state;
-struct placement_shared_counter;
-
 #define for_each_node_lruvec(nid, lruvec)                                   \
 	for (struct mem_cgroup *memcg = mem_cgroup_iter(NULL, NULL, NULL);  \
 	     memcg != NULL; memcg = mem_cgroup_iter(NULL, memcg, NULL))     \
@@ -123,7 +120,7 @@ static void memcg_print_debug_all(void)
 	}
 }
 
-enum folio_debug_info_timestamp_index {
+enum folio_debug_info_timestamp {
 	// Used for calculating the latency between migration and pebs hardware
 	// first generated the sample
 	FDTI_FIRST_FOUND,
@@ -134,25 +131,147 @@ enum folio_debug_info_timestamp_index {
 	FDTI_LAST_FOUND,
 	FDTI_MAX,
 };
-struct folio_debug_info {
-	u64 total_accesses;
-	u64 timestamps[FDTI_MAX];
-};
 
-struct folio_debug_info *folio_debug_info_store = NULL;
-u64 folio_debug_info_store_len = 0;
+struct page_debug_info {
+	struct {
+		u64 total_accesses;
+		u64 timestamps[FDTI_MAX];
+	} *pages;
+	u64 len;
+	struct logarithmic_histogram reoccurrence_latency;
+};
+static inline void page_debug_info_drop(struct page_debug_info *info)
+{
+	kvfree(info->pages);
+	memset(info, 0, sizeof(*info));
+}
+static int __must_check page_debug_info_init(struct page_debug_info *info)
+{
+	info->len = num_possible_pages();
+	info->pages =
+		TRY(kvcalloc(info->len, sizeof(*info->pages), GFP_KERNEL));
+	return 0;
+}
+static int page_debug_info_mark_found(struct page_debug_info *info,
+				      struct perf_sample *s, u64 now)
+{
+	if (!info->len || !info->pages) {
+		return -EINVAL;
+	}
+	u64 pfn = PFN_DOWN(s->phys_addr);
+	if (!pfn) {
+		return -ENOENT;
+	}
+	typeof(info->pages) one = info->pages + pfn;
+	one->total_accesses += 1;
+	if (!one->timestamps[FDTI_FIRST_FOUND]) {
+		one->timestamps[FDTI_FIRST_FOUND] = s->time;
+	}
+	if (one->timestamps[FDTI_LAST_FOUND]) {
+		u64 reoccurrence = saturating_sub(
+			s->time, one->timestamps[FDTI_LAST_FOUND]);
+		logarithmic_histogram_push(&info->reoccurrence_latency,
+					   reoccurrence);
+	}
+	one->timestamps[FDTI_LAST_FOUND] = s->time;
+	if (!one->timestamps[FDTI_COLLECTION]) {
+		one->timestamps[FDTI_COLLECTION] = now;
+	}
+	return 0;
+}
+static int page_debug_info_mark_migrated(struct page_debug_info *info, u64 pfn,
+					 u64 now)
+{
+	if (!pfn) {
+		return -ENOENT;
+	}
+	typeof(info->pages) one = info->pages + pfn;
+	if (!one->timestamps[FDTI_MIGRATION]) {
+		one->timestamps[FDTI_MIGRATION] = now;
+	}
+	return 0;
+}
+static void page_debug_info_print_debug(struct page_debug_info *info)
+{
+	struct logarithmic_histogram total_accesses = {},
+				     collection_latency = {},
+				     migration_latency = {};
+	for (u64 i = 0; i < info->len; ++i) {
+		typeof(info->pages) one = info->pages + i;
+		logarithmic_histogram_push(&total_accesses,
+					   one->total_accesses);
+		if (!one->timestamps[FDTI_FIRST_FOUND] ||
+		    !one->timestamps[FDTI_COLLECTION]) {
+			continue;
+		}
+		logarithmic_histogram_push(
+			&collection_latency,
+			saturating_sub(one->timestamps[FDTI_COLLECTION],
+				       one->timestamps[FDTI_FIRST_FOUND]));
+		if (!one->timestamps[FDTI_MIGRATION]) {
+			continue;
+		}
+		logarithmic_histogram_push(
+			&migration_latency,
+			saturating_sub(one->timestamps[FDTI_MIGRATION],
+				       one->timestamps[FDTI_COLLECTION]));
+	}
+	pr_info("total_accesses histo:\n");
+	logarithmic_histogram_print_debug(&total_accesses);
+	pr_info("collection_latency histo:\n");
+	logarithmic_histogram_print_debug(&collection_latency);
+	pr_info("migration_latency histo:\n");
+	logarithmic_histogram_print_debug(&migration_latency);
+	pr_info("reoccurrence_latency histo:\n");
+	logarithmic_histogram_print_debug(&info->reoccurrence_latency);
+}
+
+struct sample_debug_info {
+	u64 size, cap;
+	struct perf_sample data[0];
+};
+static inline void sample_debug_info_drop(struct sample_debug_info *info)
+{
+	kvfree(info);
+}
+static int __must_check sample_debug_info_init(struct sample_debug_info **info,
+					       u64 cap)
+{
+	*info = kvzalloc(sizeof(**info) + sizeof(struct perf_sample) * cap,
+			 GFP_KERNEL);
+	if (!*info) {
+		return -ENOMEM;
+	}
+	(*info)->cap = cap;
+	return 0;
+}
+static int sample_debug_info_push(struct sample_debug_info *info,
+				  struct perf_sample *s)
+{
+	if (info->size >= info->cap) {
+		return -ENOSPC;
+	}
+	info->data[info->size++] = *s;
+	return 0;
+}
+static ssize_t sample_debug_info_write_file(struct sample_debug_info *info,
+					    char const *filename)
+{
+	return debug_write_file(filename, info->data,
+				info->size * sizeof(struct perf_sample));
+}
+
+struct page_debug_info page_debug_info = {};
 int placement_thread_fn_policy(struct placement *p)
 {
 	pr_info("%s: thread started\n", __func__);
-	u64 spanned = 0;
-	int nid;
-	for_each_node_state(nid, N_MEMORY) {
-		spanned += NODE_DATA(nid)->node_spanned_pages;
-	}
+
 	if (debug_migration_latency) {
-		folio_debug_info_store = kvcalloc(
-			spanned, sizeof(struct folio_debug_info), GFP_KERNEL);
-		folio_debug_info_store_len = spanned;
+		TRY(page_debug_info_init(&page_debug_info));
+	}
+	struct sample_debug_info *sample_debug_info = {};
+	if (debug_log_samples) {
+		TRY(sample_debug_info_init(&sample_debug_info, 2ul << 20));
 	}
 
 	u64 timeout = usecs_to_jiffies(10000);
@@ -163,15 +282,6 @@ int placement_thread_fn_policy(struct placement *p)
 	TRY(streaming_decaying_sketch_init(&sds,
 					   streaming_decaying_sketch_width,
 					   streaming_decaying_sketch_depth));
-
-	u64 debug_samples_len = 0, debug_samples_cap = 2ul << 20;
-	struct perf_sample *debug_samples_store =
-		unlikely(debug_log_samples) ?
-			kvmalloc(sizeof(struct perf_sample) *
-					 (debug_samples_cap),
-				 GFP_KERNEL) :
-			NULL;
-	struct logarithmic_histogram reoccurrence_latency = {};
 
 	while (!kthread_should_stop()) {
 		u64 begin = local_clock();
@@ -197,14 +307,9 @@ int placement_thread_fn_policy(struct placement *p)
 			u64 ts = local_clock();
 			for_each_sample_from_cpu_x_event(p, cpu, eidx, e, s)
 			{
-				if (unlikely(debug_log_samples &&
-					     debug_samples_store &&
-					     debug_samples_len <
-						     debug_samples_cap)) {
-					debug_samples_store[debug_samples_len++ %
-							    debug_samples_cap] =
-						s;
-					// continue;
+				if (unlikely(debug_log_samples)) {
+					sample_debug_info_push(
+						sample_debug_info, &s);
 				}
 
 				++valid;
@@ -217,31 +322,9 @@ int placement_thread_fn_policy(struct placement *p)
 				}
 
 				u64 pfn = PFN_DOWN(s.phys_addr);
-				if (debug_migration_latency &&
-				    folio_debug_info_store) {
-					struct folio_debug_info *info =
-						folio_debug_info_store + pfn;
-					info->total_accesses += 1;
-					if (!info->timestamps[FDTI_FIRST_FOUND]) {
-						info->timestamps
-							[FDTI_FIRST_FOUND] =
-							s.time;
-					}
-					if (info->timestamps[FDTI_LAST_FOUND]) {
-						u64 reoccurrence = saturating_sub(
-							s.time,
-							info->timestamps
-								[FDTI_LAST_FOUND]);
-						logarithmic_histogram_push(
-							&reoccurrence_latency,
-							reoccurrence);
-					}
-					info->timestamps[FDTI_LAST_FOUND] =
-						s.time;
-					if (!info->timestamps[FDTI_COLLECTION]) {
-						info->timestamps[FDTI_COLLECTION] =
-							ts;
-					}
+				if (unlikely(debug_migration_latency)) {
+					page_debug_info_mark_found(
+						&page_debug_info, &s, ts);
 				}
 				bool in_dram = pfn_to_nid(pfn) == DRAM_NID;
 				u64 count = streaming_decaying_sketch_push(&sds,
@@ -301,57 +384,13 @@ int placement_thread_fn_policy(struct placement *p)
 	}
 
 	if (debug_log_samples) {
-		debug_write_file("/out/debug_samples", debug_samples_store,
-				 min(debug_samples_len, debug_samples_cap) *
-					 sizeof(struct perf_sample));
+		sample_debug_info_write_file(sample_debug_info,
+					     "/out/debug_samples");
+		sample_debug_info_drop(sample_debug_info);
 	}
-	if (debug_migration_latency && folio_debug_info_store) {
-		kvfree(folio_debug_info_store);
-	}
-	if (debug_migration_latency && folio_debug_info_store) {
-		struct logarithmic_histogram total_accesses = {},
-					     collection_latency = {},
-					     migration_latency = {};
-		for (u64 i = 0; i < folio_debug_info_store_len; ++i) {
-			struct folio_debug_info *info =
-				folio_debug_info_store + i;
-
-			logarithmic_histogram_push(&total_accesses,
-						   info->total_accesses);
-			if (!info->timestamps[FDTI_FIRST_FOUND]) {
-				continue;
-			}
-
-			if (!info->timestamps[FDTI_COLLECTION]) {
-				continue;
-			}
-			logarithmic_histogram_push(
-				&collection_latency,
-				saturating_sub(
-					info->timestamps[FDTI_COLLECTION],
-					info->timestamps[FDTI_FIRST_FOUND]));
-
-			if (!info->timestamps[FDTI_MIGRATION]) {
-				continue;
-			}
-			logarithmic_histogram_push(
-				&migration_latency,
-				saturating_sub(
-					info->timestamps[FDTI_MIGRATION],
-					info->timestamps[FDTI_COLLECTION]));
-		}
-
-		pr_info("total_accesses histo:\n");
-		logarithmic_histogram_print_debug(&total_accesses);
-
-		pr_info("collection_latency histo:\n");
-		logarithmic_histogram_print_debug(&collection_latency);
-
-		pr_info("migration_latency histo:\n");
-		logarithmic_histogram_print_debug(&migration_latency);
-
-		pr_info("reoccurrence_latency histo:\n");
-		logarithmic_histogram_print_debug(&reoccurrence_latency);
+	if (debug_migration_latency) {
+		page_debug_info_print_debug(&page_debug_info);
+		page_debug_info_drop(&page_debug_info);
 	}
 
 	return 0;
@@ -450,20 +489,21 @@ static int migration_do(struct indexable_heap *heap, bool demotion)
 		return -EAGAIN;
 	}
 
-	u64 isolated = 0, migrated = 0, *pfns = NULL, pfns_len = 0,
-	    ts = local_clock();
+	u64 isolated = {}, migrated = {}, ts = local_clock();
+	u64 *pfns = {};
+	struct list_head folios = LIST_HEAD_INIT(folios);
+	struct folio *folio;
 	scoped_guard(lru)
 	{
-		struct list_head folios = LIST_HEAD_INIT(folios);
 		isolated = migration_isolate_folios(heap, demotion, &folios);
 		if (!isolated) {
 			// try again later
 			return -EAGAIN;
 		}
-		pfns = kvcalloc(sizeof(u64), isolated, GFP_KERNEL);
-		struct folio *folio;
+		pfns = kvcalloc(isolated, sizeof(u64), GFP_KERNEL);
+		u64 i = 0;
 		list_for_each_entry(folio, &folios, lru) {
-			pfns[pfns_len++] = folio_pfn(folio);
+			pfns[i++] = folio_pfn(folio);
 		}
 		pr_info_ratelimited("%s: %s isolated %llu pages\n", __func__,
 				    demotion ? " demotion" : "promotion",
@@ -475,20 +515,28 @@ static int migration_do(struct indexable_heap *heap, bool demotion)
 				    demotion ? " demotion" : "promotion",
 				    migrated);
 	}
-	if (debug_migration_latency && folio_debug_info_store &&
-	    isolated == migrated) {
-		for (u64 i = 0; i < pfns_len; ++i) {
-			u64 pfn = pfns[i];
-			struct folio_debug_info *info =
-				folio_debug_info_store + pfn;
-			if (!info->timestamps[FDTI_MIGRATION]) {
-				info->timestamps[FDTI_MIGRATION] = ts;
+	u64 last = 0;
+	// Filter out those isolated but not migrated folios
+	list_for_each_entry(folio, &folios, lru) {
+		for (u64 i = 0; i < isolated; ++i) {
+			u64 j = last + i % isolated;
+			if (pfns[j] != folio_pfn(folio)) {
+				continue;
 			}
+			pfns[last = j] = 0;
+			break;
 		}
 	}
-	if (pfns) {
-		kvfree(pfns);
+	if (debug_migration_latency) {
+		// Only record the migration latency of those successfully
+		// migrated pages
+		for (u64 i = 0; i < isolated; ++i) {
+			page_debug_info_mark_migrated(&page_debug_info, pfns[i],
+						      ts);
+		}
 	}
+	// kvfree() will do nothing for a NULL pointer
+	kvfree(pfns);
 	return migrated;
 }
 

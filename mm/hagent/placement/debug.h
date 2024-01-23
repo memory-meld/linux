@@ -16,7 +16,7 @@ static inline int __filp_close(struct file **file)
 // 	     filp_open(filename, flags, mode), const char *filename, int flags,
 // 	     umode_t mode);
 
-static inline ssize_t debug_write_file(char *name, void *buf, size_t len)
+static inline ssize_t debug_write_file(char const *name, void *buf, size_t len)
 {
 	if (!name || !buf) {
 		return -EINVAL;

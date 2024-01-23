@@ -4,8 +4,9 @@
 #include <linux/prime_numbers.h>
 #include <linux/xxhash.h>
 
-#include "utils.h"
 #include "module.h"
+#include "mt19937.h"
+#include "utils.h"
 
 // clang-format off
 static inline u64 streaming_decaying_sketch_powb(u64 exp) {
@@ -47,6 +48,22 @@ streaming_decaying_sketch_init(struct streaming_decaying_sketch *s, u64 w,
 		return -ENOMEM;
 	}
 	return 0;
+}
+
+static inline void streaming_decaying_sketch_update_param(void)
+{
+	if (streaming_decaying_sketch_width != SDS_WIDTH) {
+		// leave depth unchanged
+		return;
+	}
+	// The original implementation has 2000 < W < 12000.
+	// When giving b = 1.08, N = 10^7, ε = 2^−16 or 2^−17,
+	// the error rate is within (0.01, 0.05)
+	// if we choose W = 7000, we have W = 7/10000 of N
+	streaming_decaying_sketch_width =
+		next_prime_number(num_possible_pages() * 7 / 10000 / 3);
+	pr_info("%s: streaming_decaying_sketch_width=%lu\n", __func__,
+		streaming_decaying_sketch_width);
 }
 
 static inline struct streaming_decaying_sketch_slot *
@@ -109,26 +126,6 @@ streaming_decaying_sketch_push(struct streaming_decaying_sketch *s, u64 key)
 		count = max(*c, count);
 	}
 	return count;
-}
-
-static inline void streaming_decaying_sketch_update_param(void)
-{
-	if (streaming_decaying_sketch_width == SDS_WIDTH) {
-		// The original implementation has 2000 < W < 12000.
-		// When giving b = 1.08, N = 10^7, ε = 2^−16 or 2^−17,
-		// the error rate is within (0.01,0.05)
-		// if we choose W = 7000, we have W = 7/10000 of N
-		u64 spanned = 0;
-		int nid;
-		for_each_node_state(nid, N_MEMORY) {
-			spanned += NODE_DATA(nid)->node_spanned_pages;
-		}
-		streaming_decaying_sketch_width =
-			next_prime_number(spanned * 7 / 10000 / 3);
-		pr_info("%s: streaming_decaying_sketch_width=%lu\n", __func__,
-			streaming_decaying_sketch_width);
-	}
-	// leave depth unchanged
 }
 
 #endif // !HAGENT_PLACEMENT_SDS_H
