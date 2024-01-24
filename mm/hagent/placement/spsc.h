@@ -11,6 +11,7 @@ struct spsc {
 
 static inline void spsc_drop(struct spsc *ch)
 {
+	pr_info("%s: ch=0x%px buffer=0x%px\n", __func__, ch, ch->buffer);
 	kvfree(ch->buffer);
 }
 
@@ -19,6 +20,8 @@ static inline int __must_check spsc_init(struct spsc *ch, u64 size)
 	ch->head = ch->tail = 0;
 	ch->size = size;
 	ch->buffer = kvmalloc(size, GFP_KERNEL);
+	pr_info("%s: ch=0x%px size=%llu buffer=0x%px\n", __func__, ch, size,
+		ch->buffer);
 	if (!ch->buffer) {
 		return -ENOMEM;
 	}

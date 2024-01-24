@@ -6,9 +6,9 @@
 #include "placement.h"
 #include "sds.h"
 #include "iheap.h"
-#include "histogram.h"
 #include "debug.h"
 #include "module.h"
+#include "migrate.h"
 
 #define for_each_node_lruvec(nid, lruvec)                                   \
 	for (struct mem_cgroup *memcg = mem_cgroup_iter(NULL, NULL, NULL);  \
@@ -30,13 +30,6 @@
 	if (!(BIT(lru) & (lru_mask))) continue;				\
 	else list_for_each_entry((folio), &lruvec->lists[lru], lru)
 // clang-format on
-
-#define for_each_sample_from_cpu_x_event(p, cpu, eidx, e, s)                  \
-	for (cpu = 0; cpu < num_online_cpus(); ++cpu)                         \
-		for (eidx = 0; eidx < EI_MAX; ++eidx)                         \
-			for (e = (p)->events[cpu][eidx]; e; e = NULL)         \
-				for (; !spsc_pop(e->overflow_handler_context, \
-						 &s, sizeof(s));)
 
 static inline u64 policy_drain_lruvec(struct streaming_decaying_sketch *sds,
 				      struct indexable_heap *heap,
@@ -120,168 +113,12 @@ static void memcg_print_debug_all(void)
 	}
 }
 
-enum folio_debug_info_timestamp {
-	// Used for calculating the latency between migration and pebs hardware
-	// first generated the sample
-	FDTI_FIRST_FOUND,
-	FDTI_COLLECTION,
-	FDTI_MIGRATION,
-	// Used for calculating how long does it take for the same sample to
-	// occur again
-	FDTI_LAST_FOUND,
-	FDTI_MAX,
-};
-
-struct page_debug_info {
-	struct {
-		u64 total_accesses;
-		u64 timestamps[FDTI_MAX];
-	} *pages;
-	u64 len;
-	struct logarithmic_histogram reoccurrence_latency;
-};
-static inline void page_debug_info_drop(struct page_debug_info *info)
-{
-	kvfree(info->pages);
-	memset(info, 0, sizeof(*info));
-}
-static int __must_check page_debug_info_init(struct page_debug_info *info)
-{
-	info->len = num_possible_pages();
-	info->pages =
-		TRY(kvcalloc(info->len, sizeof(*info->pages), GFP_KERNEL));
-	return 0;
-}
-static int page_debug_info_mark_found(struct page_debug_info *info,
-				      struct perf_sample *s, u64 now)
-{
-	if (!info->len || !info->pages) {
-		return -EINVAL;
-	}
-	u64 pfn = PFN_DOWN(s->phys_addr);
-	if (!pfn) {
-		return -ENOENT;
-	}
-	typeof(info->pages) one = info->pages + pfn;
-	one->total_accesses += 1;
-	if (!one->timestamps[FDTI_FIRST_FOUND]) {
-		one->timestamps[FDTI_FIRST_FOUND] = s->time;
-	}
-	if (one->timestamps[FDTI_LAST_FOUND]) {
-		u64 reoccurrence = saturating_sub(
-			s->time, one->timestamps[FDTI_LAST_FOUND]);
-		logarithmic_histogram_push(&info->reoccurrence_latency,
-					   reoccurrence);
-	}
-	one->timestamps[FDTI_LAST_FOUND] = s->time;
-	if (!one->timestamps[FDTI_COLLECTION]) {
-		one->timestamps[FDTI_COLLECTION] = now;
-	}
-	return 0;
-}
-static int page_debug_info_mark_migrated(struct page_debug_info *info, u64 pfn,
-					 u64 now)
-{
-	if (!pfn) {
-		return -ENOENT;
-	}
-	typeof(info->pages) one = info->pages + pfn;
-	if (!one->timestamps[FDTI_MIGRATION]) {
-		one->timestamps[FDTI_MIGRATION] = now;
-	}
-	return 0;
-}
-static void page_debug_info_print_debug(struct page_debug_info *info)
-{
-	struct logarithmic_histogram total_accesses = {},
-				     collection_latency = {},
-				     migration_latency = {};
-	for (u64 i = 0; i < info->len; ++i) {
-		typeof(info->pages) one = info->pages + i;
-		logarithmic_histogram_push(&total_accesses,
-					   one->total_accesses);
-		if (!one->timestamps[FDTI_FIRST_FOUND] ||
-		    !one->timestamps[FDTI_COLLECTION]) {
-			continue;
-		}
-		logarithmic_histogram_push(
-			&collection_latency,
-			saturating_sub(one->timestamps[FDTI_COLLECTION],
-				       one->timestamps[FDTI_FIRST_FOUND]));
-		if (!one->timestamps[FDTI_MIGRATION]) {
-			continue;
-		}
-		logarithmic_histogram_push(
-			&migration_latency,
-			saturating_sub(one->timestamps[FDTI_MIGRATION],
-				       one->timestamps[FDTI_COLLECTION]));
-	}
-	pr_info("total_accesses histo:\n");
-	logarithmic_histogram_print_debug(&total_accesses);
-	pr_info("collection_latency histo:\n");
-	logarithmic_histogram_print_debug(&collection_latency);
-	pr_info("migration_latency histo:\n");
-	logarithmic_histogram_print_debug(&migration_latency);
-	pr_info("reoccurrence_latency histo:\n");
-	logarithmic_histogram_print_debug(&info->reoccurrence_latency);
-}
-
-struct sample_debug_info {
-	u64 size, cap;
-	struct perf_sample data[0];
-};
-static inline void sample_debug_info_drop(struct sample_debug_info *info)
-{
-	kvfree(info);
-}
-static int __must_check sample_debug_info_init(struct sample_debug_info **info,
-					       u64 cap)
-{
-	*info = kvzalloc(sizeof(**info) + sizeof(struct perf_sample) * cap,
-			 GFP_KERNEL);
-	if (!*info) {
-		return -ENOMEM;
-	}
-	(*info)->cap = cap;
-	return 0;
-}
-static int sample_debug_info_push(struct sample_debug_info *info,
-				  struct perf_sample *s)
-{
-	if (info->size >= info->cap) {
-		return -ENOSPC;
-	}
-	info->data[info->size++] = *s;
-	return 0;
-}
-static ssize_t sample_debug_info_write_file(struct sample_debug_info *info,
-					    char const *filename)
-{
-	return debug_write_file(filename, info->data,
-				info->size * sizeof(struct perf_sample));
-}
-
-struct page_debug_info page_debug_info = {};
 int placement_thread_fn_policy(struct placement *p)
 {
 	pr_info("%s: thread started\n", __func__);
 
-	if (debug_migration_latency) {
-		TRY(page_debug_info_init(&page_debug_info));
-	}
-	struct sample_debug_info *sample_debug_info = {};
-	if (debug_log_samples) {
-		TRY(sample_debug_info_init(&sample_debug_info, 2ul << 20));
-	}
-
 	u64 timeout = usecs_to_jiffies(10000);
 	u64 interval = 10000, iter = 0, valid = 0;
-
-	struct streaming_decaying_sketch sds;
-	streaming_decaying_sketch_update_param();
-	TRY(streaming_decaying_sketch_init(&sds,
-					   streaming_decaying_sketch_width,
-					   streaming_decaying_sketch_depth));
 
 	while (!kthread_should_stop()) {
 		u64 begin = local_clock();
@@ -302,95 +139,81 @@ int placement_thread_fn_policy(struct placement *p)
 		struct placement_shared_counter diff = {};
 
 		struct placement_shared_state *state = &p->state;
+		u64 ts = local_clock();
 		scoped_guard(mutex, &state->lock)
-		{
-			u64 ts = local_clock();
+
 			for_each_sample_from_cpu_x_event(p, cpu, eidx, e, s)
-			{
-				if (unlikely(debug_log_samples)) {
-					sample_debug_info_push(
-						sample_debug_info, &s);
-				}
-
-				++valid;
-				// pr_info_ratelimited(
-				// 	"%s: got %llu-th sample: cpu=%d eidx=%d pid=%u tid=%u time=%llu addr=0x%llx weight=%llu phys_addr=0x%llx\n",
-				// 	__func__, valid, cpu, eidx, s.pid, s.tid,
-				// 	s.time, s.addr, s.weight, s.phys_addr);
-				if (!s.phys_addr) {
-					continue;
-				}
-
-				u64 pfn = PFN_DOWN(s.phys_addr);
-				if (unlikely(debug_migration_latency)) {
-					page_debug_info_mark_found(
-						&page_debug_info, &s, ts);
-				}
-				bool in_dram = pfn_to_nid(pfn) == DRAM_NID;
-				u64 count = streaming_decaying_sketch_push(&sds,
-									   pfn);
-				struct pair elem = { pfn, count }, old = {};
-
-				int idx = in_dram ? CHI_DEMOTION :
-						    CHI_PROMOTION;
-				old = indexable_heap_insert(
-					state->candidate + idx, &elem);
-				// switch (old.key) {
-				// case -EFBIG:
-				// 	break;
-				// case -ENOENT:
-				// 	pr_info_ratelimited(
-				// 		"%s: %s candidate insert  pfn=0x%llx count=%llu\n",
-				// 		__func__,
-				// 		in_dram ? " demotion" : "promotion",
-				// 		pfn, count);
-				// 	break;
-				// default:
-				// 	pr_info_ratelimited(
-				// 		"%s: %s candidate %s pfn=0x%llx count=%llu old_count=%llu\n",
-				// 		__func__,
-				// 		in_dram ? " demotion" : "promotion",
-				// 		old.key == elem.key ? "update " :
-				// 				      "replace",
-				// 		pfn, count, old.value);
-				// 	break;
-				// }
-				placement_shared_counter_count(&diff, &s);
+		{
+			if (unlikely(debug_log_samples)) {
+				sample_debug_info_push(p->debug.samples, &s);
 			}
 
-			placement_shared_counter_merge(&state->counters, &diff);
-
-			for (int i = 0; i < CHI_MAX; ++i) {
-				u64 *not_eough =
-					state->candidate_not_enough + i;
-				if (*not_eough == 0) {
-					continue;
-				}
-				// should drain_lru
-				u64 drained = policy_drain_lruvec(
-					&sds, &state->candidate[i],
-					i == CHI_DEMOTION);
-				*not_eough = saturating_sub(
-					*not_eough,
-					drained / migration_batch_size);
+			++valid;
+			// pr_info_ratelimited(
+			// 	"%s: got %llu-th sample: cpu=%d eidx=%d pid=%u tid=%u time=%llu addr=0x%llx weight=%llu phys_addr=0x%llx\n",
+			// 	__func__, valid, cpu, eidx, s.pid, s.tid,
+			// 	s.time, s.addr, s.weight, s.phys_addr);
+			if (!s.phys_addr) {
+				continue;
 			}
+
+			u64 pfn = PFN_DOWN(s.phys_addr);
+			if (unlikely(debug_migration_latency)) {
+				page_debug_info_mark_found(&p->debug.pages, &s,
+							   ts);
+			}
+			bool in_dram = pfn_to_nid(pfn) == DRAM_NID;
+			u64 count = streaming_decaying_sketch_push(&state->sds,
+								   pfn);
+			struct pair elem = { pfn, count }, old = {};
+
+			int idx = in_dram ? CHI_DEMOTION : CHI_PROMOTION;
+			old = indexable_heap_insert(state->candidate + idx,
+						    &elem);
+			// switch (old.key) {
+			// case -EFBIG:
+			// 	break;
+			// case -ENOENT:
+			// 	pr_info_ratelimited(
+			// 		"%s: %s candidate insert  pfn=0x%llx count=%llu\n",
+			// 		__func__,
+			// 		in_dram ? " demotion" : "promotion",
+			// 		pfn, count);
+			// 	break;
+			// default:
+			// 	pr_info_ratelimited(
+			// 		"%s: %s candidate %s pfn=0x%llx count=%llu old_count=%llu\n",
+			// 		__func__,
+			// 		in_dram ? " demotion" : "promotion",
+			// 		old.key == elem.key ? "update " :
+			// 				      "replace",
+			// 		pfn, count, old.value);
+			// 	break;
+			// }
+			placement_shared_counter_count(&diff, &s);
 		}
+
+		placement_shared_counter_merge(&state->counters, &diff);
+
+		for (int i = 0; i < CHI_MAX; ++i) {
+			u64 *not_eough = state->candidate_not_enough + i;
+			if (*not_eough == 0) {
+				continue;
+			}
+			// should drain_lru
+			u64 drained = policy_drain_lruvec(&state->sds,
+							  &state->candidate[i],
+							  i == CHI_DEMOTION);
+			*not_eough = saturating_sub(
+				*not_eough, drained / migration_batch_size);
+		}
+
 		count_vm_events(HOTNESS_IDENTIFICATION_COST,
 				local_clock() - begin);
 
 		// give up cpu
 		// pr_info_ratelimited("%s: thread giving up cpu\n", __func__);
 		schedule_timeout_interruptible(timeout);
-	}
-
-	if (debug_log_samples) {
-		sample_debug_info_write_file(sample_debug_info,
-					     "/out/debug_samples");
-		sample_debug_info_drop(sample_debug_info);
-	}
-	if (debug_migration_latency) {
-		page_debug_info_print_debug(&page_debug_info);
-		page_debug_info_drop(&page_debug_info);
 	}
 
 	return 0;
@@ -401,143 +224,6 @@ static void zone_wmark_print_debug(struct zone *z)
 	pr_info("%s: min=%lu low=%lu high=%lu promo=%lu\n", __func__,
 		wmark_pages(z, WMARK_MIN), wmark_pages(z, WMARK_LOW),
 		wmark_pages(z, WMARK_HIGH), wmark_pages(z, WMARK_PROMO));
-}
-
-// reference:
-//  - migrate_folio_unmap() in mm/migrate.c
-//  - folio_get_anon_vma() in mm/rmap.c
-//  - rmap_walk_anon() in mm/rmap.c
-//  - migrate_to_node() in mm/mempolicy.c
-//  - queue_folios_pte_range() in mm/mempolicy.c
-static int migration_isolate_folios(struct indexable_heap *heap, bool demotion,
-				    struct list_head *isolated)
-{
-	int got = 0, filtered = 0, failed = 0,
-	    candidate = indexable_heap_length(heap);
-	while (got < migration_batch_size && indexable_heap_length(heap) > 0) {
-		struct pair *p = indexable_heap_pop_back(heap);
-		BUG_ON(!p);
-		u64 pfn = p->key, count = p->value;
-
-		if ((count > 1) ^ !demotion) {
-			++filtered;
-			continue;
-		}
-		// FIXME: make sure huge page is disabled
-		struct folio *folio = pfn_folio(pfn);
-		if (!folio || !folio_test_lru(folio) ||
-		    !folio_isolate_lru(folio)) {
-			++failed;
-			continue;
-		}
-		// pr_info_ratelimited(
-		// 	"%s: add pfn=0x%llx as migration candidate\n", __func__,
-		// 	p->key);
-		list_add_tail(&folio->lru, isolated);
-		node_stat_mod_folio(folio,
-				    NR_ISOLATED_ANON + folio_is_file_lru(folio),
-				    folio_nr_pages(folio));
-		++got;
-	}
-	if (got < migration_batch_size / 10 && !indexable_heap_length(heap)) {
-		pr_info_ratelimited(
-			"%s: not enough %s candidate candidate=%d got=%d filtered=%d failed=%d\n",
-			__func__, demotion ? " demotion" : "promotion",
-			candidate, got, filtered, failed);
-	}
-
-	return got;
-}
-
-static int migration_migrate_folios(struct list_head *isolated, bool demotion)
-{
-	int target_nid = demotion ? PMEM_NID : DRAM_NID;
-	nodemask_t target_mask = nodemask_of_node(target_nid);
-	struct migration_target_control mtc = {
-		.gfp_mask = (GFP_HIGHUSER_MOVABLE & ~__GFP_RECLAIM) |
-			    __GFP_NOWARN | __GFP_NOMEMALLOC | GFP_NOWAIT,
-		.nid = target_nid,
-		.nmask = &target_mask,
-	};
-	// pr_info_ratelimited("%s: migrate_pages trying %lu pages\n", __func__,
-	// 		    list_count_nodes(isolated));
-	u32 succeeded = 0;
-	int err = migrate_pages(isolated, alloc_migration_target, NULL,
-				(unsigned long)&mtc, MIGRATE_ASYNC,
-				MR_NUMA_MISPLACED, &succeeded);
-	u64 failed = list_count_nodes(isolated);
-	if (err) {
-		putback_movable_pages(isolated);
-	}
-	// pr_info_ratelimited(
-	// 	"%s: migrate_pages returned %d succeeded %u failed %llu\n",
-	// 	__func__, err, succeeded, failed);
-
-	return succeeded;
-}
-
-static int migration_do(struct indexable_heap *heap, bool demotion)
-{
-	int to_nid = demotion ? PMEM_NID : DRAM_NID;
-	struct zone *to_zone = NODE_DATA(to_nid)->node_zones + ZONE_NORMAL;
-
-	u64 free = zone_page_state(to_zone, NR_FREE_PAGES),
-	    wmark = wmark_pages(to_zone, WMARK_LOW);
-	// pr_info_ratelimited("%s: free=%llu wmark=%llu\n",
-	// 		    __func__, free, wmark);
-	if (free <= wmark) {
-		return -EAGAIN;
-	}
-
-	u64 isolated = {}, migrated = {}, ts = local_clock();
-	u64 *pfns = {};
-	struct list_head folios = LIST_HEAD_INIT(folios);
-	struct folio *folio;
-	scoped_guard(lru)
-	{
-		isolated = migration_isolate_folios(heap, demotion, &folios);
-		if (!isolated) {
-			// try again later
-			return -EAGAIN;
-		}
-		pfns = kvcalloc(isolated, sizeof(u64), GFP_KERNEL);
-		u64 i = 0;
-		list_for_each_entry(folio, &folios, lru) {
-			pfns[i++] = folio_pfn(folio);
-		}
-		pr_info_ratelimited("%s: %s isolated %llu pages\n", __func__,
-				    demotion ? " demotion" : "promotion",
-				    isolated);
-		migrated = migration_migrate_folios(&folios, demotion);
-		count_vm_events(demotion ? PAGE_DEMOTED : PAGE_PROMOTED,
-				migrated);
-		pr_info_ratelimited("%s: %s migrated %llu pages\n", __func__,
-				    demotion ? " demotion" : "promotion",
-				    migrated);
-	}
-	u64 last = 0;
-	// Filter out those isolated but not migrated folios
-	list_for_each_entry(folio, &folios, lru) {
-		for (u64 i = 0; i < isolated; ++i) {
-			u64 j = last + i % isolated;
-			if (pfns[j] != folio_pfn(folio)) {
-				continue;
-			}
-			pfns[last = j] = 0;
-			break;
-		}
-	}
-	if (debug_migration_latency) {
-		// Only record the migration latency of those successfully
-		// migrated pages
-		for (u64 i = 0; i < isolated; ++i) {
-			page_debug_info_mark_migrated(&page_debug_info, pfns[i],
-						      ts);
-		}
-	}
-	// kvfree() will do nothing for a NULL pointer
-	kvfree(pfns);
-	return migrated;
 }
 
 // void cyc2ns_print_debug(void);
@@ -599,7 +285,8 @@ int placement_thread_fn_migration(struct placement *p)
 			    wmark_pages(dram_normal, WMARK_PROMO)) {
 				// pr_info_ratelimited("%s: demotion\n", __func__);
 				err = migration_do(
-					&state->candidate[CHI_DEMOTION], true);
+					&state->candidate[CHI_DEMOTION], true,
+					&p->debug.pages);
 				if (err == -EAGAIN) {
 					goto yield;
 				}
@@ -615,7 +302,7 @@ int placement_thread_fn_migration(struct placement *p)
 			// However, promotion should be done continuously
 			// pr_info_ratelimited("%s: promotion\n", __func__);
 			err = migration_do(&state->candidate[CHI_PROMOTION],
-					   false);
+					   false, &p->debug.pages);
 			if (err == -EAGAIN) {
 				goto yield;
 			}

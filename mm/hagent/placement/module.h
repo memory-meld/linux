@@ -18,6 +18,7 @@ enum module_param_defaults {
 	MIGRATION_NCANDIDATE = 131072,
 	MIGRATION_TARGET_DRAM_ACCESS_PERCENTILE = 95,
 	MIGRATION_BATCH_SIZE = 4096,
+	ASYNCHRONOUS_ARCHITECTURE = true,
 };
 extern ulong ring_buffer_pages;
 extern ulong load_latency_sample_period;
@@ -28,7 +29,10 @@ extern ulong streaming_decaying_sketch_depth;
 extern ulong migration_candidate_size;
 extern ulong migration_target_dram_access_percentile;
 extern ulong migration_batch_size;
+extern bool asynchronous_architecture;
 extern bool debug_log_samples;
 extern bool debug_migration_latency;
+
+DECLARE_STATIC_KEY_TRUE(use_asynchronous_architecture);
 
 #endif // !HAGENT_PLACEMENT_MODULE_H

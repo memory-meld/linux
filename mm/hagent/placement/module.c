@@ -58,6 +58,12 @@ module_param_named(migration_batch_size, migration_batch_size, ulong, 0644);
 MODULE_PARM_DESC(migration_batch_size,
 		 "Batch size for migration, defaults to 4096 pages");
 
+bool asynchronous_architecture = ASYNCHRONOUS_ARCHITECTURE;
+module_param_named(asynchronous_architecture, asynchronous_architecture, bool,
+		   0644);
+MODULE_PARM_DESC(asynchronous_architecture,
+		 "Whether to use asynchronous architecture, defaults to true");
+
 bool debug_log_samples = false;
 module_param_named(debug_log_samples, debug_log_samples, bool, 0644);
 MODULE_PARM_DESC(debug_log_samples,
@@ -68,6 +74,8 @@ module_param_named(debug_migration_latency, debug_migration_latency, bool,
 		   0644);
 MODULE_PARM_DESC(debug_migration_latency,
 		 "Log migration latency (only for debugging)");
+
+DEFINE_STATIC_KEY_TRUE(use_asynchronous_architecture);
 
 static void intel_pmu_print_debug_all(void)
 {
@@ -100,9 +108,8 @@ static struct placement __global_placement;
 static int init(void)
 {
 	struct placement *p = &__global_placement;
-	TRY(placement_init(p));
-	TRY(placement_thread_start(p));
-	TRY(placement_event_start(p));
+	UNWRAP(placement_init(p));
+	UNWRAP(placement_start(p));
 	return 0;
 }
 

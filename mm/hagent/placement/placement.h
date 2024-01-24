@@ -1,7 +1,9 @@
 #ifndef HAGENT_PLACEMENT_PLACEMENT_H
 #define HAGENT_PLACEMENT_PLACEMENT_H
 
+#include "sds.h"
 #include "iheap.h"
+#include "debug.h"
 #include "module.h"
 #include "pebs.h"
 #include "spsc.h"
@@ -51,6 +53,15 @@ static struct perf_event_attr event_attrs[EI_MAX] = {
 	// 	.exclude_callchain_kernel= 1,
 	// },
 };
+static u64 event_attrs_index(struct perf_event_attr *attr)
+{
+	for (u64 i = 0; i < EI_MAX; ++i) {
+		if (attr->config == event_attrs[i].config) {
+			return i;
+		}
+	}
+	BUG();
+}
 
 static inline void event_attrs_update_param(void)
 {
@@ -114,6 +125,7 @@ enum placement_shared_state_chan_index {
 };
 
 struct placement_shared_state {
+	struct streaming_decaying_sketch sds;
 	struct mutex lock;
 	struct placement_shared_counter counters;
 	struct indexable_heap candidate[CHI_MAX];
@@ -126,10 +138,15 @@ static inline void placement_shared_state_drop(struct placement_shared_state *s)
 	for (int i = 0; i < CHI_MAX; ++i)
 		indexable_heap_drop(&s->candidate[i]);
 	mutex_destroy(&s->lock);
+	streaming_decaying_sketch_drop(&s->sds);
 }
 
 static inline int placement_shared_state_init(struct placement_shared_state *s)
 {
+	streaming_decaying_sketch_update_param();
+	TRY(streaming_decaying_sketch_init(&s->sds,
+					   streaming_decaying_sketch_width,
+					   streaming_decaying_sketch_depth));
 	mutex_init(&s->lock);
 	s->counters = (struct placement_shared_counter){};
 	indexable_heap_update_param();
@@ -140,12 +157,46 @@ static inline int placement_shared_state_init(struct placement_shared_state *s)
 	return 0;
 }
 
+struct placement_debug {
+	struct page_debug_info pages;
+	struct sample_debug_info *samples;
+};
+static inline void placement_debug_drop(struct placement_debug *d)
+{
+	if (debug_log_samples) {
+		sample_debug_info_write_file(d->samples, "/out/debug_samples");
+		sample_debug_info_drop(d->samples);
+	}
+	if (debug_migration_latency) {
+		page_debug_info_print_debug(&d->pages);
+		page_debug_info_drop(&d->pages);
+	}
+}
+static inline __must_check int placement_debug_init(struct placement_debug *d)
+{
+	if (debug_migration_latency) {
+		TRY(page_debug_info_init(&d->pages));
+	}
+	if (debug_log_samples) {
+		TRY(sample_debug_info_init(&d->samples, 2ul << 20));
+	}
+	return 0;
+}
+
 struct placement {
 	struct perf_event *events[NR_CPUS][EI_MAX];
 	struct spsc chan[NR_CPUS][EI_MAX];
-	struct task_struct *threads[TI_MAX];
+	union {
+		struct task_struct *threads[TI_MAX];
+		struct delayed_work works[TI_MAX];
+	};
 	struct placement_shared_state state;
+	struct placement_debug debug;
 };
+
+#define for_each_cpu_x_event_nocheck(p, cpu, eidx, e) \
+	for (cpu = 0; cpu < num_online_cpus(); ++cpu) \
+		for (eidx = 0; eidx < EI_MAX; ++eidx)
 
 #define for_each_cpu_x_event(p, cpu, eidx, e)         \
 	for (cpu = 0; cpu < num_online_cpus(); ++cpu) \
@@ -156,6 +207,38 @@ struct placement {
 	for (cpu = 0; cpu < num_online_cpus(); ++cpu) \
 		for (eidx = 0; eidx < EI_MAX; ++eidx) \
 			for (eptr = &(p)->events[cpu][eidx]; eptr; eptr = NULL)
+
+#define for_each_sample_from_cpu_x_event(p, cpu, eidx, e, s)                \
+	for (cpu = 0; cpu < num_online_cpus(); ++cpu)                       \
+		for (eidx = 0; eidx < EI_MAX; ++eidx)                       \
+			for (e = (p)->events[cpu][eidx]; e; e = NULL)       \
+				for (; !spsc_pop(&(p)->chan[cpu][eidx], &s, \
+						 sizeof(s));)
+
+static inline void placement_spsc_drop(struct placement *p)
+{
+	int cpu, i;
+	struct perf_event *e;
+	for_each_cpu_x_event_nocheck(p, cpu, i, e)
+	{
+		struct spsc *ch = &p->chan[cpu][i];
+		if (ch) {
+			spsc_drop(ch);
+		}
+	}
+}
+
+static inline int placement_spsc_init(struct placement *p)
+{
+	int cpu, i;
+	struct perf_event *e;
+	for_each_cpu_x_event_nocheck(p, cpu, i, e)
+	{
+		struct spsc *ch = &p->chan[cpu][i];
+		TRY(spsc_init(ch, SPSC_NELEMS * sizeof(struct perf_sample)));
+	}
+	return 0;
+}
 
 static inline int placement_event_start(struct placement *p)
 {
@@ -184,44 +267,13 @@ static inline void placement_event_drop(struct placement *p)
 	struct perf_event *e;
 	for_each_cpu_x_event(p, cpu, i, e)
 	{
-		struct spsc *ch = e->overflow_handler_context;
 		perf_event_release_kernel(e);
-		spsc_drop(ch);
 	}
 }
 
 static inline void placement_event_overflow(struct perf_event *event,
 					    struct perf_sample_data *data,
-					    struct pt_regs *regs)
-{
-	void perf_prepare_sample(struct perf_sample_data * data,
-				 struct perf_event * event,
-				 struct pt_regs * regs);
-	// for locking see: __perf_event_output
-	scoped_guard(rcu)
-	{
-		scoped_guard(irqsave)
-		{
-			struct spsc *ch = event->overflow_handler_context;
-			perf_prepare_sample(data, event, regs);
-			struct perf_sample s = {
-				.pid = data->tid_entry.pid,
-				.tid = data->tid_entry.tid,
-				.time = data->time,
-				.addr = data->addr,
-				.weight = data->weight.full,
-				.phys_addr = data->phys_addr,
-			};
-
-			if (spsc_push(ch, &s, sizeof(s))) {
-				pr_warn_ratelimited(
-					"%s: discard sample due to ring buffer overflow\n",
-					__func__);
-			}
-		}
-	}
-}
-
+					    struct pt_regs *regs);
 static inline int placement_event_init(struct placement *p)
 {
 	event_attrs_update_param();
@@ -229,18 +281,10 @@ static inline int placement_event_init(struct placement *p)
 	struct perf_event **e;
 	for_each_cpu_x_event_ptr(p, cpu, i, e)
 	{
-		struct spsc *ch = &p->chan[cpu][i];
-		int err =
-			spsc_init(ch, SPSC_NELEMS * sizeof(struct perf_sample));
-		if (err) {
-			placement_event_drop(p);
-			return err;
-		}
-
 		*e = perf_event_create_kernel_counter(&event_attrs[i], cpu,
 						      NULL,
 						      placement_event_overflow,
-						      ch);
+						      p);
 		if (IS_ERR(*e)) {
 			placement_event_drop(p);
 			return PTR_ERR(*e);
@@ -248,34 +292,6 @@ static inline int placement_event_init(struct placement *p)
 	}
 
 	return 0;
-}
-
-static inline int placement_thread_start(struct placement *p)
-{
-	for (int i = 0; i < TI_MAX; ++i) {
-		struct task_struct *t = p->threads[i];
-		if (!t) {
-			continue;
-		}
-		wake_up_process(t);
-	}
-	return 0;
-}
-
-static inline void placement_thread_stop(struct placement *p)
-{
-	for (int i = 0; i < TI_MAX; ++i) {
-		struct task_struct *t = p->threads[i];
-		if (!t)
-			continue;
-		// Scynchrously stop the thread and wait for exit
-		kthread_stop(t);
-	}
-}
-
-static inline void placement_thread_drop(struct placement *p)
-{
-	placement_thread_stop(p);
 }
 
 extern int placement_thread_fn_policy(struct placement *p);
@@ -292,6 +308,49 @@ static char *placement_thread_name[TI_MAX] = {
 // 	[TI_POLICY] = 1,
 // 	[TI_MIGRATION] = -1,
 // };
+
+static inline int placement_thread_start(struct placement *p)
+{
+	for (int i = 0; i < TI_MAX; ++i) {
+		struct task_struct *t = p->threads[i];
+		if (!t) {
+			continue;
+		}
+		pr_info("%s: wake_up_process(%s)\n", __func__,
+			placement_thread_name[i]);
+		wake_up_process(t);
+	}
+	return 0;
+}
+
+static inline void placement_thread_stop(struct placement *p)
+{
+	for (int i = TI_MAX; i > 0; --i) {
+		struct task_struct *t = p->threads[i - 1];
+		if (!t)
+			continue;
+		pr_info("%s: kthread_stop(%s)\n", __func__,
+			placement_thread_name[i - 1]);
+		// Scynchrously stop the thread and wait for exit
+		kthread_stop(t);
+	}
+}
+
+static inline void placement_thread_drop(struct placement *p)
+{
+	placement_thread_stop(p);
+}
+
+extern void placement_work_fn_policy(struct work_struct *);
+extern void placement_work_fn_migration(struct work_struct *);
+static void (*placement_work_fn[TI_MAX])(struct work_struct *) = {
+	[TI_POLICY] = placement_work_fn_policy,
+	[TI_MIGRATION] = placement_work_fn_migration,
+};
+static char *placement_work_name[TI_MAX] = {
+	[TI_POLICY] = "placement_policy",
+	[TI_MIGRATION] = "placement_migration",
+};
 
 static inline int __must_check placement_thread_init(struct placement *p)
 {
@@ -312,20 +371,102 @@ static inline int __must_check placement_thread_init(struct placement *p)
 	return 0;
 }
 
+static inline int __must_check placement_work_init(struct placement *p)
+{
+	for (int i = 0; i < TI_MAX; ++i) {
+		INIT_DELAYED_WORK(&p->works[i], placement_work_fn[i]);
+		pr_info("%s: INIT_DELAYED_WORK(%s, 0x%px)\n", __func__,
+			placement_work_name[i], placement_work_fn[i]);
+	}
+	return 0;
+}
+
+static inline void placement_work_drop(struct placement *p)
+{
+	for (int i = 0; i < TI_MAX; ++i) {
+		pr_info("%s: cancel_delayed_work_sync(%s)\n", __func__,
+			placement_work_name[i]);
+		// Scynchrously stop the work and wait for exit
+		cancel_delayed_work_sync(&p->works[i]);
+	}
+}
+
+static inline void placement_event_overflow(struct perf_event *event,
+					    struct perf_sample_data *data,
+					    struct pt_regs *regs)
+{
+	void perf_prepare_sample(struct perf_sample_data * data,
+				 struct perf_event * event,
+				 struct pt_regs * regs);
+	struct placement *p = event->overflow_handler_context;
+	u64 ith = regs->cx;
+
+	// for locking see: __perf_event_output
+	scoped_guard(rcu) scoped_guard(irqsave)
+	{
+		struct spsc *ch = &p->chan[smp_processor_id()]
+					  [event_attrs_index(&event->attr)];
+		perf_prepare_sample(data, event, regs);
+		struct perf_sample s = {
+			.pid = data->tid_entry.pid,
+			.tid = data->tid_entry.tid,
+			.time = data->time,
+			.addr = data->addr,
+			.weight = data->weight.full,
+			.phys_addr = data->phys_addr,
+		};
+		if (spsc_push(ch, &s, sizeof(s))) {
+			pr_warn_ratelimited(
+				"%s: discard sample due to ring buffer overflow\n",
+				__func__);
+		}
+	}
+	if (static_branch_likely(&use_asynchronous_architecture) && ith == 0) {
+		// pr_info_ratelimited("%s: queue_work(%s)\n", __func__,
+		// 		    placement_work_name[TI_POLICY]);
+		queue_delayed_work(system_wq, &p->works[TI_POLICY], 1);
+	}
+}
+
 static inline void placement_drop(struct placement *p)
 {
-	placement_thread_drop(p);
 	placement_event_drop(p);
+	if (static_branch_likely(&use_asynchronous_architecture)) {
+		placement_work_drop(p);
+	} else {
+		placement_thread_drop(p);
+	}
+	placement_spsc_drop(p);
+	placement_debug_drop(&p->debug);
 	placement_shared_state_drop(&p->state);
 }
 
 static inline int placement_init(struct placement *p)
 {
 	memset(p, 0, sizeof(*p));
+	TRY(placement_spsc_init(p));
+	TRY(placement_debug_init(&p->debug));
 	TRY(placement_event_init(p));
-	TRY(placement_thread_init(p));
+	if (asynchronous_architecture) {
+		static_branch_enable(&use_asynchronous_architecture);
+		pr_info("%s: use asynchronous architecture\n", __func__);
+		TRY(placement_work_init(p));
+	} else {
+		static_branch_disable(&use_asynchronous_architecture);
+		pr_info("%s: use threaded architecture\n", __func__);
+		TRY(placement_thread_init(p));
+	}
 	TRY(placement_shared_state_init(&p->state));
 
+	return 0;
+}
+
+static inline int placement_start(struct placement *p)
+{
+	TRY(placement_event_start(p));
+	if (!static_branch_likely(&use_asynchronous_architecture)) {
+		TRY(placement_thread_start(p));
+	}
 	return 0;
 }
 
