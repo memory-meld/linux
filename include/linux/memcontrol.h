@@ -388,7 +388,7 @@ struct mem_cgroup {
 	 * the expected DRAM hit ratio when the system only uses 4KB (base) pages.
 	 */
 	unsigned long hotness_hg[16]; // page access histogram
-	unsigned long ebp_hotness_hg[16]; // expected bage page
+	unsigned long ebp_hotness_hg[16]; // expected base page
 	/* lock for histogram */
 	spinlock_t access_lock;
 	/* etc */

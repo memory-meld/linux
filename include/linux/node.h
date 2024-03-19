@@ -82,11 +82,11 @@ static inline void node_set_perf_attrs(unsigned int nid,
 #endif
 
 struct node {
-	struct device	dev;
+	struct device dev;
 	struct list_head access_list;
 
 #if defined(CONFIG_MEMORY_HOTPLUG_SPARSE) && defined(CONFIG_HUGETLBFS)
-	struct work_struct	node_work;
+	struct work_struct node_work;
 #endif
 #ifdef CONFIG_HMEM_REPORTING
 	struct list_head cache_attrs;
@@ -96,11 +96,10 @@ struct node {
 
 struct memory_block;
 extern struct node *node_devices[];
-typedef  void (*node_registration_func_t)(struct node *);
+typedef void (*node_registration_func_t)(struct node *);
 
 #if defined(CONFIG_MEMORY_HOTPLUG_SPARSE) && defined(CONFIG_NUMA)
-void link_mem_sections(int nid, unsigned long start_pfn,
-		       unsigned long end_pfn,
+void link_mem_sections(int nid, unsigned long start_pfn, unsigned long end_pfn,
 		       enum meminit_context context);
 #else
 static inline void link_mem_sections(int nid, unsigned long start_pfn,
@@ -169,7 +168,8 @@ static inline int unregister_cpu_under_node(unsigned int cpu, unsigned int nid)
 {
 	return 0;
 }
-static inline void unregister_memory_block_under_nodes(struct memory_block *mem_blk)
+static inline void
+unregister_memory_block_under_nodes(struct memory_block *mem_blk)
 {
 }
 
@@ -183,7 +183,8 @@ static inline void register_hugetlbfs_with_node(node_registration_func_t reg,
 
 static inline bool node_is_toptier(int node)
 {
-    return node_state(node, N_CPU);
+	// return node_state(node, N_CPU);
+	return node == first_memory_node;
 }
 
 #endif /* _LINUX_NODE_H_ */

@@ -179,6 +179,8 @@ static void pebs_update_period(struct ksamplingd *ksamplingd)
 {
 	u64 llc_perido = get_sample_period(ksamplingd->llc_idx);
 	u64 inst_period = get_sample_inst_period(ksamplingd->inst_idx);
+	pr_info_ratelimited("%s: llc_perido: %llu, inst_period: %llu\n",
+			    __func__, llc_perido, inst_period);
 
 	for (int cpu = 0; cpu < CPUS_PER_SOCKET; cpu++) {
 		for (int event = 0; event < N_HTMMEVENTS; event++) {
@@ -261,6 +263,7 @@ static int ksamplingd_iter(struct ksamplingd *ksamplingd, int cpu, int event)
 			break;
 		}
 
+		count_vm_event(PEBS_SAMPLE_COLLECTED);
 		count_vm_events(PEBS_COLLECTION_COST, local_clock() - begin);
 		scoped_guard(vmevent, HOTNESS_IDENTIFICATION_COST)
 		{
@@ -398,12 +401,13 @@ static int ksamplingd_fn(struct ksamplingd *ksamplingd)
 	u64 usage_ema_x1000 = 0;
 	/* used for periodic checks*/
 
-	struct ksamplingd_time pebs_last, report_last, overall_begin;
-	pebs_last = report_last = overall_begin = (struct ksamplingd_time){
+	struct ksamplingd_time pebs_last, report_last, ksamplingd_begin;
+	pebs_last = report_last = ksamplingd_begin = (struct ksamplingd_time){
 		.cputime = jiffies,
 		/* orig impl: see read_sum_exec_runtime() */
 		.runtime = t->se.sum_exec_runtime,
 	};
+	u64 iterations = 0;
 
 	/* TODO implements per-CPU node ksamplingd by using pg_data_t */
 	/* Currently uses a single CPU node(0) */
@@ -413,6 +417,7 @@ static int ksamplingd_fn(struct ksamplingd *ksamplingd)
 	// }
 
 	while (!kthread_should_stop()) {
+		iterations += 1;
 		if (htmm_mode == HTMM_NO_MIG) {
 			msleep_interruptible(10000);
 			continue;
@@ -440,15 +445,16 @@ static int ksamplingd_fn(struct ksamplingd *ksamplingd)
 
 	struct ksamplingd_time total = {
 		// us
-		.cputime = jiffies_to_usecs(jiffies - overall_begin.cputime),
+		.cputime = jiffies_to_usecs(jiffies - ksamplingd_begin.cputime),
 		// ns
-		.runtime = t->se.sum_exec_runtime - overall_begin.runtime,
+		.runtime = t->se.sum_exec_runtime - ksamplingd_begin.runtime,
 	};
-	printk("nr_sampled: %llu, nr_throttled: %llu, nr_lost: %llu\n",
-	       measurements->nr_sampled, measurements->nr_throttled,
+	printk("%s: nr_sampled: %llu, nr_throttled: %llu, nr_lost: %llu\n",
+	       __func__, measurements->nr_sampled, measurements->nr_throttled,
 	       measurements->nr_lost);
-	printk("total runtime: %llu ns, total cputime: %lu us, cpu usage: %llu\n",
-	       total.runtime, total.cputime, total.runtime / total.cputime);
+	printk("%s: total runtime: %llu ns, total cputime: %lu us, cpu usage: %llu, iterations: %llu\n",
+	       __func__, total.runtime, total.cputime,
+	       total.runtime / (1 + total.cputime), iterations);
 
 	return 0;
 }

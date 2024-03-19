@@ -126,12 +126,39 @@ static unsigned long need_lowertier_promotion(pg_data_t *pgdat,
 	if (htmm_mode == HTMM_NO_MIG)
 		return 0;
 
+	// pr_info_ratelimited(
+	// 	"%s: need to promote lowertier active anon memory lruvec_size=%lu active_threshold=%u warm_threshold=%u bp_active_threshold=%u\n",
+	// 	__func__, lruvec_size, memcg->active_threshold,
+	// 	memcg->warm_threshold, memcg->bp_active_threshold);
 	return lruvec_size;
 }
 
 static bool need_direct_demotion(pg_data_t *pgdat, struct mem_cgroup *memcg)
 {
 	return READ_ONCE(memcg->nodeinfo[pgdat->node_id]->need_demotion);
+}
+
+unsigned long (*node_balloon_pages_implementation)(int) = NULL;
+// This is a hook point for balloon driver to replace
+unsigned long node_balloon_pages(int nid)
+{
+	if (!node_balloon_pages_implementation)
+		return 0;
+	return node_balloon_pages_implementation(nid);
+}
+EXPORT_SYMBOL(node_balloon_pages);
+
+static unsigned long node_free_pages(pg_data_t *pgdat);
+static unsigned long node_managed_pages(pg_data_t *pgdat)
+{
+	unsigned long total = 0;
+	for (int z = pgdat->nr_zones - 1; z >= 0; z--) {
+		struct zone *zone = pgdat->node_zones + z;
+		if (!populated_zone(zone))
+			continue;
+		total += zone_managed_pages(zone);
+	}
+	return total;
 }
 
 static bool need_toptier_demotion(pg_data_t *pgdat, struct mem_cgroup *memcg,
@@ -149,6 +176,10 @@ static bool need_toptier_demotion(pg_data_t *pgdat, struct mem_cgroup *memcg,
 	target_pgdat = NODE_DATA(target_nid);
 
 	max_nr_pages = memcg->nodeinfo[pgdat->node_id]->max_nr_base_pages;
+	if (max_nr_pages == ULONG_MAX) {
+		max_nr_pages = node_managed_pages(pgdat) -
+			       node_balloon_pages(pgdat->node_id);
+	}
 	nr_lru_pages = get_nr_lru_pages_node(memcg, pgdat);
 
 	fasttier_max_watermark = get_memcg_promotion_watermark(max_nr_pages);
@@ -157,29 +188,54 @@ static bool need_toptier_demotion(pg_data_t *pgdat, struct mem_cgroup *memcg,
 	if (need_direct_demotion(pgdat, memcg)) {
 		if (nr_lru_pages + fasttier_max_watermark <= max_nr_pages)
 			goto check_nr_need_promoted;
-		else if (nr_lru_pages < max_nr_pages)
+		else if (nr_lru_pages < max_nr_pages) {
 			*nr_exceeded = fasttier_max_watermark -
 				       (max_nr_pages - nr_lru_pages);
-		else
+			// pr_info_ratelimited(
+			// 	"%s: free pages over high watermark: nr_to_promote=%lu",
+			// 	__func__, *nr_to_promote);
+		} else {
 			*nr_exceeded = nr_lru_pages + fasttier_max_watermark -
 				       max_nr_pages;
+		}
 		*nr_exceeded += 1U * 128 * 100; // 100 MB
+		pr_info_ratelimited(
+			"%s: direct demotion needed nr_exceeded=%lu\n",
+			__func__, *nr_exceeded);
 		return true;
+	} else {
+		pr_info_ratelimited(
+			"%s: no direct demotion needed because there is nothing wrong with alloc_pages_vma()\n",
+			__func__);
 	}
 
 check_nr_need_promoted:
 	nr_need_promoted = need_lowertier_promotion(target_pgdat, memcg);
 	if (nr_need_promoted) {
 		if (nr_lru_pages + nr_need_promoted + fasttier_max_watermark <=
-		    max_nr_pages)
+		    max_nr_pages) {
+			pr_info_ratelimited(
+				"%s: no demotion need because there is enough space for promotion nr_lru_pages=%lu nr_need_promoted=%lu fasttier_max_watermark=%lu max_nr_pages=%lu\n",
+				__func__, nr_lru_pages, nr_need_promoted,
+				fasttier_max_watermark, max_nr_pages);
 			return false;
+		}
 	} else {
-		if (nr_lru_pages + fasttier_min_watermark <= max_nr_pages)
+		if (nr_lru_pages + fasttier_min_watermark <= max_nr_pages) {
+			pr_info_ratelimited(
+				"%s: no demotion need because there is enough free pages nr_lru_pages=%lu fasttier_min_watermark=%lu max_nr_pages=%lu\n",
+				__func__, nr_lru_pages, fasttier_min_watermark,
+				max_nr_pages);
 			return false;
+		}
 	}
 
 	*nr_exceeded = nr_lru_pages + nr_need_promoted +
 		       fasttier_max_watermark - max_nr_pages;
+	pr_info_ratelimited(
+		"%s: demotion needed nr_lru_pages=%lu nr_need_promoted=%lu fasttier_max_watermark=%lu max_nr_pages=%lu nr_exceeded=%lu\n",
+		__func__, nr_lru_pages, nr_need_promoted,
+		fasttier_max_watermark, max_nr_pages, *nr_exceeded);
 	return true;
 }
 
@@ -196,7 +252,8 @@ static unsigned long node_free_pages(pg_data_t *pgdat)
 		if (!populated_zone(zone))
 			continue;
 
-		free_pages = zone_page_state(zone, NR_FREE_PAGES);
+		// We should include pending modifications to vmstat
+		free_pages = zone_page_state_snapshot(zone, NR_FREE_PAGES);
 		free_pages -= zone->nr_reserved_highatomic;
 		free_pages -= zone->lowmem_reserve[ZONE_MOVABLE];
 
@@ -222,6 +279,11 @@ static bool promotion_available(int target_nid, struct mem_cgroup *memcg,
 
 	cur_nr_pages = get_nr_lru_pages_node(memcg, pgdat);
 	max_nr_pages = memcg->nodeinfo[target_nid]->max_nr_base_pages;
+	// This fixes node_free_pages() always return 0 under memory pressure
+	if (max_nr_pages == ULONG_MAX) {
+		max_nr_pages = node_managed_pages(pgdat) -
+			       node_balloon_pages(pgdat->node_id);
+	}
 	nr_isolated = node_page_state(pgdat, NR_ISOLATED_ANON) +
 		      node_page_state(pgdat, NR_ISOLATED_FILE);
 
@@ -229,9 +291,15 @@ static bool promotion_available(int target_nid, struct mem_cgroup *memcg,
 
 	if (max_nr_pages == ULONG_MAX) {
 		*nr_to_promote = node_free_pages(pgdat);
+		pr_info_ratelimited(
+			"%s: using free pages over high watermark: nr_to_promote=%lu",
+			__func__, *nr_to_promote);
 		return true;
 	} else if (cur_nr_pages + nr_isolated <
 		   max_nr_pages - fasttier_max_watermark) {
+		pr_info_ratelimited(
+			"%s: using free pages over max watermark: nr_to_promote=%lu",
+			__func__, *nr_to_promote);
 		*nr_to_promote = max_nr_pages - fasttier_max_watermark -
 				 cur_nr_pages - nr_isolated;
 		return true;
@@ -341,24 +409,57 @@ static struct page *alloc_migrate_page(struct page *page, unsigned long node)
 static unsigned long migrate_page_list(struct list_head *migrate_list,
 				       pg_data_t *pgdat, bool promotion)
 {
-	int target_nid;
-	unsigned int nr_succeeded = 0;
-
-	if (promotion)
-		target_nid =
-			htmm_cxl_mode ? 0 : next_promotion_node(pgdat->node_id);
-	else
-		target_nid =
-			htmm_cxl_mode ? 1 : next_demotion_node(pgdat->node_id);
-
 	if (list_empty(migrate_list))
 		return 0;
+	int target_nid;
+	unsigned int nr_succeeded = 0;
+	unsigned int candidates = list_count_nodes(migrate_list),
+		     useful_work = 0;
+	unsigned long toptier_free_pages, lowertier_free_pages;
+
+	if (promotion) {
+		target_nid = htmm_cxl_mode ?
+				     first_memory_node :
+				     next_promotion_node(pgdat->node_id);
+		toptier_free_pages = node_free_pages(NODE_DATA(target_nid));
+		lowertier_free_pages = node_free_pages(pgdat);
+	} else {
+		target_nid = htmm_cxl_mode ? last_memory_node :
+					     next_demotion_node(pgdat->node_id);
+		toptier_free_pages = node_free_pages(pgdat);
+		lowertier_free_pages = node_free_pages(NODE_DATA(target_nid));
+	}
+
+	struct page *page;
+	list_for_each_entry (page, migrate_list, lru) {
+		if (page_to_nid(page) == target_nid)
+			continue;
+		useful_work++;
+	}
 
 	if (target_nid == NUMA_NO_NODE)
 		return 0;
 
 	migrate_pages(migrate_list, alloc_migrate_page, NULL, target_nid,
 		      MIGRATE_ASYNC, MR_NUMA_MISPLACED, &nr_succeeded);
+
+	unsigned long toptier_free_pages_after, lowertier_free_pages_after;
+	if (promotion) {
+		toptier_free_pages_after =
+			node_free_pages(NODE_DATA(target_nid));
+		lowertier_free_pages_after = node_free_pages(pgdat);
+	} else {
+		toptier_free_pages_after = node_free_pages(pgdat);
+		lowertier_free_pages_after =
+			node_free_pages(NODE_DATA(target_nid));
+	}
+	pr_info_ratelimited(
+		"%s: %s %d -> %d candidates=%ld useful_work=%ld nr_succeeded=%ld failed=%d toptier free_pages %lu -> %lu lowertier free_pages %lu -> %lu\n",
+		__func__, promotion ? "promotion" : "demotion", pgdat->node_id,
+		target_nid, candidates, useful_work, nr_succeeded,
+		list_count_nodes(migrate_list), toptier_free_pages,
+		toptier_free_pages_after, lowertier_free_pages,
+		lowertier_free_pages_after);
 
 	if (promotion)
 		count_vm_events(HTMM_NR_PROMOTED, nr_succeeded);
@@ -631,14 +732,18 @@ static unsigned long demote_node(pg_data_t *pgdat, struct mem_cgroup *memcg,
 		nr_reclaimed +=
 			demote_lruvec(nr_to_reclaim - nr_reclaimed, priority,
 				      pgdat, lruvec, shrink_active);
+		pr_info_ratelimited(
+			"%s: nr_to_reclaim=%lu nr_reclaimed=%lu priority=%d",
+			__func__, nr_to_reclaim, nr_reclaimed, priority);
 		if (nr_reclaimed >= nr_to_reclaim)
 			break;
 		priority--;
 	} while (priority);
 
 	if (htmm_nowarm == 0) {
-		int target_nid =
-			htmm_cxl_mode ? 1 : next_demotion_node(pgdat->node_id);
+		int target_nid = htmm_cxl_mode ?
+					 last_memory_node :
+					 next_demotion_node(pgdat->node_id);
 		unsigned long nr_lowertier_active =
 			target_nid == NUMA_NO_NODE ?
 				0 :
@@ -669,26 +774,38 @@ static unsigned long demote_node(pg_data_t *pgdat, struct mem_cgroup *memcg,
 static unsigned long promote_node(pg_data_t *pgdat, struct mem_cgroup *memcg)
 {
 	struct lruvec *lruvec = mem_cgroup_lruvec(memcg, pgdat);
-	unsigned long nr_to_promote, nr_promoted = 0, tmp;
+	unsigned long nr_to_promote, nr_promoted = 0, tmp = 0;
 	enum lru_list lru = LRU_ACTIVE_ANON;
 	short priority = DEF_PRIORITY;
-	int target_nid =
-		htmm_cxl_mode ? 0 : next_promotion_node(pgdat->node_id);
+	int target_nid = htmm_cxl_mode ? first_memory_node :
+					 next_promotion_node(pgdat->node_id);
 
+	// FIXME: nr_to_promote wiil be zero when free memory is below water
+	// marks and no page will be promoted.
 	if (!promotion_available(target_nid, memcg, &nr_to_promote))
 		return 0;
 
 	nr_to_promote =
 		min(nr_to_promote, lruvec_lru_size(lruvec, lru, MAX_NR_ZONES));
 
+	// Why should we migrate pages under no migration mode?
 	if (nr_to_promote == 0 && htmm_mode == HTMM_NO_MIG) {
 		lru = LRU_INACTIVE_ANON;
+		// original code: https://github.com/cosmoss-jigu/memtis/blob/cb79fa4d73dcf33fed1aa6a7d9e1fa47a8fd088a/linux/mm/htmm_migrater.c#L650C2-L650C71
+		// This is an UB, because tmp is an uninitialized variable
 		nr_to_promote =
 			min(tmp, lruvec_lru_size(lruvec, lru, MAX_NR_ZONES));
+		// Maybe the authors meant this:
+		// nr_to_promote = lruvec_lru_size(lruvec, lru, MAX_NR_ZONES);
+		// pr_info_ratelimited("%s: inactive lru: nr_to_promote=%lu",
+		// 		    __func__, nr_to_promote);
 	}
 	do {
 		nr_promoted += promote_lruvec(nr_to_promote, priority, pgdat,
 					      lruvec, lru);
+		pr_info_ratelimited(
+			"%s: nr_to_promote=%lu nr_promoted=%lu priority=%d",
+			__func__, nr_to_promote, nr_promoted, priority);
 		if (nr_promoted >= nr_to_promote)
 			break;
 		priority--;
@@ -984,13 +1101,26 @@ static struct mem_cgroup_per_node *next_memcg_cand(pg_data_t *pgdat)
 	return pn;
 }
 
+struct kmigraterd_time {
+	// in unit of jiffy (1/HZ)
+	u64 cputime;
+	// in unit of ns (scheduler clock)
+	u64 runtime;
+};
+
 static int kmigraterd_demotion(pg_data_t *pgdat)
 {
+	pr_info("%s: started for nid=%d\n", __func__, pgdat->node_id);
 	const struct cpumask *cpumask = cpumask_of_node(pgdat->node_id);
 	struct mem_cgroup *memcg;
 
 	if (!cpumask_empty(cpumask))
 		set_cpus_allowed_ptr(pgdat->kmigraterd, cpumask);
+
+	struct kmigraterd_time kmigraterd_begin = {
+		.cputime = jiffies, .runtime = current->se.sum_exec_runtime
+	};
+	u64 iterations = 0;
 
 	for (u32 memcg_sleep_ms = 0;;
 	     /* default: wait 50 ms */
@@ -1005,6 +1135,21 @@ static int kmigraterd_demotion(pg_data_t *pgdat)
 
 			if (kthread_should_stop())
 				break;
+			if (++iterations % 10 == 0) {
+				struct kmigraterd_time total = {
+					.cputime = jiffies_to_usecs(
+						jiffies -
+						kmigraterd_begin.cputime),
+					.runtime =
+						current->se.sum_exec_runtime -
+						kmigraterd_begin.runtime,
+				};
+				printk("%s: nid: %d, total runtime: %llu ns, total cputime: %lu us, cpu usage: %llu, iterations: %llu\n",
+				       __func__, pgdat->node_id, total.runtime,
+				       total.cputime,
+				       total.runtime / (1 + total.cputime),
+				       iterations);
+			}
 
 			pn = next_memcg_cand(pgdat);
 			if (!pn) {
@@ -1048,7 +1193,19 @@ static int kmigraterd_demotion(pg_data_t *pgdat)
 
 			/* demotes inactive lru pages */
 			if (need_toptier_demotion(pgdat, memcg, &nr_exceeded)) {
+				u64 free_pages = node_free_pages(pgdat);
 				demote_node(pgdat, memcg, nr_exceeded);
+				u64 free_pages_after = node_free_pages(pgdat);
+				pr_info_ratelimited(
+					"%s: nid: %d, free pages: %llu -> %llu, demoted: %lu\n",
+					__func__, pgdat->node_id, free_pages,
+					free_pages_after,
+					free_pages_after - free_pages);
+
+			} else {
+				pr_info_ratelimited(
+					"%s: top tier demotion skipped\n",
+					__func__);
 			}
 			//if (need_direct_demotion(pgdat, memcg))
 			//  goto demotion;
@@ -1058,6 +1215,11 @@ static int kmigraterd_demotion(pg_data_t *pgdat)
 
 static int kmigraterd_promotion(pg_data_t *pgdat)
 {
+	pr_info("%s: started for nid=%d\n", __func__, pgdat->node_id);
+	struct kmigraterd_time kmigraterd_begin = {
+		.cputime = jiffies, .runtime = current->se.sum_exec_runtime
+	};
+	u64 iterations = 0;
 	const struct cpumask *cpumask;
 
 	if (htmm_cxl_mode)
@@ -1078,6 +1240,21 @@ static int kmigraterd_promotion(pg_data_t *pgdat)
 
 			if (kthread_should_stop())
 				break;
+			if (++iterations % 10 == 0) {
+				struct kmigraterd_time total = {
+					.cputime = jiffies_to_usecs(
+						jiffies -
+						kmigraterd_begin.cputime),
+					.runtime =
+						current->se.sum_exec_runtime -
+						kmigraterd_begin.runtime,
+				};
+				printk("%s: nid: %d, total runtime: %llu ns, total cputime: %lu us, cpu usage: %llu, iterations: %llu\n",
+				       __func__, pgdat->node_id, total.runtime,
+				       total.cputime,
+				       total.runtime / (1 + total.cputime),
+				       iterations);
+			}
 
 			pn = next_memcg_cand(pgdat);
 			if (!pn) {
@@ -1132,9 +1309,12 @@ static int kmigraterd(void *p)
 {
 	pg_data_t *pgdat = (pg_data_t *)p;
 	int nid = pgdat->node_id;
+	if (!node_state(nid, N_MEMORY))
+		return 0;
+	pr_info("%s: started nid=%d\n", __func__, nid);
 
 	if (htmm_cxl_mode) {
-		if (nid == 0)
+		if (nid == first_memory_node)
 			return kmigraterd_demotion(pgdat);
 		else
 			return kmigraterd_promotion(pgdat);

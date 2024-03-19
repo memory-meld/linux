@@ -19,6 +19,7 @@
 #include <linux/mm.h>
 #include <linux/page_reporting.h>
 #include <linux/sched/clock.h>
+#include <linux/kprobes.h>
 
 /*
  * Balloon device works in 4K page units.  So each page is pointed to by
@@ -1086,6 +1087,73 @@ static int virtio_balloon_register_shrinker(struct virtio_balloon *vb)
 	return register_shrinker(&vb->shrinker);
 }
 
+typedef unsigned long (*kallsyms_lookup_name_t)(const char *);
+static kallsyms_lookup_name_t kallsyms_lookup_name_default = NULL;
+typedef unsigned long (*node_balloon_pages_t)(int);
+node_balloon_pages_t node_balloon_pages_default = NULL;
+static struct virtio_balloon *balloon_instance = NULL;
+
+unsigned long node_balloon_pages_implementation(int nid)
+{
+	if (!balloon_instance) {
+		return 0;
+	}
+	int dram_node = first_node(node_states[N_MEMORY]);
+	int hetero_node = last_node(node_states[N_MEMORY]);
+	if (nid == dram_node) {
+		return balloon_instance->num_pages;
+	}
+	if (nid == hetero_node) {
+		return balloon_instance->num_hetero_pages;
+	}
+	return 0;
+}
+
+void node_balloon_pages_hook_install(struct virtio_balloon *vb)
+{
+	if (!kallsyms_lookup_name_default) {
+		struct kprobe kp = { .symbol_name = "kallsyms_lookup_name" };
+		register_kprobe(&kp);
+		kallsyms_lookup_name_default = (kallsyms_lookup_name_t)kp.addr;
+		unregister_kprobe(&kp);
+		BUG_ON(!kallsyms_lookup_name_default);
+	}
+	balloon_instance = vb;
+	node_balloon_pages_t *p =
+		(node_balloon_pages_t *)kallsyms_lookup_name_default(
+			"node_balloon_pages_implementation");
+	if (!p) {
+		pr_err("node_balloon_pages not found\n");
+		return;
+	}
+	if (*p == node_balloon_pages_implementation) {
+		pr_info("node_balloon_pages already hooked\n");
+		return;
+	}
+	// backup old symbols
+	node_balloon_pages_default = *p;
+	// install hooked version
+	*p = node_balloon_pages_implementation;
+	pr_info("successfully hooked node_balloon_pages %px", *p);
+}
+void node_balloon_pages_hook_uninstall(void)
+{
+	balloon_instance = NULL;
+	node_balloon_pages_t *p =
+		(node_balloon_pages_t *)kallsyms_lookup_name_default(
+			"node_balloon_pages_implementation");
+	if (!p) {
+		pr_err("node_balloon_pages not found\n");
+		return;
+	}
+	if (*p == node_balloon_pages_default) {
+		pr_info("node_balloon_pages already unhooked\n");
+		return;
+	}
+	*p = node_balloon_pages_default;
+	pr_info("successfully unhooked node_balloon_pages %px", *p);
+}
+
 static int virtballoon_probe(struct virtio_device *vdev)
 {
 	struct virtio_balloon *vb;
@@ -1226,6 +1294,7 @@ static int virtballoon_probe(struct virtio_device *vdev)
 
 	if (towards_target(vb) || towards_hetero_target(vb))
 		virtballoon_changed(vdev);
+	node_balloon_pages_hook_install(vb);
 	return 0;
 
 out_unregister_hetero:
@@ -1269,6 +1338,7 @@ static void remove_common(struct virtio_balloon *vb)
 static void virtballoon_remove(struct virtio_device *vdev)
 {
 	struct virtio_balloon *vb = vdev->priv;
+	node_balloon_pages_hook_uninstall();
 
 	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_REPORTING))
 		page_reporting_unregister(&vb->pr_dev_info);

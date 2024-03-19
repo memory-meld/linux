@@ -3246,6 +3246,8 @@ static int establish_migrate_target(int node, nodemask_t *used)
 	node_demotion[node] = migration_target;
 	node_promotion[migration_target] = node;
 
+	pr_info("node %d demotes to node %d\n", node, migration_target);
+	pr_info("node %d promotes to node %d\n", migration_target, node);
 	return migration_target;
 }
 
