@@ -181,4 +181,10 @@ static inline void register_hugetlbfs_with_node(node_registration_func_t reg,
 
 #define to_node(device) container_of(device, struct node, dev)
 
+static inline bool node_is_toptier(int node)
+{
+	// ideally, toptier nodes should be the memory with CPU.
+	// for now, just assume the first memory node is the toptier memory
+	return first_memory_node == node;
+}
 #endif /* _LINUX_NODE_H_ */
