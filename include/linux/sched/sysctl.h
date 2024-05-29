@@ -35,6 +35,12 @@ enum sched_tunable_scaling {
 	SCHED_TUNABLESCALING_END,
 };
 
+#define NUMA_BALANCING_DISABLED		0x0
+#define NUMA_BALANCING_NORMAL		0x1
+#define NUMA_BALANCING_TIERED_MEMORY	0x2
+
+extern int sysctl_numa_balancing_mode;
+
 /*
  *  control realtime throttling:
  *
