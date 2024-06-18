@@ -1296,11 +1296,13 @@ int next_promotion_node(int node)
 
 	return target;
 }
+
+// sudo bpftrace -e 'kretprobe:unmap_and_move { @[retval] = count() }'
 /*
  * Obtain the lock on page, remove all ptes and migrate the page
  * to the newly allocated page in newpage.
  */
-static int unmap_and_move(new_page_t get_new_page,
+noinline int unmap_and_move(new_page_t get_new_page,
 				   free_page_t put_new_page,
 				   unsigned long private, struct page *page,
 				   int force, enum migrate_mode mode,
@@ -1395,7 +1397,7 @@ out:
  * because then pte is replaced with migration swap entry and direct I/O code
  * will wait in the page fault for migration to complete.
  */
-static int unmap_and_move_huge_page(new_page_t get_new_page,
+noinline int unmap_and_move_huge_page(new_page_t get_new_page,
 				free_page_t put_new_page, unsigned long private,
 				struct page *hpage, int force,
 				enum migrate_mode mode, int reason,
@@ -1648,6 +1650,20 @@ retry:
 				nr_failed++;
 				break;
 			case -ENOMEM:
+				// called from htmm_migrator
+				if (reason == MR_NUMA_MISPLACED && mode == MIGRATE_ASYNC) {
+					if (private == first_memory_node) {
+						// account for promotion failure
+						long count = 0;
+						struct page *p;
+						list_for_each_entry(p, from, lru)
+							count += compound_nr(p);
+						count_vm_events(HTMM_NR_PROMOTION_TIRED_FAILURE, count);
+						count_vm_events(HTMM_NR_PROMOTION_TIRED_FAILURE_NOMEM, count);
+					} else {
+						// account for demotion failure
+					}
+				}
 				/*
 				 * When memory is low, don't bother to try to migrate
 				 * other pages, just exit.

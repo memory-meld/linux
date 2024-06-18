@@ -406,8 +406,9 @@ static struct page *alloc_migrate_page(struct page *page, unsigned long node)
 	return newpage;
 }
 
-static unsigned long migrate_page_list(struct list_head *migrate_list,
-				       pg_data_t *pgdat, bool promotion)
+noinline unsigned long migrate_page_list(struct list_head *migrate_list,
+					 pg_data_t *pgdat, bool promotion,
+					 enum lru_list lru)
 {
 	if (list_empty(migrate_list))
 		return 0;
@@ -440,6 +441,13 @@ static unsigned long migrate_page_list(struct list_head *migrate_list,
 	if (target_nid == NUMA_NO_NODE)
 		return 0;
 
+	if (promotion) {
+		count_vm_events(HTMM_NR_PROMOTION_TRIED, candidates);
+		count_vm_events(HTMM_NR_PROMOTION_TRIED_ANON_INACTIVE + lru, candidates);
+	} else {
+		count_vm_events(HTMM_NR_DEMOTION_TRIED, candidates);
+		count_vm_events(HTMM_NR_DEMOTION_TRIED_ANON_INACTIVE + lru, candidates);
+	}
 	migrate_pages(migrate_list, alloc_migrate_page, NULL, target_nid,
 		      MIGRATE_ASYNC, MR_NUMA_MISPLACED, &nr_succeeded);
 
@@ -454,17 +462,20 @@ static unsigned long migrate_page_list(struct list_head *migrate_list,
 			node_free_pages(NODE_DATA(target_nid));
 	}
 	pr_info_ratelimited(
-		"%s: %s %d -> %d candidates=%ld useful_work=%ld nr_succeeded=%ld failed=%d toptier free_pages %lu -> %lu lowertier free_pages %lu -> %lu\n",
-		__func__, promotion ? "promotion" : "demotion", pgdat->node_id,
-		target_nid, candidates, useful_work, nr_succeeded,
+		"%s: %s %d -> %d lru=%d candidates=%ld useful_work=%ld nr_succeeded=%ld failed=%d toptier free_pages %lu -> %lu lowertier free_pages %lu -> %lu\n",
+		__func__, promotion ? "promotion" : "demotion ", pgdat->node_id,
+		target_nid, lru, candidates, useful_work, nr_succeeded,
 		list_count_nodes(migrate_list), toptier_free_pages,
 		toptier_free_pages_after, lowertier_free_pages,
 		lowertier_free_pages_after);
 
-	if (promotion)
+	if (promotion) {
 		count_vm_events(HTMM_NR_PROMOTED, nr_succeeded);
-	else
+		count_vm_events(HTMM_NR_PROMOTED_ANON_INACTIVE + lru, nr_succeeded);
+	} else {
 		count_vm_events(HTMM_NR_DEMOTED, nr_succeeded);
+		count_vm_events(HTMM_NR_DEMOTED_ANON_INACTIVE + lru, nr_succeeded);
+	}
 
 	return nr_succeeded;
 }
@@ -473,7 +484,8 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 				      pg_data_t *pgdat,
 				      struct mem_cgroup *memcg,
 				      bool shrink_active,
-				      unsigned long nr_to_reclaim)
+				      unsigned long nr_to_reclaim,
+				      enum lru_list lru)
 {
 	LIST_HEAD(demote_pages);
 	LIST_HEAD(ret_pages);
@@ -506,13 +518,19 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 			if (PageTransHuge(page)) {
 				struct page *meta = get_meta_page(page);
 
-				if (meta->idx >= memcg->warm_threshold)
+				if (meta->idx >= memcg->warm_threshold) {
+					count_vm_events(HTMM_NR_DEMOTION_SCANNED_FILTERED, compound_nr(page));
+					count_vm_events(HTMM_NR_DEMOTION_SCANNED_FILTERED_HOTNESS, compound_nr(page));
 					goto keep_locked;
+				}
 			} else {
 				unsigned int idx = get_pginfo_idx(page);
 
-				if (idx >= memcg->warm_threshold)
+				if (idx >= memcg->warm_threshold) {
+					count_vm_event(HTMM_NR_DEMOTION_SCANNED_FILTERED);
+					count_vm_event(HTMM_NR_DEMOTION_SCANNED_FILTERED_HOTNESS);
 					goto keep_locked;
+				}
 			}
 		}
 
@@ -527,7 +545,7 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 		list_add(&page->lru, &ret_pages);
 	}
 
-	nr_reclaimed = migrate_page_list(&demote_pages, pgdat, false);
+	nr_reclaimed = migrate_page_list(&demote_pages, pgdat, false, lru);
 	if (!list_empty(&demote_pages))
 		list_splice(&demote_pages, page_list);
 
@@ -536,7 +554,7 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 }
 
 static unsigned long promote_page_list(struct list_head *page_list,
-				       pg_data_t *pgdat)
+				       pg_data_t *pgdat, enum lru_list lru)
 {
 	LIST_HEAD(promote_pages);
 	LIST_HEAD(ret_pages);
@@ -570,7 +588,7 @@ static unsigned long promote_page_list(struct list_head *page_list,
 		list_add(&page->lru, &ret_pages);
 	}
 
-	nr_promoted = migrate_page_list(&promote_pages, pgdat, true);
+	nr_promoted = migrate_page_list(&promote_pages, pgdat, true, lru);
 	if (!list_empty(&promote_pages))
 		list_splice(&promote_pages, page_list);
 
@@ -598,9 +616,11 @@ static unsigned long demote_inactive_list(unsigned long nr_to_scan,
 	if (nr_taken == 0) {
 		return 0;
 	}
+	count_vm_events(HTMM_NR_DEMOTION_SCANNED, nr_taken);
+	count_vm_events(HTMM_NR_DEMOTION_SCANNED_ANON_INACTIVE + lru, nr_taken);
 
 	nr_reclaimed = shrink_page_list(&page_list, pgdat, lruvec_memcg(lruvec),
-					shrink_active, nr_to_reclaim);
+					shrink_active, nr_to_reclaim, lru);
 
 	spin_lock_irq(&lruvec->lru_lock);
 	move_pages_to_lru(lruvec, &page_list);
@@ -630,8 +650,10 @@ static unsigned long promote_active_list(unsigned long nr_to_scan,
 
 	if (nr_taken == 0)
 		return 0;
+	count_vm_events(HTMM_NR_PROMOTION_SCANNED, nr_taken);
+	count_vm_events(HTMM_NR_PROMOTION_SCANNED_ANON_INACTIVE + lru, nr_taken);
 
-	nr_promoted = promote_page_list(&page_list, pgdat);
+	nr_promoted = promote_page_list(&page_list, pgdat, lru);
 
 	spin_lock_irq(&lruvec->lru_lock);
 	move_pages_to_lru(lruvec, &page_list);
