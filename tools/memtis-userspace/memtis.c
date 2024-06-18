@@ -50,8 +50,9 @@ inline static long htmm_end(pid_t pid)
 	return syscall(syscall_htmm_end, pid);
 }
 
-inline static ssize_t echo(char const *name, void *buf, size_t len)
+inline static ssize_t echo(char const *name, char *buf, size_t len)
 {
+	fprintf(stderr, "echo \"%s\" > \"%s\"\n", buf, name);
 	int fd = TRY(open(name, O_WRONLY));
 	ssize_t written = TRY(write(fd, buf, len));
 	TRY(close(fd));
@@ -71,11 +72,25 @@ inline static int htmm_cgroup_create(void)
 
 inline static int htmm_cgroup_enable(pid_t pid)
 {
+	char buf[64];
 	TRY(echo(CGROUP_PATH "/cgroup.subtree_control", "+memory +cpuset", 15));
-	TRY(echo(CGROUP_PATH "/" CGROUP_NAME "/cgroup.procs", &pid,
-		 sizeof(pid_t)));
+	TRY(echo(CGROUP_PATH "/" CGROUP_NAME "/cgroup.procs", buf,
+		 TRY(snprintf(buf, sizeof(buf), "%d", pid))));
 	TRY(echo(CGROUP_PATH "/" CGROUP_NAME "/memory.htmm_enabled", "enabled",
 		 7));
+	char *dram_node = getenv("DRAM_NODE");
+	char *dram_limit = getenv("DRAM_LIMIT");
+	if (dram_node && dram_limit) {
+		fprintf(stderr, "setting dram limit: node=%s limit=%s\n",
+			dram_node, dram_limit);
+		char path[256];
+		TRY(snprintf(path, sizeof(path),
+			     CGROUP_PATH "/" CGROUP_NAME
+					 "/memory.max_at_node%s",
+			     dram_node));
+		TRY(echo(path, dram_limit, strlen(dram_limit)));
+	}
+
 	return 0;
 }
 
@@ -85,8 +100,8 @@ static __attribute__((constructor)) void ctor(void)
 	fprintf(stderr, "preload library started\n");
 	pid = UNWRAP(getpid());
 	fprintf(stderr, "starting htmm for pid=%d\n", pid);
-	// UNWRAP(htmm_cgroup_create());
-	// UNWRAP(htmm_cgroup_enable());
+	UNWRAP(htmm_cgroup_create());
+	UNWRAP(htmm_cgroup_enable(pid));
 	// the node argument is unused for now
 	UNWRAP(htmm_start(UNWRAP(getpid()), 0));
 }
