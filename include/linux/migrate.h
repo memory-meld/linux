@@ -6,6 +6,7 @@
 #include <linux/mempolicy.h>
 #include <linux/migrate_mode.h>
 #include <linux/hugetlb.h>
+#include <linux/nomad2.h>
 
 typedef struct page *new_page_t(struct page *page, unsigned long private);
 typedef void free_page_t(struct page *page, unsigned long private);
@@ -17,7 +18,7 @@ struct migration_target_control;
  * - negative errno on page migration failure;
  * - zero on page migration success;
  */
-#define MIGRATEPAGE_SUCCESS		0
+#define MIGRATEPAGE_SUCCESS 0
 
 enum migrate_reason {
 	MR_COMPACTION,
@@ -44,6 +45,14 @@ extern int migrate_page(struct address_space *mapping,
 extern int migrate_pages(struct list_head *l, new_page_t new, free_page_t free,
 		unsigned long private, enum migrate_mode mode, int reason,
 		unsigned int *nr_succeeded);
+
+extern int demotion_migrate_pages(struct list_head *l, new_page_t new, free_page_t free,
+		unsigned long private, enum migrate_mode mode, int reason,
+		unsigned int *nr_succeeded);
+
+extern int nomad_transit_pages(struct list_head *l, new_page_t new, free_page_t free,
+		unsigned long private, enum migrate_mode mode, int reason,
+		unsigned int *nr_succeeded, unsigned int *nr_migrated, struct nomad_context *contxt);
 extern struct page *alloc_migration_target(struct page *page, unsigned long private);
 extern int isolate_movable_page(struct page *page, isolate_mode_t mode);
 

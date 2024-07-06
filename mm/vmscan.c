@@ -51,6 +51,7 @@
 #include <linux/printk.h>
 #include <linux/dax.h>
 #include <linux/psi.h>
+#include <linux/nomad.h>
 
 #include <asm/tlbflush.h>
 #include <asm/div64.h>
@@ -1202,6 +1203,7 @@ void putback_lru_page(struct page *page)
 	lru_cache_add(page);
 	put_page(page);		/* drop ref from isolate */
 }
+EXPORT_SYMBOL(putback_lru_page);
 
 enum page_references {
 	PAGEREF_RECLAIM,
@@ -1319,6 +1321,7 @@ static void page_check_dirty_writeback(struct page *page,
 
 static struct page *alloc_demote_page(struct page *page, unsigned long node)
 {
+	struct page *newpage = NULL;
 	struct migration_target_control mtc = {
 		/*
 		 * Allocate from 'node', or fail the quickly and quietly.
@@ -1326,12 +1329,21 @@ static struct page *alloc_demote_page(struct page *page, unsigned long node)
 		 * instead of migrated.
 		 */
 		.gfp_mask = (GFP_HIGHUSER_MOVABLE & ~__GFP_RECLAIM) |
-			    __GFP_THISNODE  | __GFP_NOWARN |
-			    __GFP_NOMEMALLOC | GFP_NOWAIT,
+			    __GFP_THISNODE | __GFP_NOWARN | __GFP_NOMEMALLOC |
+			    GFP_NOWAIT,
 		.nid = node
 	};
+	newpage = alloc_migration_target(page, (unsigned long)&mtc);
+	if (!newpage && node == 1 && async_mod_glob_ctrl.initialized) {
+		if (async_mod_glob_ctrl.reclaim_page) {
+			// reclaim 10 pages each time
+			async_mod_glob_ctrl.reclaim_page(node, 10);
+			newpage = alloc_migration_target(page,
+							 (unsigned long)&mtc);
+		}
+	}
 
-	return alloc_migration_target(page, (unsigned long)&mtc);
+	return newpage;
 }
 
 /*
@@ -1339,7 +1351,7 @@ static struct page *alloc_demote_page(struct page *page, unsigned long node)
  * another node.  Pages which are not demoted are left on
  * @demote_pages.
  */
-unsigned int demote_page_list(struct list_head *demote_pages,
+static unsigned int demote_page_list(struct list_head *demote_pages,
 				     struct pglist_data *pgdat,
 				     struct scan_control *sc)
 {
@@ -1354,9 +1366,9 @@ unsigned int demote_page_list(struct list_head *demote_pages,
 	file_lru = page_is_file_lru(lru_to_page(demote_pages));
 
 	/* Demotion ignores all cpuset and mempolicy settings */
-	err = migrate_pages(demote_pages, alloc_demote_page, NULL,
-			    target_nid, MIGRATE_ASYNC, MR_DEMOTION,
-			    &nr_succeeded);
+	err = demotion_migrate_pages(demote_pages, alloc_demote_page, NULL,
+				     target_nid, MIGRATE_ASYNC, MR_DEMOTION,
+				     &nr_succeeded);
 
 	if (current_is_kswapd())
 		__count_vm_events(PGDEMOTE_KSWAPD, nr_succeeded);
@@ -2105,6 +2117,7 @@ int isolate_lru_page(struct page *page)
 
 	return ret;
 }
+EXPORT_SYMBOL(isolate_lru_page);
 
 /*
  * A direct reclaimer may isolate SWAP_CLUSTER_MAX pages from the LRU list and
@@ -2810,6 +2823,12 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 			 sc->priority == DEF_PRIORITY);
 
 	blk_start_plug(&plug);
+	if (async_mod_glob_ctrl.initialized) {
+		if (async_mod_glob_ctrl.reclaim_page) {
+			async_mod_glob_ctrl.reclaim_page(lruvec->pgdat->node_id,
+							 nr_to_reclaim / 2);
+		}
+	}
 	while (nr[LRU_INACTIVE_ANON] || nr[LRU_ACTIVE_FILE] ||
 					nr[LRU_INACTIVE_FILE]) {
 		unsigned long nr_anon, nr_file, percentage;

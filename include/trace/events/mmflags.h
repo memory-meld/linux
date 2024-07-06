@@ -120,7 +120,9 @@ IF_HAVE_PG_HWPOISON(PG_hwpoison,	"hwpoison"	)		\
 IF_HAVE_PG_IDLE(PG_young,		"young"		)		\
 IF_HAVE_PG_IDLE(PG_idle,		"idle"		)		\
 IF_HAVE_PG_ARCH_2(PG_arch_2,		"arch_2")	\
-IF_HAVE_PG_DEMOTED(PG_demoted,		"demoted")
+IF_HAVE_PG_DEMOTED(PG_demoted,		"demoted")  \
+IF_HAVE_PG_DEMOTED(PG_numa_queued,		"promqueued")  \
+IF_HAVE_PG_DEMOTED(PG_shadowed,		"shadowed")
 
 #define show_page_flags(flags)						\
 	(flags) ? __print_flags(flags, "|",				\
