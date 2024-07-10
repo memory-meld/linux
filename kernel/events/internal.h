@@ -90,6 +90,8 @@ static inline bool rb_has_aux(struct perf_buffer *rb)
 	return !!rb->aux_nr_pages;
 }
 
+int __perf_event_open(struct perf_event_attr *attr_ptr, pid_t pid, int cpu,
+		      int group_fd, unsigned long flags);
 void perf_event_aux_event(struct perf_event *event, unsigned long head,
 			  unsigned long size, u64 flags);
 

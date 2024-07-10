@@ -508,7 +508,7 @@ static int __nomad_copy_and_remap(struct page *page, struct page *newpage,
 			remove_migration_ptes(
 				page,
 				rc == MIGRATEPAGE_SUCCESS ? newpage : page,
-				false);
+				false, false);
 	}
 
 out_unlock_both:

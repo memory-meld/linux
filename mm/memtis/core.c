@@ -17,7 +17,7 @@
 #include <linux/random.h>
 #include <trace/events/htmm.h>
 
-#include "internal.h"
+#include "../internal.h"
 #include <asm/pgtable.h>
 
 void htmm_mm_init(struct mm_struct *mm)

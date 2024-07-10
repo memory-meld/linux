@@ -74,10 +74,6 @@
 #include <linux/ptrace.h>
 #include <linux/vmalloc.h>
 
-#ifdef CONFIG_HTMM
-#include <linux/htmm.h>
-#endif
-
 #include <trace/events/kmem.h>
 
 #include <asm/io.h>

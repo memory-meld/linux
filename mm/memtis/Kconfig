@@ -1,0 +1,11 @@
+config HTMM
+	bool "Enable hugepage-aware tiered memory management"
+	depends on MIGRATION && TRANSPARENT_HUGEPAGE && MEMCG
+	help
+	  Enable memory access sampling and dynamic placement for
+	  tiered memory systems (DRAM + NVM). This optimizes the system
+	  performance in tiered memory systems by coordinating transparent
+	  hugepage support with tiered memory management.
+
+	  If in doubt, say N.
+

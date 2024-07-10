@@ -16,6 +16,10 @@
 #include <linux/nomad.h>
 #endif
 
+#ifdef CONFIG_HTMM
+#include <linux/htmm.h>
+#endif
+
 /*
  * The set of flags that only affect watermark checking and reclaim
  * behaviour. This is used by the MM to obey the caller constraints

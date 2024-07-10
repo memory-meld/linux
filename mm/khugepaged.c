@@ -18,11 +18,6 @@
 #include <linux/page_idle.h>
 #include <linux/swapops.h>
 #include <linux/shmem_fs.h>
-#ifdef CONFIG_HTMM
-#include <linux/mempolicy.h>
-#include <linux/htmm.h>
-#include <linux/migrate.h>
-#endif
 
 #include <asm/tlb.h>
 #include <asm/pgalloc.h>

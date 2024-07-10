@@ -8,10 +8,9 @@
 #include <linux/perf_event.h>
 #include <linux/delay.h>
 #include <linux/sched/cputime.h>
-
-#include "../kernel/events/internal.h"
-
 #include <linux/htmm.h>
+
+#include "../../kernel/events/internal.h"
 
 struct task_struct *access_sampling = NULL;
 struct perf_event ***mem_event;
@@ -46,7 +45,7 @@ static __u64 get_pebs_event(enum events e)
 	}
 }
 
-static int __perf_event_open(__u64 config, __u64 config1, __u64 cpu, __u64 type, __u32 pid)
+static int pebs_event_open(__u64 config, __u64 config1, __u64 cpu, __u64 type, __u32 pid)
 {
 	struct perf_event_attr attr;
 	struct file *file;
@@ -109,7 +108,7 @@ static int pebs_init(pid_t pid, int node)
 				continue;
 			}
 
-			if (__perf_event_open(get_pebs_event(event), 0, cpu, event, pid))
+			if (pebs_event_open(get_pebs_event(event), 0, cpu, event, pid))
 				return -1;
 			if (htmm__perf_event_init(mem_event[cpu][event], BUFFER_SIZE))
 				return -1;
@@ -336,7 +335,7 @@ static int ksamplingd(void *data)
 				cputime = div64_u64(exec_runtime, elapsed_cputime);
 
 			/* to prevent frequent updates, allow for a slight variation of +/- 0.5% */
-			if (cputime > (ksampled_soft_cpu_quota + 5) && sample_period != pcount) {
+			if (cputime > (ksampled_soft_cpu_quota + 5) && sample_period != ARRAY_SIZE(pebs_period_list)) {
 				/* need to increase the sample period */
 				/* only increase by 1 */
 				unsigned long tmp1 = sample_period, tmp2 = sample_inst_period;

@@ -1,3 +1,6 @@
+#ifndef _LINUX_HTMM_H
+#define _LINUX_HTMM_H
+#include <linux/mm.h>
 #include <uapi/linux/perf_event.h>
 
 #define DEFERRED_SPLIT_ISOLATED 1
@@ -27,9 +30,8 @@
 #define CXL_ACCESS_LATENCY 170
 #define DELTA_CYCLES (NVM_ACCESS_LATENCY - DRAM_ACCESS_LATENCY)
 
-#define pcount 30
 /* only prime numbers */
-static const unsigned int pebs_period_list[pcount] = {
+static const unsigned int pebs_period_list[] = {
 	199, // 200 - min
 	293, // 300
 	401, // 400
@@ -62,9 +64,8 @@ static const unsigned int pebs_period_list[pcount] = {
 	19997, // 20000 - max
 };
 
-#define pinstcount 5
 /* this is for store instructions */
-static const unsigned int pebs_inst_period_list[pinstcount] = {
+static const unsigned int pebs_inst_period_list[] = {
 	100003, // 0.1M
 	300007, // 0.3M
 	600011, // 0.6M
@@ -137,22 +138,18 @@ extern void ksamplingd_exit(void);
 
 static inline unsigned long get_sample_period(unsigned long cur)
 {
+	ulong len = ARRAY_SIZE(pebs_period_list);
 	if (cur < 0)
 		return 0;
-	else if (cur < pcount)
-		return pebs_period_list[cur];
-	else
-		return pebs_period_list[pcount - 1];
+	return pebs_period_list[cur < len ? cur : len - 1];
 }
 
 static inline unsigned long get_sample_inst_period(unsigned long cur)
 {
+	ulong len = ARRAY_SIZE(pebs_inst_period_list);
 	if (cur < 0)
 		return 0;
-	else if (cur < pinstcount)
-		return pebs_inst_period_list[cur];
-	else
-		return pebs_inst_period_list[pinstcount - 1];
+	return pebs_inst_period_list[cur < len ? cur : len - 1];
 }
 #if 1
 static inline void increase_sample_period(unsigned long *llc_period,
@@ -160,11 +157,11 @@ static inline void increase_sample_period(unsigned long *llc_period,
 {
 	unsigned long p;
 	p = *llc_period;
-	if (++p < pcount)
+	if (++p < ARRAY_SIZE(pebs_period_list))
 		*llc_period = p;
 
 	p = *inst_period;
-	if (++p < pinstcount)
+	if (++p < ARRAY_SIZE(pebs_inst_period_list))
 		*inst_period = p;
 }
 
@@ -184,11 +181,12 @@ static inline void decrease_sample_period(unsigned long *llc_period,
 static inline unsigned int increase_sample_period(unsigned int cur,
 						  unsigned int next)
 {
+	ulong len = ARRAY_SIZE(pebs_period_list);
 	do {
 		cur++;
-	} while (pebs_period_list[cur] < next && cur < pcount);
+	} while (pebs_period_list[cur] < next && cur < len);
 
-	return cur < pcount ? cur : pcount - 1;
+	return cur < len ? cur : len - 1;
 }
 
 static inline unsigned int decrease_sample_period(unsigned int cur,
@@ -212,3 +210,13 @@ extern unsigned long get_memcg_promotion_watermark(unsigned long max_nr_pages);
 extern void kmigraterd_wakeup(int nid);
 extern int kmigraterd_init(void);
 extern void kmigraterd_stop(void);
+extern bool __isolate_lru_page_prepare(struct page *page, isolate_mode_t mode);
+
+struct htmm_rmap_walk_arg {
+	void *arg;
+	bool unmap_clean;
+};
+extern bool try_to_unmap_clean(struct page_vma_mapped_walk *pvmw,
+			       struct page *page);
+
+#endif

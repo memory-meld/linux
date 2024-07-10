@@ -17,7 +17,7 @@
 #include <linux/wait.h>
 #include <linux/sched.h>
 
-#include "internal.h"
+#include "../internal.h"
 
 #define MIN_WATERMARK_LOWER_LIMIT 128 * 100 // 50MB
 #define MIN_WATERMARK_UPPER_LIMIT 2560 * 100 // 1000MB

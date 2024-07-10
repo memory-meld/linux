@@ -51,7 +51,6 @@
 #include <linux/oom.h>
 #include <linux/memory.h>
 #include <linux/sched/numa_balancing.h>
-#include <linux/htmm.h>
 
 #include <asm/tlbflush.h>
 
@@ -171,65 +170,6 @@ void putback_movable_pages(struct list_head *l)
 	}
 }
 
-#ifdef CONFIG_HTMM
-
-static bool try_to_unmap_clean(struct page_vma_mapped_walk *pvmw, struct page *page)
-{
-	void *addr;
-	bool dirty;
-	pte_t newpte;
-	pginfo_t *pginfo;
-
-	VM_BUG_ON_PAGE(PageCompound(page), page);
-	VM_BUG_ON_PAGE(!PageAnon(page), page);
-	VM_BUG_ON_PAGE(!PageLocked(page), page);
-	VM_BUG_ON_PAGE(pte_present(*pvmw->pte), page);
-
-	if (PageMlocked(page) || (pvmw->vma->vm_flags & VM_LOCKED))
-		return false;
-
-	/* accessed ptes --> no zeroed pages */
-	pginfo = get_pginfo_from_pte(pvmw->pte);
-	if (!pginfo)
-		return false;
-	if (pginfo->nr_accesses > 0)
-		return false;
-
-	/*
-     * The pmd entry mapping the old thp was flushed and the pte mapping
-     * this subpage has been non present. Therefore, this subpage is
-     * inaccessible. We don't need to remap it if it contains only zeros.
-     */
-	addr = kmap_local_page(page);
-	dirty = memchr_inv(addr, 0, PAGE_SIZE);
-	kunmap_local(addr);
-
-	if (dirty)
-		return false;
-
-	pte_clear_not_present_full(pvmw->vma->vm_mm, pvmw->address, pvmw->pte,
-				   false);
-
-	if (userfaultfd_armed(pvmw->vma)) {
-		newpte = pte_mkspecial(
-			pfn_pte(page_to_pfn(ZERO_PAGE(pvmw->address)),
-				pvmw->vma->vm_page_prot));
-		ptep_clear_flush(pvmw->vma, pvmw->address, pvmw->pte);
-		set_pte_at(pvmw->vma->vm_mm, pvmw->address, pvmw->pte, newpte);
-		dec_mm_counter(pvmw->vma->vm_mm, MM_ANONPAGES);
-		return true;
-	}
-
-	dec_mm_counter(pvmw->vma->vm_mm, mm_counter(page));
-	return true;
-}
-
-struct rmap_walk_arg {
-	void *arg;
-	bool unmap_clean;
-};
-#endif
-
 /*
  * Restore a potential migration pte to a working pte entry
  */
@@ -237,7 +177,7 @@ static bool remove_migration_pte(struct page *page, struct vm_area_struct *vma,
 				 unsigned long addr, void *old)
 {
 #ifdef CONFIG_HTMM
-	struct rmap_walk_arg *rmap_walk_arg = old;
+	struct htmm_rmap_walk_arg *rmap_walk_arg = old;
 #endif
 	struct page_vma_mapped_walk pvmw = {
 #ifdef CONFIG_HTMM
@@ -373,7 +313,7 @@ void remove_migration_ptes(struct page *old, struct page *new, bool locked,
 			   bool unmap_clean)
 {
 #ifdef CONFIG_HTMM
-	struct rmap_walk_arg rmap_walk_arg = {
+	struct htmm_rmap_walk_arg rmap_walk_arg = {
 		.arg = old,
 		.unmap_clean = unmap_clean,
 	};
@@ -1272,8 +1212,8 @@ out:
 static int node_demotion[MAX_NUMNODES] __read_mostly =
 	{[0 ...  MAX_NUMNODES - 1] = NUMA_NO_NODE};
 
-static int node_promotion[MAX_NUMNODES] __read_mostly = { [0 ... MAX_NUMNODES -
-							   1] = NUMA_NO_NODE };
+static int node_promotion[MAX_NUMNODES] __read_mostly =
+	{ [0 ... MAX_NUMNODES - 1] = NUMA_NO_NODE };
 
 /**
  * next_demotion_node() - Get the next node in the demotion path
@@ -3286,6 +3226,7 @@ static int establish_migrate_target(int node, nodemask_t *used)
 
 	node_demotion[node] = migration_target;
 	node_promotion[migration_target] = node;
+	pr_info("%s: %d<->%d\n", node, migration_target);
 
 	return migration_target;
 }

@@ -34,7 +34,6 @@
 #include <linux/oom.h>
 #include <linux/numa.h>
 #include <linux/page_owner.h>
-#include <linux/htmm.h>
 
 #include <asm/tlb.h>
 #include <asm/pgalloc.h>
